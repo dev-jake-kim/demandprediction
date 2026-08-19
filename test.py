@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import logging
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -9,6 +11,17 @@ from tqdm import tqdm
 
 from dataset_frame import GridDemandDataset
 from models import GridDemandModel, compute_regression_metrics
+
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(), logging.FileHandler(log_path)],
+    )
 
 
 def evaluate(model: GridDemandModel, loader: DataLoader, device: str) -> dict[str, float]:
@@ -39,10 +52,16 @@ def main() -> None:
     parser.add_argument("--t_end", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--log_file", type=str, default=None, help="기본값: <checkpoint_path>/test.log")
     args = parser.parse_args()
 
+    checkpoint_path = Path(args.checkpoint_path)
+    log_path = Path(args.log_file) if args.log_file else checkpoint_path / "test.log"
+    setup_logging(log_path)
+    logger.info(f"Logging to: {log_path}")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = GridDemandModel.from_pretrained(args.checkpoint_path).to(device)
+    model = GridDemandModel.from_pretrained(checkpoint_path).to(device)
 
     test_ds = GridDemandDataset(
         args.npy_path,
@@ -52,10 +71,10 @@ def main() -> None:
     )
     loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    print(f"Evaluating on {len(test_ds):,} samples (checkpoint={args.checkpoint_path})")
+    logger.info(f"Evaluating on {len(test_ds):,} samples (checkpoint={checkpoint_path})")
     metrics = evaluate(model, loader, device)
     for name, value in metrics.items():
-        print(f"{name}: {value:.4f}")
+        logger.info(f"{name}: {value:.4f}")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ train:
   per_device_train_batch_size: 512
   per_device_eval_batch_size: 2048
   dataloader_num_workers: 4
+  torch_compile: true
   num_train_epochs: 80
   remove_unused_columns: false
   save_strategy: epoch
@@ -26,7 +27,7 @@ train:
   metric_for_best_model: loss
   greater_is_better: false
   seed: ${seed}
-  full_determinism: true
+  full_determinism: false
 
 callbacks:
   early_stopping:
