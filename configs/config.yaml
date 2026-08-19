@@ -3,7 +3,7 @@ defaults:
   - model: baseline
   - _self_
 
-project_name: gir
+project_name: baseline
 seed: 42
 device: cuda
 

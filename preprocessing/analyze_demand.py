@@ -48,9 +48,33 @@ def plot_demand_distribution(city: str, npy_path: Path) -> Path:
     return output_path
 
 
+def plot_daily_avg_heatmap(city: str, npy_path: Path) -> Path:
+    grid = np.load(npy_path)
+    n_days = grid.shape[0] / 24
+    daily_avg = grid.sum(axis=0) / n_days  # (H, W)
+
+    fig, ax = plt.subplots(figsize=(grid.shape[2] * 0.5 + 2, grid.shape[1] * 0.5 + 2))
+    image = ax.imshow(daily_avg, cmap='hot', interpolation='nearest')
+    ax.set_title(f'{city.upper()} Daily Avg Demand per Grid Cell ({n_days:.0f} days)')
+    ax.set_xlabel('grid col')
+    ax.set_ylabel('grid row')
+    plt.colorbar(image, ax=ax, label='Daily avg demand')
+
+    output_dir = BASE_DIR / city / 'analyze'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / 'daily_avg_heatmap.png'
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+    print(f'[{city}] saved to {output_path}')
+    return output_path
+
+
 def main() -> None:
     for city, npy_path in CITIES.items():
         plot_demand_distribution(city, npy_path)
+        plot_daily_avg_heatmap(city, npy_path)
 
 
 if __name__ == '__main__':
