@@ -1,0 +1,14 @@
+output
+.vscode
+__pycache__/
+*.pyc
+.env
+logs/
+checkpoints/
+.DS_Store
+multirun
+outputs
+data/
+.omc/
+preprocessing/**/raw/
+preprocessing/**/output/

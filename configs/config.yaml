@@ -1,0 +1,38 @@
+project_name: gir
+seed: 42
+device: cuda
+
+dataset:
+model:
+
+train:
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 64
+  num_train_epochs: 80
+  remove_unused_columns: false
+  save_strategy: epoch
+  save_total_limit: 1
+  optim: adamw_torch
+  learning_rate: 5e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  logging_steps: 500
+  eval_strategy: epoch
+
+  load_best_model_at_end: true
+  metric_for_best_model: loss
+  greater_is_better: false
+  seed: ${seed}
+  full_determinism: true
+
+callbacks:
+  early_stopping:
+    min_epochs: 20
+    early_stopping_patience: 3
+
+hydra:
+  run:
+    dir: output/${project_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: output/${project_name}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
