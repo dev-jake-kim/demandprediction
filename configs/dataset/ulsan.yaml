@@ -1,0 +1,6 @@
+city: ulsan
+npy_path: data/raw/ulsan_temporal_grid.npy
+time_step: 24
+# 시간순 분할 (셔플 X) - train_ratio + val_ratio < 1, 나머지는 test
+train_ratio: 0.7
+val_ratio: 0.15

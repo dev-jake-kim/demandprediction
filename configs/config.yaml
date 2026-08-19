@@ -1,13 +1,16 @@
+defaults:
+  - dataset: ulsan
+  - model: baseline
+  - _self_
+
 project_name: gir
 seed: 42
 device: cuda
 
-dataset:
-model:
-
 train:
-  per_device_train_batch_size: 32
-  per_device_eval_batch_size: 64
+  per_device_train_batch_size: 512
+  per_device_eval_batch_size: 2048
+  dataloader_num_workers: 4
   num_train_epochs: 80
   remove_unused_columns: false
   save_strategy: epoch

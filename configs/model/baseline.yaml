@@ -1,0 +1,11 @@
+# GridDemandConfig 하이퍼파라미터. H, W는 dataset 로드 후 train.py에서 채운다.
+a: 2
+d_model: 64
+n_layers: 2
+n_heads: 4
+dim_feedforward: 128
+dropout: 0.1
+lstm_hidden: 64
+lstm_layers: 1
+loss_gamma: 1.0
+loss_eps: 0.5

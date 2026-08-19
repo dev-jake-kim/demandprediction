@@ -20,7 +20,7 @@ node_id → (h, w) = divmod(node_id, W)
     격자 안  → emb = FourierEmbed(log1p(demand[b, t, h+di, w+dj]))   # (d_model,)
     격자 밖  → emb = special_emb[EDGE]                                # (d_model,)
 
-CLS = special_emb[CLS]  # (d_model,)
+CLS = special_emb[CLS] + node_emb[node_id]  # (d_model,) — 노드 고유 임베딩을 CLS에 더함
 seq = concat([CLS, emb_1, ..., emb_(2a+1)^2])           # ((2a+1)^2+1, d_model)
 seq = seq + positional_emb                               # learnable, 길이 (2a+1)^2+1
 
@@ -45,6 +45,12 @@ x: (B, k, (2a+1)^2+1, d_model) → reshape (B*k, (2a+1)^2+1, d_model)
 
 - `nn.Embedding(2, d_model)`: index 0 = CLS, index 1 = EDGE(격자 밖 이웃 대체).
 - EDGE 토큰은 `demand=0`과 의미가 다름(실제 데이터가 없는 위치) → Fourier로 계산하지 않고 이 토큰으로 대체.
+
+### 1-2-1. 노드 고유 임베딩
+
+- `nn.Embedding(H*W, d_model)`을 `node_id`로 조회해서 `special_emb[CLS]`에 더함 (`CLS = special_emb[CLS] + node_emb[node_id]`).
+- 이웃 수요 패턴만으로는 "이 노드가 원래 어떤 위치인지"(상습 hotspot vs 조용한 곳 등)를 구분 못 하는 문제를 보완 — CLS 자체가 "이 노드 전용 CLS"가 되어 스스로 attention부터 노드 정체성을 반영.
+- `node_id`는 각 timestep(`k`)마다 동일하므로, CLS에 한 번 실어서 encoder 전체 시퀀스에 전파되게 함.
 
 ### 1-3. Positional embedding
 
