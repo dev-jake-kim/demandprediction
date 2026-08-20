@@ -42,7 +42,7 @@ class STResNetBranch(nn.Module):
         self.conv2 = nn.Conv2d(num_filters, out_channels, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(x)
+        h = F.relu(self.conv1(x))  # 식(2): X^(1) = f(W^(1)*X^(0) + b^(1))
         for unit in self.res_units:
             h = unit(h)
         return self.conv2(F.relu(h))

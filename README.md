@@ -30,11 +30,11 @@ python train.py train.num_train_epochs=50 model.num_res_units=6   # 하이퍼파
 학습 프로세스와 무관하게, 체크포인트 경로 + 평가할 npy 데이터만 있으면 언제든 독립 실행된다.
 
 ```bash
-python test.py <checkpoint_path> --npy_path data/raw/ulsan_temporal_grid.npy --l_c 3 --l_p 1 --l_q 1 --t_start <test 구간 시작 timestep>
+python test.py <checkpoint_path> --npy_path data/raw/ulsan_temporal_grid.npy --t_start <test 구간 시작 timestep>
 ```
 
 - `<checkpoint_path>`: train.py가 저장한 `output/.../` 디렉토리 (`config.json` + `model.safetensors`가 있는 곳)
-- `--l_c/--l_p/--l_q`: 학습 때 쓴 `configs/dataset/*.yaml`의 값과 동일하게 맞춰야 함
+- `l_c/l_p/l_q`: CLI로 받지 않고 체크포인트의 `config.json`(=학습 때 쓴 값)을 그대로 사용함
 - `--t_start`: train.py 로그에 찍힌 val 구간 끝 지점(=test 구간 시작)을 그대로 넣으면 됨. 생략하면 전체 구간을 평가.
 - 출력: RMSE, MAE, MAPE(+1, 0-수요 스무딩)
 

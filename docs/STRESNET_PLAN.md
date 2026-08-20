@@ -52,7 +52,7 @@ loss = CombinedLoss(logits, labels)                      # baseline/ADFormer와 
 | loss | 논문의 단순 MSE 대신 `CombinedLoss`(baseline/ADFormer와 동일) | 비교의 유일한 변수를 아키텍처로 고정 |
 | `l_c/l_p/l_q` 기본값 | 논문 예시(3~5/1~4/1~4)보다 작게(3/1/1) | 우리 데이터가 논문 실험(1년+)보다 짧아(ulsan 182일) trend lookback으로 인한 학습 샘플 손실을 줄임 |
 | 정규화 | Min-Max `[-1,1]`(demand_min/max, train 구간 `grid[:t_end]` 전체 — target뿐 아니라 closeness/period/trend가 참조하는 `t_start` 이전 구간도 포함해야 함, 처음엔 이 부분을 빠뜨렸다가 Codex 리뷰에서 잡음) | 논문의 tanh 출력 범위와 직접 대응 |
-| ResUnit 마지막 Conv2 앞 ReLU | 표준 pre-activation ResNet 관례를 따라 추가 | 논문 본문/그림에 이 세부사항이 명시돼 있지 않음 |
+| ResUnit 마지막 Conv2 앞 ReLU | 그대로 구현 | 논문 본문이 residual 함수를 "ReLU+Conv" 두 조합으로 명시(Figure 4b와도 일치) — 별도 판단 아님, 논문 그대로 |
 
 ## 3. HuggingFace 통합
 

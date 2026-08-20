@@ -29,19 +29,17 @@ def evaluate(model: STResNetModel, loader: DataLoader, device: str) -> dict[str,
     all_preds = []
     all_labels = []
 
+    # l_c/l_p/l_q=0으로 비활성화된 브랜치는 GridDemandDataset이 해당 키 자체를 안 돌려주므로
+    # (models/modeling.py의 forward()가 Optional 인자를 None으로 받는 것과 짝을 맞춤) 배치에
+    # 실제로 있는 키만 모델에 넘긴다 — 무조건 조회하면 KeyError가 남.
+    branch_keys = ("demands_closeness", "demands_period", "demands_trend")
+
     with torch.no_grad():
         for batch in tqdm(loader, desc="evaluate"):
-            demands_closeness = batch["demands_closeness"].to(device)
-            demands_period = batch["demands_period"].to(device)
-            demands_trend = batch["demands_trend"].to(device)
-            day_of_week = batch["day_of_week"].to(device)
+            model_inputs = {key: batch[key].to(device) for key in branch_keys if key in batch}
+            model_inputs["day_of_week"] = batch["day_of_week"].to(device)
 
-            out = model(
-                demands_closeness=demands_closeness,
-                demands_period=demands_period,
-                demands_trend=demands_trend,
-                day_of_week=day_of_week,
-            )
+            out = model(**model_inputs)
             all_preds.append(out["logits"].cpu().numpy())
             all_labels.append(batch["labels"].numpy())
 
@@ -54,9 +52,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="checkpoint_path만 주면 학습 프로세스와 무관하게 단독 실행되는 평가 스크립트")
     parser.add_argument("checkpoint_path", type=str, help="model.save_pretrained()로 저장된 체크포인트 디렉토리")
     parser.add_argument("--npy_path", type=str, required=True, help="예: data/raw/ulsan_temporal_grid.npy")
-    parser.add_argument("--l_c", type=int, default=3)
-    parser.add_argument("--l_p", type=int, default=1)
-    parser.add_argument("--l_q", type=int, default=1)
     parser.add_argument("--t_start", type=int, default=None, help="평가에 사용할 target 시간 구간 시작 (예: test split 경계)")
     parser.add_argument("--t_end", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -72,11 +67,14 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = STResNetModel.from_pretrained(checkpoint_path).to(device)
 
+    # l_c/l_p/l_q는 CLI로 다시 받지 않고 체크포인트에 저장된 config를 그대로 쓴다 — 학습 때 쓴 값과
+    # 어긋나면 closeness/period/trend 시퀀스 길이가 모델 가중치(Conv1 in_channels)와 안 맞아 바로
+    # shape 에러가 나거나, 최악의 경우 조용히 잘못된 길이로 평가될 수 있음.
     test_ds = GridDemandDataset(
         args.npy_path,
-        l_c=args.l_c,
-        l_p=args.l_p,
-        l_q=args.l_q,
+        l_c=model.config.l_c,
+        l_p=model.config.l_p,
+        l_q=model.config.l_q,
         t_start=args.t_start,
         t_end=args.t_end,
     )
