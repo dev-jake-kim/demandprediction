@@ -32,9 +32,8 @@ def evaluate(model: GridDemandModel, loader: DataLoader, device: str) -> dict[st
     with torch.no_grad():
         for batch in tqdm(loader, desc="evaluate"):
             demands = batch["demands"].to(device)
-            node_id = batch["node_id"].to(device)
 
-            out = model(demands=demands, node_id=node_id)
+            out = model(demands=demands)
             all_preds.append(out["logits"].cpu().numpy())
             all_labels.append(batch["labels"].numpy())
 
@@ -50,7 +49,7 @@ def main() -> None:
     parser.add_argument("--time_step", type=int, default=24)
     parser.add_argument("--t_start", type=int, default=None, help="평가에 사용할 target 시간 구간 시작 (예: test split 경계)")
     parser.add_argument("--t_end", type=int, default=None)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=8)  # 이제 한 샘플이 H*W개 노드를 전부 예측
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--log_file", type=str, default=None, help="기본값: <checkpoint_path>/test.log")
     args = parser.parse_args()

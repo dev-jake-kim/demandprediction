@@ -1,8 +1,11 @@
 # 수요 예측 모델 구현 계획
 
-`(t-k, t-1)` 시간의 격자 수요로 `t` 시점의 특정 노드(격자셀) 수요를 예측하는 baseline 모델.
-`dataset_frame.GridDemandDataset`이 이미 `(demands, labels, node_id, sample_idx)` 형태로 샘플을
-공급하고 있고(→ `docs/STRUCTURE.md`), 이 문서는 그 위에 올라갈 모델/학습/평가를 설계한다.
+`(t-k, t-1)` 시간의 격자 수요로 `t` 시점의 **전체 격자(H*W개 노드)** 수요를 한 forward에서 함께
+예측하는 baseline 모델. 원래는 노드마다 독립적으로 forward/backward를 도는 구조였지만, 노드별로
+따로 backprop할 이유가 없어 샘플을 시간(t) 단위로 바꾸고 모델이 내부에서 N=H*W개 노드에 대해
+벡터화 연산을 하도록 변경했다 (개별 노드가 보는 연산 자체는 이전과 동일 — 배치 차원만 늘어남, §2 참고).
+`dataset_frame.GridDemandDataset`이 `(demands, labels, sample_idx)` 형태로 샘플을 공급하고
+있고(→ `docs/STRUCTURE.md`), 이 문서는 그 위에 올라갈 모델/학습/평가를 설계한다.
 
 ## 표기
 
@@ -13,22 +16,25 @@
 
 ## 1. 모델 아키텍처
 
+N=H*W(전체 노드 수). 아래 연산은 노드 0..N-1 전부에 대해 **벡터화**로 한 번에 계산되지만,
+각 노드가 보는 입력(자기 자신의 (2a+1)^2 이웃 + 자기 CLS)은 서로 완전히 독립적이라
+"노드마다 따로 도는 것"과 수치적으로 동일하다 (§2 참고).
+
 ```
-node_id → (h, w) = divmod(node_id, W)
+노드 0..N-1 각각에 대해 (h,w) = divmod(node, W):
+  각 (b, t)에 대해 (2a+1)^2개 이웃 위치 (h+di, w+dj), di,dj ∈ [-a, a]:
+      격자 안  → emb = FourierEmbed(log1p(demand[b, t, h+di, w+dj]))   # (d_model,)
+      격자 밖  → emb = special_emb[EDGE]                                # (d_model,)
 
-각 (b, t)에 대해 (2a+1)^2개 이웃 위치 (h+di, w+dj), di,dj ∈ [-a, a]:
-    격자 안  → emb = FourierEmbed(log1p(demand[b, t, h+di, w+dj]))   # (d_model,)
-    격자 밖  → emb = special_emb[EDGE]                                # (d_model,)
+  CLS = special_emb[CLS] + node_emb[node]  # (d_model,) — 노드 고유 임베딩을 CLS에 더함
+  seq = concat([CLS, emb_1, ..., emb_(2a+1)^2])           # ((2a+1)^2+1, d_model)
+  seq = seq + positional_emb                               # learnable, 길이 (2a+1)^2+1
 
-CLS = special_emb[CLS] + node_emb[node_id]  # (d_model,) — 노드 고유 임베딩을 CLS에 더함
-seq = concat([CLS, emb_1, ..., emb_(2a+1)^2])           # ((2a+1)^2+1, d_model)
-seq = seq + positional_emb                               # learnable, 길이 (2a+1)^2+1
-
-x: (B, k, (2a+1)^2+1, d_model) → reshape (B*k, (2a+1)^2+1, d_model)
-  → TransformerEncoder → CLS 출력만 추출                  # (B*k, d_model)
-  → reshape (B, k, d_model)
-  → LSTM(batch_first=True) → 마지막 timestep 출력          # (B, d_model)
-  → Linear(d_model, 1) → Softplus                         # (B,)  (수요는 음수 불가)
+x: (B, k, N, (2a+1)^2+1, d_model) → reshape (B*k*N, (2a+1)^2+1, d_model)
+  → TransformerEncoder → CLS 출력만 추출                  # (B*k*N, d_model)
+  → reshape (B, k, N, d_model) → permute → (B*N, k, d_model)
+  → LSTM(batch_first=True) → 마지막 timestep 출력          # (B*N, d_model) → reshape (B,N,d_model)
+  → Linear(d_model, 1) → Softplus → reshape                # (B, H, W)  (수요는 음수 불가)
 ```
 
 ### 1-1. 스칼라 임베딩 `FourierEmbed` (교체 가능하게 설계)
@@ -48,9 +54,10 @@ x: (B, k, (2a+1)^2+1, d_model) → reshape (B*k, (2a+1)^2+1, d_model)
 
 ### 1-2-1. 노드 고유 임베딩
 
-- `nn.Embedding(H*W, d_model)`을 `node_id`로 조회해서 `special_emb[CLS]`에 더함 (`CLS = special_emb[CLS] + node_emb[node_id]`).
+- `nn.Embedding(H*W, d_model)`. 모든 노드를 한 번에 예측하므로 `node_embed.weight`(N,d_model) 전체를
+  그대로 `special_emb[CLS]`에 더해 N개 노드 각각의 CLS를 구성한다 (`CLS = special_emb[CLS] + node_embed.weight`).
 - 이웃 수요 패턴만으로는 "이 노드가 원래 어떤 위치인지"(상습 hotspot vs 조용한 곳 등)를 구분 못 하는 문제를 보완 — CLS 자체가 "이 노드 전용 CLS"가 되어 스스로 attention부터 노드 정체성을 반영.
-- `node_id`는 각 timestep(`k`)마다 동일하므로, CLS에 한 번 실어서 encoder 전체 시퀀스에 전파되게 함.
+- 노드 정체성은 각 timestep(`k`)마다 동일하므로, CLS에 한 번 실어서 encoder 전체 시퀀스에 전파되게 함.
 
 ### 1-3. Positional embedding
 
@@ -71,14 +78,20 @@ x: (B, k, (2a+1)^2+1, d_model) → reshape (B*k, (2a+1)^2+1, d_model)
 | `lstm_hidden` | 64 (=`d_model`) | LSTM hidden size |
 | `lstm_layers` | 1 | LSTM layer 수 |
 
-## 2. 배치 크롭 구현 방식
+## 2. 배치 크롭 구현 방식 (`GridDemandModel._crop_all_nodes`)
 
-`node_id`마다 크롭 중심이 다르므로 배치 전체를 파이썬 for-loop로 자르면 느림. 대신:
+N=H*W개 노드 전부를, 그것도 배치 전체에 대해 파이썬 for-loop 없이 한 번에 잘라낸다:
 
-1. `demands: (B, k, H, W)`를 `F.pad`로 사방 `a`만큼 0-padding → `(B, k, H+2a, W+2a)`.
-2. `h, w = divmod(node_id, W)`로 배치별 중심 좌표 계산 (padding 후 좌표는 `h+a, w+a`).
-3. `unfold` 또는 advanced indexing(`torch.gather`/좌표 기반 슬라이싱을 벡터화)으로 배치별 `(2a+1)×(2a+1)` 윈도우를 한 번에 추출.
-4. padding으로 채워진 0 값 자체는 버리고, **padding 여부(격자 밖인지)**를 별도 boolean 마스크로 계산해 EDGE 토큰 대체 여부를 결정한다 (0-padding 값과 EDGE 토큰 의미를 분리하기 위해 마스크는 padding 여부로 직접 계산하지, 값이 0인지로 유추하지 않는다).
+1. `demands: (B, k, H, W)`를 `F.pad`로 사방 `a`만큼 0-padding → `(B, k, H+2a, W+2a)` → `(B,k,-1)`로 펼침.
+2. `__init__`에서 노드 0..N-1 전부에 대해 미리 계산해둔 `idx_table`/`mask_table`(N, n_neighbors) —
+   각 노드의 `(2a+1)×(2a+1)` 이웃이 padded grid의 어느 flat index에 해당하는지, 격자 밖인지 여부.
+3. `padded_flat[:, :, idx_table.reshape(-1)].reshape(B,k,N,n_neighbors)` — advanced indexing 한 번으로
+   B,k 전체 × N개 노드의 이웃 값을 동시에 뽑아낸다 (`torch.gather` 없이 기본 인덱싱만으로 충분).
+4. `mask_table`(N,n_neighbors, 배치/시간 축 없음)을 그대로 브로드캐스트해서 EDGE 토큰 대체 여부를 결정한다
+   (0-padding 값과 EDGE 토큰 의미를 분리하기 위해 마스크는 padding 여부로 직접 계산하지, 값이 0인지로 유추하지 않는다).
+
+`idx_table`/`mask_table`은 H,W,a로만 정해지는 순수 함수라 `node_id`를 인자로 받지 않고도(=모든 노드에 대해)
+그대로 재사용 가능 — 예전에 특정 `node_id`의 행만 골라 쓰던 것을 전체 사용으로만 바꾼 것.
 
 ## 3. Loss
 
@@ -106,7 +119,10 @@ class CombinedLoss(nn.Module):
 ## 5. HuggingFace 통합
 
 - `models/config.py`: `GridDemandConfig(PretrainedConfig)` — 위 1-4 하이퍼파라미터 + `H, W`(도시별 격자 크기)를 필드로.
-- `models/modeling.py`: `GridDemandModel(PreTrainedModel)` — `forward(demands, node_id, labels=None, sample_idx=None)` → `labels`가 있으면 `{'loss', 'logits'}`, 없으면 `{'logits'}` 반환 (HF `Trainer` 호환).
+- `models/modeling.py`: `GridDemandModel(PreTrainedModel)` — `forward(demands, labels=None, sample_idx=None)` → `logits`는 `(B,H,W)`(전체 노드), `labels`가 있으면 `{'loss', 'logits'}`, 없으면 `{'logits'}` 반환 (HF `Trainer` 호환).
+- 노드별 backprop을 없애고 한 forward에서 N=H*W개 노드를 다 예측하도록 바꾸면서 step당 연산량이 N배로
+  늘어남 (ulsan N=168, porto N=200) → `configs/config.yaml`의 `per_device_train/eval_batch_size`를
+  그만큼 낮춰야 함 (기본값 4/8, 실제 GPU 메모리에 맞춰 조정).
 - `trainer.save_model(output_dir)` / `model.save_pretrained(output_dir)` → `config.json` + 가중치가 한 번에 저장되어, `test.py`에서 `GridDemandModel.from_pretrained(checkpoint_path)`만으로 아키텍처+가중치 복원 가능 (hydra model config 재참조 불필요).
 
 ## 6. Hydra 설정 구조

@@ -12,7 +12,7 @@ gir/
 │       └── porto_temporal_grid.npy
 ├── dataset_frame/
 │   ├── __init__.py
-│   └── grid_demand_dataset.py # GridDemandDataset (npy -> demands/labels/node_id/sample_idx)
+│   └── grid_demand_dataset.py # GridDemandDataset (npy -> demands/labels/sample_idx, 샘플=시간 t 1개=전체 노드)
 ├── models/                    # 비어있음
 ├── output/                    # 비어있음 (hydra.run.dir 대상)
 ├── preprocessing/

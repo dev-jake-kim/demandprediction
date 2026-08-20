@@ -8,10 +8,14 @@ seed: 42
 device: cuda
 
 train:
-  per_device_train_batch_size: 512
-  per_device_eval_batch_size: 2048
+  # 노드별 backprop을 없애고 한 step에 전체 H*W개 노드를 같이 예측하도록 바꾸면서
+  # step당 연산량이 H*W배(ulsan 168, porto 200) 늘어남 -> batch size를 크게 낮춤.
+  # 실제 GPU 메모리에 맞춰 조정 필요.
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 8
   dataloader_num_workers: 4
   torch_compile: true
+  disable_tqdm: true
   num_train_epochs: 80
   remove_unused_columns: false
   save_strategy: epoch
