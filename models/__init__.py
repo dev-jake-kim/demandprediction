@@ -1,14 +1,11 @@
-from .config import GridDemandConfig
-from .embeddings import FourierScalarEmbedding, ScalarEmbedding
+from .config import STResNetConfig
 from .losses import CombinedLoss
 from .metrics import compute_regression_metrics
-from .modeling import GridDemandModel
+from .modeling import STResNetModel
 
 __all__ = [
     'CombinedLoss',
-    'FourierScalarEmbedding',
-    'GridDemandConfig',
-    'GridDemandModel',
-    'ScalarEmbedding',
+    'STResNetConfig',
+    'STResNetModel',
     'compute_regression_metrics',
 ]

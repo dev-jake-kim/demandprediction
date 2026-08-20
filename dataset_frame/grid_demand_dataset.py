@@ -6,38 +6,46 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+PERIOD = 24  # 하루(시간) — 논문의 p
+TREND_SPAN = 24 * 7  # 일주일(시간) — 논문의 q
+
 
 class GridDemandDataset(Dataset):
     """전처리 파이프라인(`preprocessing/*/create_graph.py`)이 저장한
-    `temporal_grid.npy`((T, X, Y), 시간대별 격자 수요)를 읽어,
-    직전 `time_step`시간(t-k ~ t-1)의 전체 격자 수요로 t시점의 전체 격자(X*Y개 노드) 수요를
-    한 번에 예측하는 샘플을 만든다. 샘플 하나 = 시간 t 하나 (노드별로 나누지 않음 —
-    노드별 forward/backward는 `GridDemandModel`이 배치 차원을 늘려서 벡터화로 처리한다).
+    `temporal_grid.npy`((T, X, Y), 시간대별 격자 수요)를 읽어, ST-ResNet이 요구하는
+    closeness/period/trend 세 시퀀스 + 예측 시점 t의 외부 요인(day_of_week)으로 샘플을 만든다.
+
+    - closeness: t 직전 l_c개 연속 시간
+    - period: 하루(PERIOD) 간격으로 l_p개 (t-PERIOD, t-2*PERIOD, ...)
+    - trend: 일주일(TREND_SPAN) 간격으로 l_q개 (t-TREND_SPAN, t-2*TREND_SPAN, ...)
+    - day_of_week: t로부터 산술 계산(`(t//24)%7`) — 실제 달력에 맞출 필요 없음(공휴일 미사용,
+      요일 주기성만 학습에 쓰이므로 t=0을 무슨 요일로 보든 전역적으로 일관되면 무해함).
 
     반환 형식은 HuggingFace `Trainer`에서 바로 쓸 수 있도록
-    `{'demands', 'labels', 'sample_idx'}` 딕셔너리로 고정한다
-    (configs/config.yaml의 `remove_unused_columns: false`와 짝을 맞춤 —
-    `sample_idx`는 모델 forward에 안 쓰여도 collate 단계에서 제거되지 않음).
+    `{'demands_closeness', 'demands_period', 'demands_trend', 'day_of_week', 'labels', 'sample_idx'}`
+    딕셔너리로 고정한다(configs/config.yaml의 `remove_unused_columns: false`와 짝을 맞춤).
     """
 
     def __init__(
         self,
         npy_path: str | Path,
-        time_step: int,
+        l_c: int,
+        l_p: int,
+        l_q: int,
         t_start: int | None = None,
         t_end: int | None = None,
     ) -> None:
         self.grid = np.load(npy_path).astype(np.float32)  # (T, X, Y)
-        self.time_step = time_step
+        self.l_c, self.l_p, self.l_q = l_c, l_p, l_q
         self.T, self.X, self.Y = self.grid.shape
 
-        min_t_start = self.time_step
+        min_t_start = max(l_c, l_p * PERIOD, l_q * TREND_SPAN)
         self.t_start = min_t_start if t_start is None else max(t_start, min_t_start)
         self.t_end = self.T if t_end is None else min(t_end, self.T)
         if self.t_start >= self.t_end:
             raise ValueError(
                 f"유효한 target 시간 구간이 없음: t_start={self.t_start}, t_end={self.t_end} "
-                f"(time_step={self.time_step}로 최소 {min_t_start} 이상 필요)"
+                f"(l_c={l_c}, l_p={l_p}*{PERIOD}, l_q={l_q}*{TREND_SPAN}로 최소 {min_t_start} 이상 필요)"
             )
 
         self.n_t = self.t_end - self.t_start
@@ -48,11 +56,24 @@ class GridDemandDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         t = self.t_start + idx
 
-        demand_seq = self.grid[t - self.time_step:t]  # (time_step, X, Y)
-        label = self.grid[t]  # (X, Y) - 전체 노드
+        label = self.grid[t]  # (X, Y)
+        day_of_week = (t // 24) % 7
 
-        return {
-            'demands': torch.from_numpy(demand_seq),
+        sample = {
+            'day_of_week': torch.tensor(day_of_week, dtype=torch.long),
             'labels': torch.from_numpy(label),
             'sample_idx': torch.tensor(idx, dtype=torch.long),
         }
+
+        # l_c/l_p/l_q=0이면 해당 시퀀스는 키 자체를 안 넣는다 — 모델이 그 브랜치를 비활성화했을 때
+        # forward()의 Optional 인자가 기본값(None)으로 채워지도록.
+        if self.l_c > 0:
+            sample['demands_closeness'] = torch.from_numpy(self.grid[t - self.l_c:t])  # (l_c,X,Y), 오래된 순
+        if self.l_p > 0:
+            period_idx = [t - PERIOD * i for i in range(self.l_p, 0, -1)]
+            sample['demands_period'] = torch.from_numpy(self.grid[period_idx])  # (l_p,X,Y), 오래된 순
+        if self.l_q > 0:
+            trend_idx = [t - TREND_SPAN * i for i in range(self.l_q, 0, -1)]
+            sample['demands_trend'] = torch.from_numpy(self.grid[trend_idx])  # (l_q,X,Y), 오래된 순
+
+        return sample

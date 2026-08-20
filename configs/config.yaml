@@ -1,20 +1,19 @@
 defaults:
   - dataset: ulsan
-  - model: baseline
+  - model: stresnet
   - _self_
 
-project_name: baseline
+project_name: stresnet
 seed: 42
 device: cuda
 
 train:
-  # 노드별 backprop을 없애고 한 step에 전체 H*W개 노드를 같이 예측하도록 바꾸면서
-  # step당 연산량이 H*W배(ulsan 168, porto 200) 늘어남 -> batch size를 크게 낮춤.
-  # 실제 GPU 메모리에 맞춰 조정 필요.
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 8
+  # ST-ResNet은 로컬 3x3 conv(+padding으로 해상도 유지)라 ADFormer(전역 N x N attention)보다
+  # 훨씬 가벼움 -> baseline/ADFormer보다 큰 배치로 시작, 실측 후 조정.
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 64
   dataloader_num_workers: 4
-  torch_compile: true
+  torch_compile: false
   disable_tqdm: true
   num_train_epochs: 80
   remove_unused_columns: false

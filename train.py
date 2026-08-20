@@ -8,7 +8,7 @@ from omegaconf import DictConfig, OmegaConf
 from transformers import Trainer, TrainerCallback, TrainingArguments
 
 from dataset_frame import GridDemandDataset
-from models import GridDemandConfig, GridDemandModel, compute_regression_metrics
+from models import STResNetConfig, STResNetModel, compute_regression_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -24,20 +24,20 @@ class LoggingCallback(TrainerCallback):
 
 def build_datasets(cfg: DictConfig) -> tuple[GridDemandDataset, GridDemandDataset, GridDemandDataset]:
     npy_path = cfg.dataset.npy_path
-    time_step = cfg.dataset.time_step
+    l_c, l_p, l_q = cfg.dataset.l_c, cfg.dataset.l_p, cfg.dataset.l_q
 
-    full_ds = GridDemandDataset(npy_path, time_step=time_step)
+    full_ds = GridDemandDataset(npy_path, l_c=l_c, l_p=l_p, l_q=l_q)
     T = full_ds.T
     split1 = int(T * cfg.dataset.train_ratio)
     split2 = int(T * (cfg.dataset.train_ratio + cfg.dataset.val_ratio))
 
-    train_ds = GridDemandDataset(npy_path, time_step=time_step, t_end=split1)
-    val_ds = GridDemandDataset(npy_path, time_step=time_step, t_start=split1, t_end=split2)
-    test_ds = GridDemandDataset(npy_path, time_step=time_step, t_start=split2)
+    train_ds = GridDemandDataset(npy_path, l_c=l_c, l_p=l_p, l_q=l_q, t_end=split1)
+    val_ds = GridDemandDataset(npy_path, l_c=l_c, l_p=l_p, l_q=l_q, t_start=split1, t_end=split2)
+    test_ds = GridDemandDataset(npy_path, l_c=l_c, l_p=l_p, l_q=l_q, t_start=split2)
 
     logger.info(
-        f"[{cfg.dataset.city}] T={T}, H={full_ds.X}, W={full_ds.Y} | "
-        f"train t=[{time_step},{split1}) ({len(train_ds):,} samples), "
+        f"[{cfg.dataset.city}] T={T}, H={full_ds.X}, W={full_ds.Y}, l_c/l_p/l_q={l_c}/{l_p}/{l_q} | "
+        f"train t=[{train_ds.t_start},{split1}) ({len(train_ds):,} samples), "
         f"val t=[{split1},{split2}) ({len(val_ds):,} samples), "
         f"test t=[{split2},{T}) ({len(test_ds):,} samples)"
     )
@@ -52,9 +52,26 @@ def compute_metrics(eval_pred) -> dict[str, float]:
 def main(cfg: DictConfig) -> None:
     train_ds, val_ds, test_ds = build_datasets(cfg)
 
+    # 정규화 통계는 train 구간(0~t_end)까지로 계산 — t_start 이전이라도 closeness/period/trend
+    # 시퀀스가 실제로 참조하는 "입력"이라 t_start:t_end만 보면 그 부분이 누락됨(t_end 이후만 진짜
+    # test/val 쪽 값이라 시간 리크 없음).
+    train_grid = train_ds.grid[:train_ds.t_end]
+    demand_min = float(train_grid.min())
+    demand_max = float(train_grid.max())
+    logger.info(f"demand_min={demand_min:.4f}, demand_max={demand_max:.4f}")
+
     model_kwargs = OmegaConf.to_container(cfg.model, resolve=True)
-    model_config = GridDemandConfig(H=train_ds.X, W=train_ds.Y, **model_kwargs)
-    model = GridDemandModel(model_config)
+    model_config = STResNetConfig(
+        H=train_ds.X,
+        W=train_ds.Y,
+        l_c=cfg.dataset.l_c,
+        l_p=cfg.dataset.l_p,
+        l_q=cfg.dataset.l_q,
+        demand_min=demand_min,
+        demand_max=demand_max,
+        **model_kwargs,
+    )
+    model = STResNetModel(model_config)
 
     output_dir = HydraConfig.get().runtime.output_dir
     training_args = TrainingArguments(

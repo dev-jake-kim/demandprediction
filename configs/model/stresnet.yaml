@@ -1,0 +1,7 @@
+# STResNetConfig 하이퍼파라미터. 논문 최고 성능 변형(L12-E-BN) 기준.
+# H, W, l_c, l_p, l_q, demand_min/max는 dataset 로드 후 train.py에서 채운다.
+num_filters: 64
+num_res_units: 12
+use_bn: true
+loss_gamma: 1.0
+loss_eps: 0.5

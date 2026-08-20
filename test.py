@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset_frame import GridDemandDataset
-from models import GridDemandModel, compute_regression_metrics
+from models import STResNetModel, compute_regression_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -24,16 +24,24 @@ def setup_logging(log_path: Path) -> None:
     )
 
 
-def evaluate(model: GridDemandModel, loader: DataLoader, device: str) -> dict[str, float]:
+def evaluate(model: STResNetModel, loader: DataLoader, device: str) -> dict[str, float]:
     model.eval()
     all_preds = []
     all_labels = []
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="evaluate"):
-            demands = batch["demands"].to(device)
+            demands_closeness = batch["demands_closeness"].to(device)
+            demands_period = batch["demands_period"].to(device)
+            demands_trend = batch["demands_trend"].to(device)
+            day_of_week = batch["day_of_week"].to(device)
 
-            out = model(demands=demands)
+            out = model(
+                demands_closeness=demands_closeness,
+                demands_period=demands_period,
+                demands_trend=demands_trend,
+                day_of_week=day_of_week,
+            )
             all_preds.append(out["logits"].cpu().numpy())
             all_labels.append(batch["labels"].numpy())
 
@@ -46,10 +54,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="checkpoint_path만 주면 학습 프로세스와 무관하게 단독 실행되는 평가 스크립트")
     parser.add_argument("checkpoint_path", type=str, help="model.save_pretrained()로 저장된 체크포인트 디렉토리")
     parser.add_argument("--npy_path", type=str, required=True, help="예: data/raw/ulsan_temporal_grid.npy")
-    parser.add_argument("--time_step", type=int, default=24)
+    parser.add_argument("--l_c", type=int, default=3)
+    parser.add_argument("--l_p", type=int, default=1)
+    parser.add_argument("--l_q", type=int, default=1)
     parser.add_argument("--t_start", type=int, default=None, help="평가에 사용할 target 시간 구간 시작 (예: test split 경계)")
     parser.add_argument("--t_end", type=int, default=None)
-    parser.add_argument("--batch_size", type=int, default=8)  # 이제 한 샘플이 H*W개 노드를 전부 예측
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--log_file", type=str, default=None, help="기본값: <checkpoint_path>/test.log")
     args = parser.parse_args()
@@ -60,11 +70,13 @@ def main() -> None:
     logger.info(f"Logging to: {log_path}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = GridDemandModel.from_pretrained(checkpoint_path).to(device)
+    model = STResNetModel.from_pretrained(checkpoint_path).to(device)
 
     test_ds = GridDemandDataset(
         args.npy_path,
-        time_step=args.time_step,
+        l_c=args.l_c,
+        l_p=args.l_p,
+        l_q=args.l_q,
         t_start=args.t_start,
         t_end=args.t_end,
     )
