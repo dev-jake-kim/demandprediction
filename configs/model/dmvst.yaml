@@ -1,0 +1,14 @@
+# DMVSTConfig 하이퍼파라미터. H, W는 dataset 로드 후 train.py에서 채운다.
+# /home/jinsu/PycharmProjects/DMVST/configs/config.yaml의 검증된 값을 기본값으로 채택.
+num_filters: 4
+num_cnn_layers: 3
+kernel_size: 3
+demand_embedding_dim: 16
+temporal_embedding_dim: 8
+context_embedding_dim: 8
+lstm_hidden_size: 32
+lstm_num_layers: 2
+lstm_dropout: 0.1
+line_dim: 64
+loss_gamma: 1.0
+loss_eps: 0.5

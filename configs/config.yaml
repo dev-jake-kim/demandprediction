@@ -1,20 +1,20 @@
 defaults:
   - dataset: ulsan
-  - model: baseline
+  - model: dmvst
   - _self_
 
-project_name: baseline
+project_name: dmvst
 seed: 42
 device: cuda
 
 train:
-  # 노드별 backprop을 없애고 한 step에 전체 H*W개 노드를 같이 예측하도록 바꾸면서
-  # step당 연산량이 H*W배(ulsan 168, porto 200) 늘어남 -> batch size를 크게 낮춤.
-  # 실제 GPU 메모리에 맞춰 조정 필요.
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 8
+  # DMVST-Net은 한 step에 H*W개 노드를 전부 배치로 묶어 Local CNN(필터 4개, STResnet의 64개보다
+  # 훨씬 가벼움) + LSTM으로 처리 -> baseline(Transformer 인코더)보다는 가볍지만 STResnet(순수 conv,
+  # attention 없음)보다는 무거움 -> 중간값으로 시작, 실측 후 조정.
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 16
   dataloader_num_workers: 4
-  torch_compile: true
+  torch_compile: false
   disable_tqdm: true
   num_train_epochs: 80
   remove_unused_columns: false

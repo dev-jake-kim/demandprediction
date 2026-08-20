@@ -1,14 +1,11 @@
-from .config import GridDemandConfig
-from .embeddings import FourierScalarEmbedding, ScalarEmbedding
+from .config import DMVSTConfig
 from .losses import CombinedLoss
 from .metrics import compute_regression_metrics
-from .modeling import GridDemandModel
+from .modeling import DMVSTModel
 
 __all__ = [
     'CombinedLoss',
-    'FourierScalarEmbedding',
-    'GridDemandConfig',
-    'GridDemandModel',
-    'ScalarEmbedding',
+    'DMVSTConfig',
+    'DMVSTModel',
     'compute_regression_metrics',
 ]
