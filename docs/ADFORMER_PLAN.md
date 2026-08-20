@@ -86,6 +86,26 @@ end_conv1(window T -> horizon 1) -> end_conv2(skip_dim -> 1) -> 역표준화 -> 
 - `train.py`: `dataset.cluster_map_path`에서 클러스터 레벨 수를 자동 추론하고, train split grid로 `demand_mean/std`를 계산해 `ADFormerConfig`에 주입. 나머지(Trainer/TrainingArguments/compute_metrics/LoggingCallback/save/evaluate)는 baseline 때와 동일.
 - `test.py`: `node_id` 없이 `hour_of_day`/`day_of_week`를 넘기는 것만 baseline과 다름, 나머지 동일.
 
+## 4-1. PDF만 보고 리뷰 시 오탐 나는 두 지점 (공식 코드로 재확인 완료)
+
+논문 PDF 원문(식 12, 16, 17)만 근거로 리뷰하면 아래 두 지점이 "논문과 다르다"고 잘못 지적될 수 있다
+(실제로 Codex에 PDF만 첨부해 리뷰시켰을 때 둘 다 CHANGES_NEEDED로 지적됨). 공식 구현
+(`github.com/decisionintelligence/ADFormer`, `model/ADFormer.py`)의 실제 코드로 재확인한 결과 둘 다
+의도된 설계이며 수정 불필요:
+
+- **SCA `cls_sep`가 매 forward마다 `cluster_map`으로 재마스킹되지 않는 것**: 공식 코드의
+  `get_map_param()`도 `forward_map = torch.randn(map.size()) * map`를 `STEncoder.__init__`에서
+  **한 번만** 호출해 `nn.Parameter`로 저장하고, `forward()`에서는 그 파라미터를 그대로 재사용한다
+  (재마스킹 없음). 식(12) `M_sep^S = M_cls ⊙ M_sep`는 **초기화 공식**이지 forward마다 재적용하는
+  제약이 아니다.
+- **TAA `tmp_gate`가 순수 캘린더 피처(day/hour)에서만 계산되는 것**: 공식 코드도
+  `STEncoder.forward`에서 `tmp_map = self.tmp_map_linear(add_inf.transpose(1, 2))`로 동일하게
+  구현 — `add_inf`(외부/캘린더 피처)만 입력으로 쓰고 다른 hidden state는 안 씀. 식(17)의
+  `X_full[:,:,D:D']`는 정확히 이 캘린더 피처 슬라이스를 가리키는 것으로 확인.
+
+향후 PDF 기반 재리뷰를 돌릴 때는 이 섹션을 프롬프트에 같이 참고시켜서 같은 오탐이 반복되지 않게
+할 것.
+
 ## 5. 미확정 / 향후 조정
 
 - `per_device_train/eval_batch_size` 기본값(8/16)은 보수적 시작점 — N×N dense attention이라 baseline의 all-node(4/8→512/2048로 키웠던 것)보다 메모리 프로파일이 다르므로 실측 후 조정 필요.
