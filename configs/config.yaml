@@ -1,17 +1,20 @@
 defaults:
   - dataset: ulsan
-  - model: baseline
+  - model: adformer
   - _self_
 
-project_name: baseline
+project_name: adformer
 seed: 42
 device: cuda
 
 train:
-  per_device_train_batch_size: 512
-  per_device_eval_batch_size: 2048
+  # ADFormer는 매 layer마다 N x N(전 지역) dense attention을 여러 번(SDA/SCA/TSA/TAA) 돌아서
+  # baseline(all-node, 로컬 윈도우)보다 step당 메모리 사용량이 큼 -> 보수적으로 시작.
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 16
   dataloader_num_workers: 4
-  torch_compile: true
+  torch_compile: false  # ADFormer는 SDPA + 커스텀 einsum/matmul이 많아 우선 eager로 검증
+  disable_tqdm: false
   num_train_epochs: 80
   remove_unused_columns: false
   save_strategy: epoch

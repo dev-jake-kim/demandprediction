@@ -10,13 +10,17 @@ from torch.utils.data import Dataset
 class GridDemandDataset(Dataset):
     """전처리 파이프라인(`preprocessing/*/create_graph.py`)이 저장한
     `temporal_grid.npy`((T, X, Y), 시간대별 격자 수요)를 읽어,
-    직전 `time_step`시간(t-k ~ t-1)의 전체 격자 수요로 특정 노드의 t시점 수요를
-    예측하는 샘플을 만든다.
+    직전 `time_step`시간(t-k ~ t-1)의 전체 격자 수요로 t시점의 전체 격자(X*Y개 노드) 수요를
+    한 번에 예측하는 샘플을 만든다. 샘플 하나 = 시간 t 하나.
+
+    `hour_of_day`/`day_of_week`는 npy의 절대 시간 인덱스 t로부터 산술적으로만 계산한다
+    (`t % 24`, `(t // 24) % 7`) — 실제 달력 날짜에 맞출 필요 없음. ADFormer는 공휴일을 쓰지
+    않고 요일의 "주기성"만 학습하므로, t=0을 무슨 요일로 보든 같은 실제 요일이 항상 같은
+    label로 일관되게 매핑되기만 하면 학습에 영향이 없다.
 
     반환 형식은 HuggingFace `Trainer`에서 바로 쓸 수 있도록
-    `{'demands', 'labels', 'node_id', 'sample_idx'}` 딕셔너리로 고정한다
-    (configs/config.yaml의 `remove_unused_columns: false`와 짝을 맞춤 —
-    `node_id`/`sample_idx`는 모델 forward에 안 쓰여도 collate 단계에서 제거되지 않음).
+    `{'demands', 'labels', 'hour_of_day', 'day_of_week', 'sample_idx'}` 딕셔너리로 고정한다
+    (configs/config.yaml의 `remove_unused_columns: false`와 짝을 맞춤).
     """
 
     def __init__(
@@ -40,22 +44,24 @@ class GridDemandDataset(Dataset):
             )
 
         self.n_t = self.t_end - self.t_start
-        self.n_nodes = self.X * self.Y
 
     def __len__(self) -> int:
-        return self.n_t * self.n_nodes
+        return self.n_t
 
     def __getitem__(self, idx: int) -> dict:
-        t_pos, spatial_idx = divmod(idx, self.n_nodes)
-        x_idx, y_idx = divmod(spatial_idx, self.Y)
-        t = self.t_start + t_pos
+        t = self.t_start + idx
 
         demand_seq = self.grid[t - self.time_step:t]  # (time_step, X, Y)
-        label = self.grid[t, x_idx, y_idx]  # scalar
+        label = self.grid[t]  # (X, Y) - 전체 노드
+
+        abs_hours = np.arange(t - self.time_step, t)  # lookback 구간의 절대 시간 인덱스
+        hour_of_day = (abs_hours % 24).astype(np.int64)
+        day_of_week = ((abs_hours // 24) % 7).astype(np.int64)
 
         return {
             'demands': torch.from_numpy(demand_seq),
-            'labels': torch.tensor(label, dtype=torch.float32),
-            'node_id': torch.tensor(x_idx * self.Y + y_idx, dtype=torch.long),
+            'labels': torch.from_numpy(label),
+            'hour_of_day': torch.from_numpy(hour_of_day),
+            'day_of_week': torch.from_numpy(day_of_week),
             'sample_idx': torch.tensor(idx, dtype=torch.long),
         }

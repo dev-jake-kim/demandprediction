@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset_frame import GridDemandDataset
-from models import GridDemandModel, compute_regression_metrics
+from models import ADFormerModel, compute_regression_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ def setup_logging(log_path: Path) -> None:
     )
 
 
-def evaluate(model: GridDemandModel, loader: DataLoader, device: str) -> dict[str, float]:
+def evaluate(model: ADFormerModel, loader: DataLoader, device: str) -> dict[str, float]:
     model.eval()
     all_preds = []
     all_labels = []
@@ -32,9 +32,10 @@ def evaluate(model: GridDemandModel, loader: DataLoader, device: str) -> dict[st
     with torch.no_grad():
         for batch in tqdm(loader, desc="evaluate"):
             demands = batch["demands"].to(device)
-            node_id = batch["node_id"].to(device)
+            hour_of_day = batch["hour_of_day"].to(device)
+            day_of_week = batch["day_of_week"].to(device)
 
-            out = model(demands=demands, node_id=node_id)
+            out = model(demands=demands, hour_of_day=hour_of_day, day_of_week=day_of_week)
             all_preds.append(out["logits"].cpu().numpy())
             all_labels.append(batch["labels"].numpy())
 
@@ -61,7 +62,7 @@ def main() -> None:
     logger.info(f"Logging to: {log_path}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = GridDemandModel.from_pretrained(checkpoint_path).to(device)
+    model = ADFormerModel.from_pretrained(checkpoint_path).to(device)
 
     test_ds = GridDemandDataset(
         args.npy_path,

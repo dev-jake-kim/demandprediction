@@ -3,12 +3,13 @@ from __future__ import annotations
 import logging
 
 import hydra
+import numpy as np
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from transformers import Trainer, TrainerCallback, TrainingArguments
 
 from dataset_frame import GridDemandDataset
-from models import GridDemandConfig, GridDemandModel, compute_regression_metrics
+from models import ADFormerConfig, ADFormerModel, compute_regression_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +53,30 @@ def compute_metrics(eval_pred) -> dict[str, float]:
 def main(cfg: DictConfig) -> None:
     train_ds, val_ds, test_ds = build_datasets(cfg)
 
+    # train split에서만 정규화 통계와 클러스터 레벨 구성을 계산(시간 리크 방지)
+    train_grid = train_ds.grid[train_ds.time_step:train_ds.t_end]
+    demand_mean = float(train_grid.mean())
+    demand_std = float(train_grid.std())
+
+    cluster_data = np.load(cfg.dataset.cluster_map_path)
+    cluster_reg_nums = [cluster_data[f'level_{i}'].shape[0] for i in range(len(cluster_data.files))]
+    logger.info(
+        f"demand_mean={demand_mean:.4f}, demand_std={demand_std:.4f}, "
+        f"cluster_map_path={cfg.dataset.cluster_map_path}, cluster_reg_nums={cluster_reg_nums}"
+    )
+
     model_kwargs = OmegaConf.to_container(cfg.model, resolve=True)
-    model_config = GridDemandConfig(H=train_ds.X, W=train_ds.Y, **model_kwargs)
-    model = GridDemandModel(model_config)
+    model_config = ADFormerConfig(
+        H=train_ds.X,
+        W=train_ds.Y,
+        time_step=cfg.dataset.time_step,
+        cluster_map_path=cfg.dataset.cluster_map_path,
+        cluster_reg_nums=cluster_reg_nums,
+        demand_mean=demand_mean,
+        demand_std=demand_std,
+        **model_kwargs,
+    )
+    model = ADFormerModel(model_config)
 
     output_dir = HydraConfig.get().runtime.output_dir
     training_args = TrainingArguments(

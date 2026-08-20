@@ -1,0 +1,17 @@
+# ADFormerConfig 하이퍼파라미터. 공식 구현(utils/ADFormer_config.py) 기본값 기준.
+# H, W, time_step, cluster_map_path, demand_mean/std는 dataset 로드 후 train.py에서 채운다.
+embed_dim: 64
+SE_dim: 8
+skip_dim: 256
+s_heads: 3
+sa_heads: 2
+t_heads: 2
+ta_heads: 1
+cluster_seg_num: 2
+depth: 6
+mlp_ratio: 4
+attn_drop: 0.0
+agg_drop: 0.1
+drop_path: 0.3
+loss_gamma: 1.0
+loss_eps: 0.5

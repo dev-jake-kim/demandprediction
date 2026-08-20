@@ -1,8 +1,9 @@
-# gir
+# gir (branch: ADFormer)
 
 grid 단위 택시 수요 예측. `preprocessing/{ulsan,porto}`가 원본 데이터를 `data/raw/{city}_temporal_grid.npy`로
-전처리하고, `dataset_frame`/`models`가 그 npy로 학습/평가한다. 구조는 `docs/STRUCTURE.md`, 모델 설계는
-`docs/MODEL_PLAN.md` 참고.
+전처리하고, `dataset_frame`/`models`가 그 npy로 학습/평가한다. 이 브랜치는 `master`의 baseline 모델을
+지우고 논문 ADFormer(arXiv:2506.02576)를 구현했다. 구조는 `docs/STRUCTURE.md`, 모델 설계는
+`docs/ADFORMER_PLAN.md` 참고.
 
 ## 환경
 
@@ -10,14 +11,24 @@ grid 단위 택시 수요 예측. `preprocessing/{ulsan,porto}`가 원본 데이
 conda activate DA
 ```
 
+## 학습 전 준비: 클러스터 맵 생성
+
+ADFormer의 Spatial Cluster Attention이 쓰는 DTW 기반 지역 클러스터 맵을 먼저 만들어야 한다
+(도시당 1회, `data/raw/{city}_cluster_maps.npz` 생성):
+
+```bash
+python preprocessing/build_cluster_map.py --city ulsan
+python preprocessing/build_cluster_map.py --city porto
+```
+
 ## 학습 (train.py)
 
 Hydra로 설정을 관리한다 (`configs/config.yaml` + `configs/dataset/*.yaml` + `configs/model/*.yaml`).
 
 ```bash
-python train.py                      # 기본값: dataset=ulsan, model=baseline
+python train.py                      # 기본값: dataset=ulsan, model=adformer
 python train.py dataset=porto         # porto로 학습
-python train.py train.num_train_epochs=50 model.d_model=128   # 하이퍼파라미터 오버라이드
+python train.py train.num_train_epochs=50 model.embed_dim=128   # 하이퍼파라미터 오버라이드
 ```
 
 - 결과(로그, 체크포인트)는 `output/${project_name}/{날짜}/{시간}/`에 저장된다 (`configs/config.yaml`의 `hydra.run.dir`).
