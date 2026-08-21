@@ -5,7 +5,9 @@ n_layers: 2
 n_heads: 4
 dim_feedforward: 128
 dropout: 0.1
-lstm_hidden: 64
-lstm_layers: 1
+temporal_n_layers: 2
+temporal_n_heads: 4
+temporal_dim_feedforward: 128
+temporal_dropout: 0.1
 loss_gamma: 1.0
 loss_eps: 0.5

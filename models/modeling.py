@@ -41,13 +41,16 @@ class GridDemandModel(PreTrainedModel):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.n_layers)
 
-        self.lstm = nn.LSTM(
-            input_size=config.d_model,
-            hidden_size=config.lstm_hidden,
-            num_layers=config.lstm_layers,
+        self.temporal_pos_embed = nn.Parameter(torch.randn(config.time_step, config.d_model) * 0.02)
+        temporal_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.d_model,
+            nhead=config.temporal_n_heads,
+            dim_feedforward=config.temporal_dim_feedforward,
+            dropout=config.temporal_dropout,
             batch_first=True,
         )
-        self.output_proj = nn.Linear(config.lstm_hidden, 1)
+        self.temporal_encoder = nn.TransformerEncoder(temporal_encoder_layer, num_layers=config.temporal_n_layers)
+        self.output_proj = nn.Linear(config.d_model, 1)
 
         self.loss_fn = CombinedLoss(gamma=config.loss_gamma, eps=config.loss_eps)
 
@@ -142,10 +145,12 @@ class GridDemandModel(PreTrainedModel):
         encoded = self.encoder(seq)  # (B*k*N, seq_len, d_model)
         cls_out = encoded[:, 0, :].reshape(B, k, N, d_model)
 
-        # 노드별로 독립적인 시계열이므로 (B,N)을 LSTM 배치로 합치고 k를 시퀀스 축으로 둔다.
+        # 노드별로 독립적인 시계열이므로 (B,N)을 배치로 합치고 k를 시퀀스 축으로 둔다.
         cls_out = cls_out.permute(0, 2, 1, 3).reshape(B * N, k, d_model)
-        lstm_out, _ = self.lstm(cls_out)  # (B*N,k,lstm_hidden)
-        last = lstm_out[:, -1, :].reshape(B, N, -1)  # (B,N,lstm_hidden)
+        # k개는 전부 과거 시점(label은 k 이후 시점)이라 causal mask 불필요 — 위치만 구분해주면 됨.
+        cls_out = cls_out + self.temporal_pos_embed[:k]
+        temporal_out = self.temporal_encoder(cls_out)  # (B*N,k,d_model)
+        last = temporal_out[:, -1, :].reshape(B, N, -1)  # (B,N,d_model), LSTM의 마지막 hidden state 자리
 
         pred = F.softplus(self.output_proj(last)).squeeze(-1)  # (B,N)
         logits = pred.reshape(B, H, W)  # labels(B,H,W)와 동일 shape, node_id=row*W+col 순서와 일치

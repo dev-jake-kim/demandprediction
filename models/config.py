@@ -16,8 +16,11 @@ class GridDemandConfig(PretrainedConfig):
         n_heads: int = 4,
         dim_feedforward: int = 128,
         dropout: float = 0.1,
-        lstm_hidden: int = 64,
-        lstm_layers: int = 1,
+        time_step: int = 24,
+        temporal_n_layers: int = 2,
+        temporal_n_heads: int = 4,
+        temporal_dim_feedforward: int = 128,
+        temporal_dropout: float = 0.1,
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
         **kwargs,
@@ -30,8 +33,11 @@ class GridDemandConfig(PretrainedConfig):
         self.n_heads = n_heads
         self.dim_feedforward = dim_feedforward
         self.dropout = dropout
-        self.lstm_hidden = lstm_hidden
-        self.lstm_layers = lstm_layers
+        self.time_step = time_step
+        self.temporal_n_layers = temporal_n_layers
+        self.temporal_n_heads = temporal_n_heads
+        self.temporal_dim_feedforward = temporal_dim_feedforward
+        self.temporal_dropout = temporal_dropout
         self.loss_gamma = loss_gamma
         self.loss_eps = loss_eps
         super().__init__(**kwargs)

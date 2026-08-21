@@ -86,7 +86,7 @@ def main(cfg: DictConfig) -> None:
     train_ds, val_ds, test_ds = build_datasets(cfg)
 
     model_kwargs = OmegaConf.to_container(cfg.model, resolve=True)
-    model_config = GridDemandConfig(H=train_ds.X, W=train_ds.Y, **model_kwargs)
+    model_config = GridDemandConfig(H=train_ds.X, W=train_ds.Y, time_step=train_ds.time_step, **model_kwargs)
     model = GridDemandModel(model_config)
 
     output_dir = HydraConfig.get().runtime.output_dir
