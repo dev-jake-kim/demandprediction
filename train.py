@@ -5,7 +5,7 @@ import logging
 import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
-from transformers import Trainer, TrainerCallback, TrainingArguments
+from transformers import EarlyStoppingCallback, Trainer, TrainerCallback, TrainingArguments
 
 from dataset_frame import GridDemandDataset
 from models import GridDemandConfig, GridDemandModel, compute_regression_metrics
@@ -20,6 +20,39 @@ class LoggingCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs) -> None:
         if logs is not None:
             logger.info(logs)
+
+
+class MinEpochEarlyStoppingCallback(EarlyStoppingCallback):
+    """최소 학습 epoch 이후부터 patience를 세는 early stopping callback."""
+
+    def __init__(
+        self,
+        min_epochs: int,
+        early_stopping_patience: int,
+        early_stopping_threshold: float | None = 0.0,
+    ) -> None:
+        if min_epochs < 0:
+            raise ValueError(f"min_epochs는 0 이상이어야 함: got {min_epochs}")
+        if early_stopping_patience < 1:
+            raise ValueError(
+                "early_stopping_patience는 1 이상이어야 함: "
+                f"got {early_stopping_patience}"
+            )
+        super().__init__(
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_threshold=early_stopping_threshold,
+        )
+        self.min_epochs = min_epochs
+
+    def on_evaluate(self, args, state, control, metrics, **kwargs):
+        if state.epoch is None or state.epoch < self.min_epochs:
+            return control
+        return super().on_evaluate(args, state, control, metrics, **kwargs)
+
+    def state(self) -> dict:
+        callback_state = super().state()
+        callback_state["args"]["min_epochs"] = self.min_epochs
+        return callback_state
 
 
 def build_datasets(cfg: DictConfig) -> tuple[GridDemandDataset, GridDemandDataset, GridDemandDataset]:
@@ -62,13 +95,22 @@ def main(cfg: DictConfig) -> None:
         **OmegaConf.to_container(cfg.train, resolve=True),
     )
 
+    early_stopping_cfg = cfg.callbacks.early_stopping
+    callbacks = [
+        LoggingCallback(),
+        MinEpochEarlyStoppingCallback(
+            min_epochs=early_stopping_cfg.min_epochs,
+            early_stopping_patience=early_stopping_cfg.early_stopping_patience,
+        ),
+    ]
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
         compute_metrics=compute_metrics,
-        callbacks=[LoggingCallback()],
+        callbacks=callbacks,
     )
     trainer.train()
     trainer.save_model(output_dir)
