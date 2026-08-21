@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 
+from .calibration import CalibrationTable, apply_calibration_torch
 from .config import GridDemandConfig
 from .embeddings import FourierScalarEmbedding
 from .losses import CombinedLoss
@@ -16,6 +20,11 @@ EDGE_TOKEN_ID = 1
 class GridDemandModel(PreTrainedModel):
     config_class = GridDemandConfig
     base_model_prefix = 'grid_demand'
+    _keys_to_ignore_on_load_missing = [
+        r'calibration_bin_indices',
+        r'calibration_slopes',
+        r'calibration_intercepts',
+    ]
 
     def __init__(self, config: GridDemandConfig) -> None:
         super().__init__(config)
@@ -51,6 +60,20 @@ class GridDemandModel(PreTrainedModel):
 
         self.loss_fn = CombinedLoss(gamma=config.loss_gamma, eps=config.loss_eps)
 
+        self._validate_calibration_values(
+            config.calibration_bin_indices,
+            config.calibration_slopes,
+            config.calibration_intercepts,
+            config.calibration_bin_width,
+        )
+        calibration_bin_indices = torch.tensor(config.calibration_bin_indices, dtype=torch.long)
+        calibration_slopes = torch.tensor(config.calibration_slopes, dtype=torch.float32)
+        calibration_intercepts = torch.tensor(config.calibration_intercepts, dtype=torch.float32)
+        self.register_buffer('calibration_bin_indices', calibration_bin_indices, persistent=True)
+        self.register_buffer('calibration_slopes', calibration_slopes, persistent=True)
+        self.register_buffer('calibration_intercepts', calibration_intercepts, persistent=True)
+        self._calibration_enabled = True
+
         # node_id -> (padded grid 기준 이웃 (2a+1)^2개의 flat index, 격자 안 여부)는
         # H,W,a로만 정해지는 순수 함수라 가능한 모든 node_id(H*W개)에 대해 미리 계산해둔다.
         # persistent=True로 저장해야 함: persistent=False 버퍼는 transformers 5.0의
@@ -61,6 +84,73 @@ class GridDemandModel(PreTrainedModel):
         self.register_buffer('mask_table', mask_table, persistent=True)  # (H*W, n_neighbors)
 
         self.post_init()
+
+    @staticmethod
+    def _validate_calibration_values(
+        bin_indices: list[int],
+        slopes: list[float],
+        intercepts: list[float],
+        bin_width: float | None,
+    ) -> None:
+        if not (len(bin_indices) == len(slopes) == len(intercepts)):
+            raise ValueError('config의 calibration table 길이가 서로 다름')
+        if bin_indices and (
+            bin_width is None or not math.isfinite(float(bin_width)) or float(bin_width) <= 0
+        ):
+            raise ValueError('calibration table이 있으면 calibration_bin_width가 필요함')
+        if any(int(value) != value for value in bin_indices):
+            raise ValueError('calibration_bin_indices는 정수여야 함')
+        if any(right <= left for left, right in zip(bin_indices, bin_indices[1:])):
+            raise ValueError('calibration_bin_indices는 중복 없이 오름차순이어야 함')
+        if not all(math.isfinite(float(value)) for value in [*slopes, *intercepts]):
+            raise ValueError('calibration coefficient에 NaN 또는 inf가 포함됨')
+
+    @property
+    def has_calibration(self) -> bool:
+        return self.calibration_bin_indices.numel() > 0
+
+    def install_calibration(self, table: CalibrationTable) -> None:
+        if self.has_calibration:
+            raise ValueError('이미 calibration table이 설치된 모델임')
+
+        self._validate_calibration_values(
+            table.bin_indices,
+            table.slopes,
+            table.intercepts,
+            table.bin_width,
+        )
+        device = self.pos_embed.device
+        bin_indices = torch.tensor(table.bin_indices, dtype=torch.long, device=device)
+        slopes = torch.tensor(table.slopes, dtype=torch.float32, device=device)
+        intercepts = torch.tensor(table.intercepts, dtype=torch.float32, device=device)
+
+        self.calibration_bin_indices = bin_indices
+        self.calibration_slopes = slopes
+        self.calibration_intercepts = intercepts
+        self.config.calibration_bin_width = table.bin_width
+        self.config.calibration_bin_indices = table.bin_indices
+        self.config.calibration_slopes = table.slopes
+        self.config.calibration_intercepts = table.intercepts
+
+    @contextmanager
+    def calibration_disabled(self):
+        previous = self._calibration_enabled
+        self._calibration_enabled = False
+        try:
+            yield
+        finally:
+            self._calibration_enabled = previous
+
+    def apply_calibration(self, predictions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.has_calibration or not self._calibration_enabled:
+            return predictions, torch.zeros_like(predictions, dtype=torch.bool)
+        return apply_calibration_torch(
+            predictions,
+            bin_width=self.config.calibration_bin_width,
+            bin_indices=self.calibration_bin_indices,
+            slopes=self.calibration_slopes,
+            intercepts=self.calibration_intercepts,
+        )
 
     def _build_neighbor_tables(self) -> tuple[torch.Tensor, torch.Tensor]:
         H, W, a = self.H, self.W, self.a
@@ -114,6 +204,8 @@ class GridDemandModel(PreTrainedModel):
         demands: torch.Tensor,
         labels: torch.Tensor | None = None,
         sample_idx: torch.Tensor | None = None,
+        apply_calibration: bool = True,
+        return_raw_logits: bool = False,
     ) -> dict[str, torch.Tensor | None]:
         B, k, H, W = demands.shape
         N = H * W
@@ -148,10 +240,16 @@ class GridDemandModel(PreTrainedModel):
         last = lstm_out[:, -1, :].reshape(B, N, -1)  # (B,N,lstm_hidden)
 
         pred = F.softplus(self.output_proj(last)).squeeze(-1)  # (B,N)
-        logits = pred.reshape(B, H, W)  # labels(B,H,W)와 동일 shape, node_id=row*W+col 순서와 일치
+        raw_logits = pred.reshape(B, H, W)  # labels(B,H,W)와 동일 shape, node_id=row*W+col 순서와 일치
+        logits = raw_logits
+        if apply_calibration:
+            logits, _ = self.apply_calibration(raw_logits)
 
         loss = None
         if labels is not None:
             loss = self.loss_fn(logits, labels.to(logits.dtype))
 
-        return {'loss': loss, 'logits': logits}
+        output = {'loss': loss, 'logits': logits}
+        if return_raw_logits:
+            output['raw_logits'] = raw_logits
+        return output

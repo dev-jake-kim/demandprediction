@@ -20,6 +20,10 @@ class GridDemandConfig(PretrainedConfig):
         lstm_layers: int = 1,
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
+        calibration_bin_width: float | None = None,
+        calibration_bin_indices: list[int] | None = None,
+        calibration_slopes: list[float] | None = None,
+        calibration_intercepts: list[float] | None = None,
         **kwargs,
     ) -> None:
         self.H = H
@@ -34,4 +38,8 @@ class GridDemandConfig(PretrainedConfig):
         self.lstm_layers = lstm_layers
         self.loss_gamma = loss_gamma
         self.loss_eps = loss_eps
+        self.calibration_bin_width = calibration_bin_width
+        self.calibration_bin_indices = list(calibration_bin_indices or [])
+        self.calibration_slopes = list(calibration_slopes or [])
+        self.calibration_intercepts = list(calibration_intercepts or [])
         super().__init__(**kwargs)

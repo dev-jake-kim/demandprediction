@@ -28,18 +28,27 @@ def evaluate(model: GridDemandModel, loader: DataLoader, device: str) -> dict[st
     model.eval()
     all_preds = []
     all_labels = []
+    matched_count = 0
+    prediction_count = 0
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="evaluate"):
             demands = batch["demands"].to(device)
 
-            out = model(demands=demands)
+            out = model(demands=demands, return_raw_logits=model.has_calibration)
             all_preds.append(out["logits"].cpu().numpy())
             all_labels.append(batch["labels"].numpy())
+            if model.has_calibration:
+                _, matched = model.apply_calibration(out["raw_logits"])
+                matched_count += int(matched.sum().item())
+                prediction_count += matched.numel()
 
     preds = np.concatenate(all_preds)
     labels = np.concatenate(all_labels)
-    return compute_regression_metrics(preds, labels)
+    metrics = compute_regression_metrics(preds, labels)
+    if model.has_calibration:
+        metrics['calibration_unseen_fraction'] = 1.0 - matched_count / prediction_count
+    return metrics
 
 
 def main() -> None:
@@ -61,6 +70,14 @@ def main() -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = GridDemandModel.from_pretrained(checkpoint_path).to(device)
+    if model.has_calibration:
+        logger.info(
+            'Loaded calibration: bin_width=%s, bins=%d',
+            model.config.calibration_bin_width,
+            model.calibration_bin_indices.numel(),
+        )
+    else:
+        logger.info('Loaded checkpoint without calibration')
 
     test_ds = GridDemandDataset(
         args.npy_path,
