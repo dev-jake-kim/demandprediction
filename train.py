@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
@@ -86,7 +87,13 @@ def main(cfg: DictConfig) -> None:
     train_ds, val_ds, test_ds = build_datasets(cfg)
 
     model_kwargs = OmegaConf.to_container(cfg.model, resolve=True)
-    model_config = GridDemandConfig(H=train_ds.X, W=train_ds.Y, **model_kwargs)
+    model_config = GridDemandConfig(
+        H=train_ds.X,
+        W=train_ds.Y,
+        time_step=train_ds.time_step,
+        npy_path=str(Path(cfg.dataset.npy_path).resolve()),
+        **model_kwargs,
+    )
     model = GridDemandModel(model_config)
 
     output_dir = HydraConfig.get().runtime.output_dir

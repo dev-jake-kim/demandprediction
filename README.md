@@ -34,6 +34,9 @@ python test.py <checkpoint_path> --npy_path data/raw/ulsan_temporal_grid.npy --t
 
 - `<checkpoint_path>`: train.py가 저장한 `output/.../` 디렉토리 (`config.json` + `model.safetensors`가 있는 곳)
 - `--t_start`: train.py 로그에 찍힌 val 구간 끝 지점(=test 구간 시작)을 그대로 넣으면 됨. 생략하면 `time_step` 이후 전체 구간을 평가.
+- `--npy_path`/`--time_step`은 **반드시 학습 때 쓴 값과 같아야 함** — 이 모델은 검색(retrieval) 앙상블
+  브랜치가 있어서(`docs/MODEL_PLAN.md` §1-5), 체크포인트의 `config.npy_path`/`config.time_step`과
+  다르면 test.py가 시작하자마자 명확한 에러를 낸다(조용히 틀린 결과가 나오는 걸 막기 위함).
 - 출력: RMSE, MAE, MAPE(+1, 0-수요 스무딩)
 
 ## 전처리 (원본 데이터 -> npy)

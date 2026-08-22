@@ -32,8 +32,9 @@ def evaluate(model: GridDemandModel, loader: DataLoader, device: str) -> dict[st
     with torch.no_grad():
         for batch in tqdm(loader, desc="evaluate"):
             demands = batch["demands"].to(device)
+            sample_idx = batch["sample_idx"].to(device)
 
-            out = model(demands=demands)
+            out = model(demands=demands, sample_idx=sample_idx)
             all_preds.append(out["logits"].cpu().numpy())
             all_labels.append(batch["labels"].numpy())
 
@@ -60,7 +61,29 @@ def main() -> None:
     logger.info(f"Logging to: {log_path}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = GridDemandModel.from_pretrained(checkpoint_path).to(device)
+    model = GridDemandModel.from_pretrained(checkpoint_path)
+
+    # 체크포인트의 config.npy_path/time_step(검색 DB를 만드는 데 쓰임)과 --npy_path/--time_step
+    # (평가 데이터셋을 만드는 데 쓰임)이 어긋나면 검색 브랜치가 엉뚱한 grid를 검색하거나(조용히 틀린
+    # 결과) time_step이 다르면 einsum에서 shape 에러가 남 — 미리 명확한 에러로 막는다.
+    resolved_npy_path = str(Path(args.npy_path).resolve())
+    if model.config.npy_path != resolved_npy_path:
+        raise ValueError(
+            f"체크포인트 config.npy_path({model.config.npy_path})와 --npy_path({resolved_npy_path})가 "
+            f"다름 — 검색 DB와 평가 데이터셋이 같은 grid를 가리켜야 함"
+        )
+    if model.config.time_step != args.time_step:
+        raise ValueError(
+            f"체크포인트 config.time_step({model.config.time_step})과 --time_step({args.time_step})이 다름"
+        )
+
+    # retrieval_keys/values/norms는 persistent=False 버퍼라 from_pretrained의 meta-device
+    # fast-init 후 자동 복원되지 않음(값이 깨져 있음) — npy로부터 명시적으로 다시 만들어야 함.
+    # 반드시 .to(device) 전에(= CPU 상태에서) 재구성한다: 그렇지 않으면 GPU로 옮겨진 깨진 buffer +
+    # 재구성 중간 텐서 + 새 buffer가 동시에 GPU에 존재하는 메모리 스파이크가 생김(특히 porto에서
+    # OOM 위험).
+    model.build_retrieval_db()
+    model = model.to(device)
 
     test_ds = GridDemandDataset(
         args.npy_path,

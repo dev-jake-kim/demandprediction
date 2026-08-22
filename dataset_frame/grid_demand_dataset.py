@@ -16,8 +16,12 @@ class GridDemandDataset(Dataset):
 
     반환 형식은 HuggingFace `Trainer`에서 바로 쓸 수 있도록
     `{'demands', 'labels', 'sample_idx'}` 딕셔너리로 고정한다
-    (configs/config.yaml의 `remove_unused_columns: false`와 짝을 맞춤 —
-    `sample_idx`는 모델 forward에 안 쓰여도 collate 단계에서 제거되지 않음).
+    (configs/config.yaml의 `remove_unused_columns: false`와 짝을 맞춤).
+
+    `sample_idx`는 이 Dataset 인스턴스 내부의 0-base idx가 아니라 **절대 시간 인덱스**
+    (`t = t_start + idx`, 원본 npy 배열 기준)다. train/val/test가 전부 같은 근본 grid의
+    서로 다른 `t_start`/`t_end` 슬라이스이므로, 절대 인덱스를 써야 어느 split에서 온
+    샘플이든 검색(retrieval) 브랜치의 인과적 prefix 계산에 그대로 정렬돼서 쓸 수 있다.
     """
 
     def __init__(
@@ -54,5 +58,5 @@ class GridDemandDataset(Dataset):
         return {
             'demands': torch.from_numpy(demand_seq),
             'labels': torch.from_numpy(label),
-            'sample_idx': torch.tensor(idx, dtype=torch.long),
+            'sample_idx': torch.tensor(t, dtype=torch.long),
         }

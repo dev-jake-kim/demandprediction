@@ -34,7 +34,13 @@ x: (B, k, N, (2a+1)^2+1, d_model) → reshape (B*k*N, (2a+1)^2+1, d_model)
   → TransformerEncoder → CLS 출력만 추출                  # (B*k*N, d_model)
   → reshape (B, k, N, d_model) → permute → (B*N, k, d_model)
   → LSTM(batch_first=True) → 마지막 timestep 출력          # (B*N, d_model) → reshape (B,N,d_model)
-  → Linear(d_model, 1) → Softplus → reshape                # (B, H, W)  (수요는 음수 불가)
+  → Linear(d_model, 1) → Softplus                          # neural_pred (B, N)
+
+병렬로 검색(retrieval) 브랜치가 같은 입력(로컬 윈도우)으로 ir_out (B,N)을 만들고(§1-5),
+neural_pred와 ir_out을 sigmoid 게이트로 섞은 뒤 reshape:
+  lambda = sigmoid(Linear([last_hidden, ir_out]))          # (B, N), 최종 레이어 직전 concat
+  pred = lambda * neural_pred + (1 - lambda) * ir_out
+  → reshape                                                 # (B, H, W)  (양쪽 다 비음수라 pred도 비음수)
 ```
 
 ### 1-1. 스칼라 임베딩 `FourierEmbed` (교체 가능하게 설계)
@@ -77,6 +83,45 @@ x: (B, k, N, (2a+1)^2+1, d_model) → reshape (B*k*N, (2a+1)^2+1, d_model)
 | `dropout` | 0.1 | transformer/lstm dropout |
 | `lstm_hidden` | 64 (=`d_model`) | LSTM hidden size |
 | `lstm_layers` | 1 | LSTM layer 수 |
+| `retrieval_k` | 20 | 검색(retrieval) top-k |
+| `time_step` | 24 | 검색 DB 슬라이딩 윈도우 길이(`train.py`가 `dataset.time_step`으로 주입, yaml에 직접 안 둠) |
+| `npy_path` | (없음, 필수) | 검색 DB를 만들 원본 grid npy **절대경로**(`train.py`가 `dataset.npy_path`를 resolve해서 주입) |
+
+## 1-5. 검색(retrieval) 앙상블 브랜치
+
+`/home/jinsu/PycharmProjects/DMVST` 저장소 `ir` 브랜치(`IRModule`)에서 아이디어를 가져온
+브랜치(이 저장소도 브랜치명이 `ir`). 뉴럴 브랜치(위 1절)와 별도로, 같은 위치(node)의 **과거** 로컬
+윈도우 중 지금 입력과 코사인 유사도가 가장 높은 top-k를 찾아 그 시점 실제 수요값을 softmax
+가중평균한 값(`ir_out`)을 만들고, `sigmoid` 게이트로 뉴럴 브랜치 예측과 섞는다
+(`GridDemandModel.build_retrieval_db`/`_retrieve`, `models/modeling.py`).
+
+**검색 DB(`build_retrieval_db`)**: `config.npy_path`의 원본 grid 전체 시계열(T,H,W)을
+`_crop_all_nodes`로 한 번에 크롭(B=1,k=T로 호출)한 뒤, `time_step` 길이 슬라이딩 윈도우로 잘라
+절대 시간 인덱스 `t`(0..T-1)로 인덱싱되는 3개 텐서를 만든다:
+- `retrieval_keys (N,T,flat_dim)`, `flat_dim = n_neighbors * time_step`
+- `retrieval_values (N,T)` — 그 시점 실제 수요
+- `retrieval_norms (N,T)` — key 벡터 L2 norm(코사인 유사도 분모 캐시)
+
+`t < time_step` 구간은 유효한 윈도우가 없어 0으로 남겨두고, 후보 슬라이스가 항상
+`[time_step, t)`(자기 자신 미만)로 제한되므로 미래 시점을 참조하지 않는다. 검색(`_retrieve`)은
+gir가 이미 한 샘플 = 한 시각(t)에 N개 노드 전부를 담고 있다는 점을 이용해, 원본처럼 배치 안
+`node_id`별로 루프 도는 대신 **배치 원소(B)별로만** 루프를 돈다(후보 구간이 노드에 무관하게
+b 하나당 하나로 통일되기 때문 — B~4-8회로 원본보다 훨씬 적은 반복).
+
+**중요 — `persistent=False` + 수동 재로드**: 위 3개 버퍼는 `config.npy_path`의 순수 함수지만
+크기가 커서(ulsan ~1.7GB, porto ~4GB, fp32) 다른 buffer(`idx_table`/`mask_table`)처럼
+`persistent=True`로 체크포인트에 통째로 저장하지 않는다. 대신:
+- `GridDemandModel(config)` fresh construction(`train.py`) 시엔 `__init__`이 자동으로
+  `build_retrieval_db()`를 호출해 정상적으로 채워짐.
+- **`GridDemandModel.from_pretrained(...)`로 로드한 경우, 반드시 그 직후 `model.build_retrieval_db()`
+  를 다시 호출해야 함** — transformers 5.0의 meta-device fast-init이 `persistent=False` buffer를
+  체크포인트에서 복원하지 않아 깨진 채로 남기 때문(이 프로젝트가 4개 브랜치 내내 확인해온 것과 동일
+  원인). `test.py`가 이미 이렇게 구현돼 있음: `from_pretrained(...)` → (config.npy_path/time_step과
+  `--npy_path`/`--time_step` 일치 검증) → `build_retrieval_db()`(CPU 상태에서) → `.to(device)` 순서.
+  이 순서(재구성을 `.to(device)` **전에**)가 중요함 — 반대로 하면 깨진 buffer가 GPU로 옮겨진 뒤
+  재구성돼서 old+intermediate+new 버퍼가 동시에 존재하는 메모리 스파이크가 생김.
+- 새 checkpoint를 다른 방식으로 로드하는 코드를 추가할 때도 반드시 `build_retrieval_db()`를 그
+  직후에 호출해야 한다 — 빠뜨리면 검색 브랜치가 조용히 0만 반환하는 위험한 실패 모드가 됨.
 
 ## 2. 배치 크롭 구현 방식 (`GridDemandModel._crop_all_nodes`)
 
@@ -119,7 +164,7 @@ class CombinedLoss(nn.Module):
 ## 5. HuggingFace 통합
 
 - `models/config.py`: `GridDemandConfig(PretrainedConfig)` — 위 1-4 하이퍼파라미터 + `H, W`(도시별 격자 크기)를 필드로.
-- `models/modeling.py`: `GridDemandModel(PreTrainedModel)` — `forward(demands, labels=None, sample_idx=None)` → `logits`는 `(B,H,W)`(전체 노드), `labels`가 있으면 `{'loss', 'logits'}`, 없으면 `{'logits'}` 반환 (HF `Trainer` 호환).
+- `models/modeling.py`: `GridDemandModel(PreTrainedModel)` — `forward(demands, labels=None, sample_idx=None)` → `logits`는 `(B,H,W)`(전체 노드), `labels`가 있으면 `{'loss', 'logits'}`, 없으면 `{'logits'}` 반환 (HF `Trainer` 호환). 검색 브랜치(§1-5) 때문에 `sample_idx`는 사실상 필수(`None`이면 `ValueError`) — `GridDemandDataset`이 반환하는 `sample_idx`는 split-local idx가 아니라 **절대 시간 인덱스** `t`임에 유의.
 - 노드별 backprop을 없애고 한 forward에서 N=H*W개 노드를 다 예측하도록 바꾸면서 step당 연산량이 N배로
   늘어남 (ulsan N=168, porto N=200) → `configs/config.yaml`의 `per_device_train/eval_batch_size`를
   그만큼 낮춰야 함 (기본값 4/8, 실제 GPU 메모리에 맞춰 조정).

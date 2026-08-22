@@ -18,6 +18,9 @@ class GridDemandConfig(PretrainedConfig):
         dropout: float = 0.1,
         lstm_hidden: int = 64,
         lstm_layers: int = 1,
+        time_step: int = 24,
+        npy_path: str | None = None,
+        retrieval_k: int = 20,
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
         **kwargs,
@@ -32,6 +35,11 @@ class GridDemandConfig(PretrainedConfig):
         self.dropout = dropout
         self.lstm_hidden = lstm_hidden
         self.lstm_layers = lstm_layers
+        # 아래 3개는 검색(retrieval) 브랜치 전용 — time_step/npy_path는 검색 DB(build_retrieval_db)를
+        # 만드는 데 필요하고, npy_path는 원본 grid 전체 시계열을 가리키는 절대경로여야 함(train.py가 주입).
+        self.time_step = time_step
+        self.npy_path = npy_path
+        self.retrieval_k = retrieval_k
         self.loss_gamma = loss_gamma
         self.loss_eps = loss_eps
         super().__init__(**kwargs)
