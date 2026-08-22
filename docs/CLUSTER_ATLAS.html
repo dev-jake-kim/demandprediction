@@ -1,0 +1,421 @@
+<title>Cluster Atlas</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    color-scheme: light;
+    --surface-0: #f3f6f4;
+    --surface-1: #fdfefd;
+    --surface-2: #e9eeeb;
+    --border: #d4dcd8;
+    --border-strong: #b9c4bf;
+    --text-primary: #10201d;
+    --text-secondary: #4c5b57;
+    --text-muted: #7d8a86;
+    --accent: #2b5e5f;
+    --accent-soft: #e2edec;
+    --readout-bg: #10201d;
+    --readout-text: #eef2f1;
+    --shadow: 0 1px 2px rgba(16, 32, 29, 0.06), 0 8px 24px -12px rgba(16, 32, 29, 0.18);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface-0: #0c1312;
+      --surface-1: #121b19;
+      --surface-2: #1a2523;
+      --border: #263431;
+      --border-strong: #34443f;
+      --text-primary: #edf3f1;
+      --text-secondary: #b3c1bc;
+      --text-muted: #7c8b86;
+      --accent: #82babb;
+      --accent-soft: #1a2b2a;
+      --readout-bg: #0c1312;
+      --readout-text: #d9e6e3;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 28px -12px rgba(0, 0, 0, 0.55);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-0: #0c1312;
+    --surface-1: #121b19;
+    --surface-2: #1a2523;
+    --border: #263431;
+    --border-strong: #34443f;
+    --text-primary: #edf3f1;
+    --text-secondary: #b3c1bc;
+    --text-muted: #7c8b86;
+    --accent: #82babb;
+    --accent-soft: #1a2b2a;
+    --readout-bg: #0c1312;
+    --readout-text: #d9e6e3;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 28px -12px rgba(0, 0, 0, 0.55);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--surface-0);
+    color: var(--text-primary);
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 56px 28px 96px;
+  }
+
+  header.masthead {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding-bottom: 32px;
+    margin-bottom: 40px;
+    border-bottom: 1px solid var(--border);
+  }
+  .eyebrow {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  h1 {
+    font-family: 'Archivo', system-ui, sans-serif;
+    font-weight: 700;
+    font-size: clamp(30px, 4vw, 42px);
+    line-height: 1.08;
+    margin: 0;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+  .lede {
+    max-width: 62ch;
+    color: var(--text-secondary);
+    font-size: 15.5px;
+  }
+  .lede code {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.92em;
+    background: var(--surface-2);
+    padding: 0.1em 0.4em;
+    border-radius: 4px;
+    color: var(--text-primary);
+  }
+
+  section.city {
+    margin-bottom: 56px;
+  }
+  section.city:last-child { margin-bottom: 0; }
+
+  .city-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    margin-bottom: 18px;
+    flex-wrap: wrap;
+  }
+  .city-head h2 {
+    font-family: 'Archivo', system-ui, sans-serif;
+    font-weight: 600;
+    font-size: 21px;
+    margin: 0;
+    letter-spacing: -0.005em;
+  }
+  .city-meta {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12.5px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .panels {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 20px;
+  }
+
+  .panel {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 18px 16px;
+    box-shadow: var(--shadow);
+  }
+
+  .panel-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .panel-title {
+    font-family: 'Archivo', system-ui, sans-serif;
+    font-weight: 600;
+    font-size: 14.5px;
+  }
+  .panel-title .level-tag {
+    font-family: 'IBM Plex Mono', monospace;
+    font-weight: 500;
+    font-size: 11px;
+    color: var(--accent);
+    background: var(--accent-soft);
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-right: 8px;
+    letter-spacing: 0.02em;
+  }
+  .panel-stats {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .panel-stats b { color: var(--text-secondary); font-weight: 500; }
+
+  .grid-wrap {
+    background: var(--surface-2);
+    border-radius: 7px;
+    padding: 10px;
+    border: 1px solid var(--border);
+  }
+  .grid-wrap svg {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  .grid-wrap rect.cell {
+    stroke: var(--surface-2);
+    stroke-width: 0.05;
+    cursor: crosshair;
+    transition: opacity 0.12s ease, stroke 0.12s ease, stroke-width 0.12s ease;
+  }
+  .grid-wrap rect.cell.dim { opacity: 0.22; }
+  .grid-wrap rect.cell.match { stroke: var(--text-primary); stroke-width: 0.09; }
+
+  .readout {
+    margin-top: 10px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    background: var(--readout-bg);
+    color: var(--readout-text);
+    border-radius: 6px;
+    padding: 8px 10px;
+    min-height: 14px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow-x: auto;
+  }
+  .readout .dim-text { color: #8b9a96; }
+  .readout .swatch {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    margin-right: 6px;
+    vertical-align: middle;
+    position: relative;
+    top: -1px;
+  }
+
+  .legend {
+    margin-top: 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px 10px;
+  }
+  .legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .legend-item .sw {
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+
+  footer {
+    margin-top: 48px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    line-height: 1.7;
+  }
+
+  @media (max-width: 620px) {
+    .page { padding: 36px 16px 72px; }
+  }
+</style>
+
+<div class="page">
+
+  <header class="masthead">
+    <div class="eyebrow">ADFormer &middot; Spatial Cluster Attention</div>
+    <h1>Cluster Atlas</h1>
+    <p class="lede">
+      ADFormer는 DTW 기반 계층적 클러스터링으로 지역을 두 단계로 묶는다 &mdash;
+      <code>level 0</code>(세분화)와 <code>level 1</code>(상위, level 0을 다시 묶음).
+      아래는 두 도시의 격자에서 같은 클러스터에 속한 셀을 같은 색으로 칠한 것이다.
+      셀 위에 마우스를 올리면 해당 클러스터 전체가 강조된다.
+    </p>
+  </header>
+
+  <div id="cities"></div>
+
+  <footer>
+    data: data/raw/{city}_cluster_maps.npz &middot; built by preprocessing/build_cluster_map.py (DTW + hierarchical clustering, train-split only)
+  </footer>
+
+</div>
+
+<script>
+  const DATA = {"ulsan": {"H": 14, "W": 12, "levels": {"level_0": {"num_clusters": 40, "assign": [0, 0, 0, 0, 0, 0, 20, 1, 37, 1, 1, 37, 37, 37, 21, 1, 1, 1, 5, 2, 5, 5, 5, 21, 21, 21, 5, 3, 3, 25, 34, 4, 34, 34, 25, 25, 25, 25, 24, 24, 24, 34, 2, 5, 3, 6, 24, 24, 9, 34, 27, 4, 7, 8, 9, 10, 3, 27, 9, 9, 27, 27, 11, 12, 13, 14, 15, 16, 2, 17, 9, 9, 27, 18, 19, 20, 3, 21, 3, 2, 38, 38, 2, 2, 38, 38, 10, 22, 23, 24, 25, 21, 26, 38, 4, 4, 11, 8, 27, 28, 29, 30, 31, 32, 33, 4, 4, 18, 11, 10, 8, 34, 35, 36, 37, 11, 11, 18, 18, 18, 18, 8, 8, 11, 38, 37, 39, 13, 39, 39, 39, 39, 39, 17, 17, 13, 10, 13, 8, 13, 17, 17, 17, 33, 33, 13, 33, 20, 20, 33, 20, 33, 7, 7, 7, 7, 7, 19, 19, 20, 19, 19, 19, 6, 6, 6, 6, 6], "sizes": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 4, 6, 1, 6, 1, 1, 1, 6, 6, 6, 6, 6, 1, 1, 6, 6, 1, 6, 1, 1, 1, 1, 1, 6, 6, 1, 1, 6, 6, 6], "max_size": 6, "mean_size": 4.2}, "level_1": {"num_clusters": 10, "assign": [0, 0, 0, 0, 0, 0, 9, 0, 9, 0, 0, 9, 9, 9, 5, 0, 0, 0, 2, 1, 2, 2, 2, 5, 5, 5, 2, 2, 2, 5, 1, 0, 1, 1, 5, 5, 5, 5, 5, 5, 5, 1, 1, 2, 2, 0, 5, 5, 0, 1, 2, 0, 0, 2, 0, 2, 2, 2, 0, 0, 2, 2, 9, 3, 2, 3, 4, 4, 1, 9, 0, 0, 2, 9, 9, 9, 2, 5, 2, 1, 5, 5, 1, 1, 5, 5, 2, 4, 4, 5, 5, 5, 4, 5, 0, 0, 9, 2, 2, 6, 4, 8, 6, 7, 5, 0, 0, 9, 9, 2, 2, 1, 8, 8, 9, 9, 9, 9, 9, 9, 9, 2, 2, 9, 5, 9, 5, 2, 5, 5, 5, 5, 5, 9, 9, 2, 2, 2, 2, 2, 9, 9, 9, 5, 5, 2, 5, 9, 9, 5, 9, 5, 0, 0, 0, 0, 0, 9, 9, 9, 9, 9, 9, 0, 0, 0, 0, 0], "sizes": [36, 12, 34, 2, 6, 36, 2, 1, 3, 36], "max_size": 36, "mean_size": 16.8}}}, "porto": {"H": 10, "W": 20, "levels": {"level_0": {"num_clusters": 48, "assign": [0, 0, 0, 0, 0, 0, 25, 25, 11, 11, 11, 11, 11, 30, 30, 30, 30, 30, 47, 47, 47, 47, 47, 20, 20, 20, 20, 20, 12, 12, 12, 12, 12, 6, 6, 6, 6, 6, 19, 19, 19, 19, 19, 31, 31, 31, 1, 31, 31, 2, 15, 1, 3, 15, 4, 15, 15, 15, 16, 16, 16, 16, 16, 14, 5, 1, 6, 1, 1, 7, 2, 8, 1, 38, 9, 14, 14, 14, 14, 7, 7, 38, 7, 7, 10, 2, 11, 2, 2, 12, 10, 13, 2, 14, 32, 7, 37, 37, 37, 37, 37, 34, 23, 23, 32, 15, 8, 16, 17, 18, 19, 20, 21, 22, 23, 23, 8, 34, 34, 34, 17, 17, 24, 25, 8, 38, 26, 27, 28, 29, 30, 31, 32, 8, 33, 38, 23, 17, 17, 17, 33, 33, 33, 34, 35, 36, 37, 38, 35, 38, 39, 40, 41, 23, 42, 33, 25, 33, 36, 36, 36, 36, 36, 9, 9, 9, 9, 9, 25, 8, 43, 44, 34, 25, 24, 45, 24, 24, 24, 24, 35, 35, 35, 35, 45, 45, 45, 45, 45, 5, 46, 47, 5, 5, 5, 5, 10, 10, 10, 10], "sizes": [6, 6, 6, 1, 1, 6, 6, 6, 6, 6, 6, 6, 6, 1, 6, 6, 6, 6, 1, 6, 6, 1, 1, 6, 6, 6, 1, 1, 1, 1, 6, 6, 3, 6, 6, 6, 6, 6, 6, 1, 1, 1, 1, 1, 1, 6, 1, 6], "max_size": 6, "mean_size": 4.17}, "level_1": {"num_clusters": 12, "assign": [0, 0, 0, 0, 0, 0, 3, 3, 1, 1, 1, 1, 1, 3, 3, 3, 3, 3, 6, 6, 6, 6, 6, 4, 4, 4, 4, 4, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 5, 5, 5, 5, 5, 3, 3, 3, 0, 3, 3, 0, 5, 0, 1, 5, 2, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 11, 0, 6, 1, 5, 5, 5, 5, 0, 0, 6, 0, 0, 1, 0, 1, 0, 0, 1, 1, 2, 0, 5, 6, 0, 6, 6, 6, 6, 6, 3, 4, 4, 6, 5, 11, 5, 5, 2, 5, 4, 3, 2, 4, 4, 11, 3, 3, 3, 5, 5, 4, 3, 11, 6, 4, 4, 4, 5, 3, 3, 6, 11, 3, 6, 4, 5, 5, 5, 3, 3, 3, 3, 2, 6, 6, 6, 2, 6, 1, 7, 2, 4, 8, 3, 3, 3, 6, 6, 6, 6, 6, 1, 1, 1, 1, 1, 3, 11, 9, 10, 3, 3, 4, 6, 4, 4, 4, 4, 2, 2, 2, 2, 6, 6, 6, 6, 6, 0, 11, 6, 0, 0, 0, 0, 1, 1, 1, 1], "sizes": [36, 26, 11, 31, 21, 31, 33, 1, 1, 1, 1, 7], "max_size": 36, "mean_size": 16.67}}}};
+
+  const CITY_LABEL = { ulsan: 'Ulsan', porto: 'Porto' };
+  const LEVEL_LABEL = { level_0: 'Level 0 &middot; fine', level_1: 'Level 1 &middot; coarse' };
+
+  function isDark() {
+    const attr = document.documentElement.getAttribute('data-theme');
+    if (attr === 'dark') return true;
+    if (attr === 'light') return false;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+
+  // golden-angle hue rotation + banded lightness/chroma for max local separation
+  // across an arbitrary cluster count (identity is confirmed by hover, not color alone).
+  function clusterColor(i, dark) {
+    const hue = (i * 137.50776) % 360;
+    const band = i % 3;
+    const L = dark ? [0.66, 0.56, 0.61][band] : [0.74, 0.62, 0.68][band];
+    const C = [0.13, 0.155, 0.10][band];
+    return `oklch(${L} ${C} ${hue}deg)`;
+  }
+
+  function buildPanel(city, levelKey, levelData, H, W) {
+    const dark = isDark();
+    const colors = [];
+    for (let i = 0; i < levelData.num_clusters; i++) colors.push(clusterColor(i, dark));
+
+    const panel = document.createElement('div');
+    panel.className = 'panel';
+
+    const head = document.createElement('div');
+    head.className = 'panel-head';
+    head.innerHTML = `
+      <div class="panel-title"><span class="level-tag">${levelKey === 'level_0' ? 'L0' : 'L1'}</span>${LEVEL_LABEL[levelKey]}</div>
+      <div class="panel-stats"><b>${levelData.num_clusters}</b> clusters &middot; max <b>${levelData.max_size}</b> &middot; avg <b>${levelData.mean_size}</b></div>
+    `;
+    panel.appendChild(head);
+
+    const gridWrap = document.createElement('div');
+    gridWrap.className = 'grid-wrap';
+    const gap = 0.06;
+    const svgNS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(svgNS, 'svg');
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', `${CITY_LABEL[city]} ${levelKey} cluster map`);
+
+    const rects = [];
+    for (let idx = 0; idx < H * W; idx++) {
+      const row = Math.floor(idx / W);
+      const col = idx % W;
+      const cid = levelData.assign[idx];
+      const rect = document.createElementNS(svgNS, 'rect');
+      rect.setAttribute('class', 'cell');
+      rect.setAttribute('x', col + gap / 2);
+      rect.setAttribute('y', row + gap / 2);
+      rect.setAttribute('width', 1 - gap);
+      rect.setAttribute('height', 1 - gap);
+      rect.setAttribute('rx', 0.07);
+      rect.setAttribute('fill', colors[cid]);
+      rect.dataset.cluster = cid;
+      rect.dataset.row = row;
+      rect.dataset.col = col;
+      rect.dataset.idx = idx;
+      svg.appendChild(rect);
+      rects.push(rect);
+    }
+    gridWrap.appendChild(svg);
+    panel.appendChild(gridWrap);
+
+    const readout = document.createElement('div');
+    readout.className = 'readout';
+    readout.innerHTML = '<span class="dim-text">hover a cell to inspect its cluster</span>';
+    panel.appendChild(readout);
+
+    rects.forEach(r => {
+      r.addEventListener('mouseenter', () => {
+        const cid = r.dataset.cluster;
+        rects.forEach(other => {
+          const match = other.dataset.cluster === cid;
+          other.classList.toggle('dim', !match);
+          other.classList.toggle('match', match);
+        });
+        const size = levelData.sizes[cid];
+        readout.innerHTML = `<span class="swatch" style="background:${colors[cid]}"></span>` +
+          `row ${r.dataset.row}, col ${r.dataset.col} &middot; node #${r.dataset.idx} &middot; cluster ${cid} (${size} node${size == 1 ? '' : 's'})`;
+      });
+    });
+    gridWrap.addEventListener('mouseleave', () => {
+      rects.forEach(other => { other.classList.remove('dim', 'match'); });
+      readout.innerHTML = '<span class="dim-text">hover a cell to inspect its cluster</span>';
+    });
+
+    if (levelData.num_clusters <= 16) {
+      const legend = document.createElement('div');
+      legend.className = 'legend';
+      for (let i = 0; i < levelData.num_clusters; i++) {
+        const item = document.createElement('span');
+        item.className = 'legend-item';
+        item.innerHTML = `<span class="sw" style="background:${colors[i]}"></span>${i} (${levelData.sizes[i]})`;
+        legend.appendChild(item);
+      }
+      panel.appendChild(legend);
+    }
+
+    return panel;
+  }
+
+  function render() {
+    const root = document.getElementById('cities');
+    root.innerHTML = '';
+    Object.keys(DATA).forEach(city => {
+      const { H, W, levels } = DATA[city];
+      const section = document.createElement('section');
+      section.className = 'city';
+      const headEl = document.createElement('div');
+      headEl.className = 'city-head';
+      headEl.innerHTML = `<h2>${CITY_LABEL[city]}</h2><span class="city-meta">${H}&times;${W} grid &middot; ${H * W} regions</span>`;
+      section.appendChild(headEl);
+
+      const panels = document.createElement('div');
+      panels.className = 'panels';
+      Object.keys(levels).forEach(levelKey => {
+        panels.appendChild(buildPanel(city, levelKey, levels[levelKey], H, W));
+      });
+      section.appendChild(panels);
+      root.appendChild(section);
+    });
+  }
+
+  render();
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', render);
+</script>
