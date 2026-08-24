@@ -1,13 +1,25 @@
-# gir
+# gir (branch: ir-commute)
 
 grid 단위 택시 수요 예측. `preprocessing/{ulsan,porto}`가 원본 데이터를 `data/raw/{city}_temporal_grid.npy`로
-전처리하고, `dataset_frame`/`models`가 그 npy로 학습/평가한다. 구조는 `docs/STRUCTURE.md`, 모델 설계는
-`docs/MODEL_PLAN.md` 참고.
+전처리하고, `dataset_frame`/`models`가 그 npy로 학습/평가한다. 이 브랜치는 `ir`(검색기 앙상블 baseline)에
+DTW 기반 commute-attention을 추가했다. 구조는 `docs/STRUCTURE.md`, 모델 설계는 `docs/MODEL_PLAN.md`
+(특히 §1-6) 참고.
 
 ## 환경
 
 ```bash
 conda activate DA
+```
+
+## 학습 전 준비: commute map 생성
+
+commute-attention이 쓰는 DTW 기반 노드별 참조 목록을 먼저 만들어야 한다(도시당 1회,
+`data/raw/{city}_commute_map.npz` 생성). `--a`는 `configs/model/baseline.yaml`의 `a`와 반드시 같아야
+한다(기본값 2):
+
+```bash
+python preprocessing/build_commute_map.py --city ulsan --a 2
+python preprocessing/build_commute_map.py --city porto --a 2
 ```
 
 ## 학습 (train.py)

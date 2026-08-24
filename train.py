@@ -92,6 +92,7 @@ def main(cfg: DictConfig) -> None:
         W=train_ds.Y,
         time_step=train_ds.time_step,
         npy_path=str(Path(cfg.dataset.npy_path).resolve()),
+        commute_map_path=str(Path(cfg.dataset.commute_map_path).resolve()),
         **model_kwargs,
     )
     model = GridDemandModel(model_config)

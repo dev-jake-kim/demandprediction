@@ -34,6 +34,7 @@ x: (B, k, N, (2a+1)^2+1, d_model) → reshape (B*k*N, (2a+1)^2+1, d_model)
   → TransformerEncoder → CLS 출력만 추출                  # (B*k*N, d_model)
   → reshape (B, k, N, d_model) → permute → (B*N, k, d_model)
   → LSTM(batch_first=True) → 마지막 timestep 출력          # (B*N, d_model) → reshape (B,N,d_model)
+  → commute-attention으로 강화(§1-6, residual)             # last (B,N,d_model), shape 불변
   → Linear(d_model, 1) → Softplus                          # neural_pred (B, N)
 
 병렬로 검색(retrieval) 브랜치가 같은 입력(로컬 윈도우)으로 ir_out (B,N)을 만들고(§1-5),
@@ -86,6 +87,7 @@ neural_pred와 ir_out을 sigmoid 게이트로 섞은 뒤 reshape:
 | `retrieval_k` | 20 | 검색(retrieval) top-k |
 | `time_step` | 24 | 검색 DB 슬라이딩 윈도우 길이(`train.py`가 `dataset.time_step`으로 주입, yaml에 직접 안 둠) |
 | `npy_path` | (없음, 필수) | 검색 DB를 만들 원본 grid npy **절대경로**(`train.py`가 `dataset.npy_path`를 resolve해서 주입) |
+| `commute_map_path` | (없음, 필수) | commute-attention이 쓰는 노드별 참조 목록 npz **절대경로**(§1-6, `train.py`가 `dataset.commute_map_path`를 resolve해서 주입) |
 
 ## 1-5. 검색(retrieval) 앙상블 브랜치
 
@@ -122,6 +124,56 @@ b 하나당 하나로 통일되기 때문 — B~4-8회로 원본보다 훨씬 �
   재구성돼서 old+intermediate+new 버퍼가 동시에 존재하는 메모리 스파이크가 생김.
 - 새 checkpoint를 다른 방식으로 로드하는 코드를 추가할 때도 반드시 `build_retrieval_db()`를 그
   직후에 호출해야 한다 — 빠뜨리면 검색 브랜치가 조용히 0만 반환하는 위험한 실패 모드가 됨.
+
+## 1-6. Commute-attention (branch: ir-commute)
+
+동기: `ADFormer` 브랜치의 DTW 기반 계층적 클러스터링(`docs/CLUSTER_ATLAS.html`)을 확인해보니
+고수요 노드는 서로 잘 안 묶인다(클러스터 크기 1인 경우가 많음). 이를 보완하기 위해, 클러스터링
+대신 **노드마다 (2a+1)² 로컬 윈도우 밖에서 DTW 기준 가장 비슷한 n개(기본 3) 노드를 미리 골라두고,
+LSTM 출력에 그 정보를 주입**하는 방식을 택했다. 로컬 윈도우는 이미 공간 Transformer 인코더가
+보므로, commute 참조는 그 밖의(공간적으로 멀지만 패턴이 비슷한) 노드를 향한다.
+
+**설계 원칙 — DTW는 "후보 선택"에만, "얼마나 반영할지"는 학습이 결정**: DTW 스칼라를 그대로
+softmax 가중치로 쓰지 않는다 — DTW는 학습이 개입 못 하는 고정값이고, 노드마다 DTW 거리 분포가
+달라 스칼라 하나로 신뢰도를 비교 가능한 형태로 만들 수 없기 때문. 대신:
+
+1. **전처리(`preprocessing/build_commute_map.py`)**: ADFormer의 `build_daily_profile`/
+   `compute_dtw_matrix`(하루 24시간 평균 패턴, train split만, fastdtw radius=6)를 재사용해 DTW
+   거리행렬(N,N)을 만든다. 노드마다 체비쇼프 거리(`max(|Δrow|,|Δcol|) <= a`)로 로컬 윈도우
+   안(자기 자신 포함)을 후보에서 제외하고, 남은 노드 중 거리행렬 전체를 표준화(평균 0, 분산 1)한 뒤
+   부호를 뒤집은 유사도가 가장 높은 top-n을 선택한다. `commute_idx (N,n)` int64,
+   `commute_sim (N,n)` float32(표준화된 유사도, raw DTW 아님)로 `data/raw/{city}_commute_map.npz`에
+   저장. **`--a`는 반드시 모델 config의 `a`와 같아야 함**(스크립트가 실행 시 화면에 크게 echo함).
+2. **모델(`GridDemandModel._load_commute_map`/`forward`)**: LSTM 출력 `last (B,N,lstm_hidden)`
+   직후에 학습 가능한 단일 헤드 cross-attention을 끼워 넣는다:
+   ```python
+   ref_emb = last[:, self.commute_idx, :]  # (B,N,n,lstm_hidden) — idx_table과 동일한 gather 트릭,
+                                            # 공간 축이 아니라 노드 축에 바로 적용(격자 밖 처리 불필요)
+   q = commute_q_proj(last).unsqueeze(2); ref_k = commute_k_proj(ref_emb); ref_v = commute_v_proj(ref_emb)
+   commute_logits = (q * ref_k).sum(-1) / sqrt(lstm_hidden)                 # (B,N,n)
+   commute_bias = commute_dtw_bias(commute_sim.unsqueeze(-1)).squeeze(-1)    # (N,n), Linear(1,1)
+   commute_weights = softmax(commute_logits + commute_bias, dim=-1)
+   last = last + (commute_weights.unsqueeze(-1) * ref_v).sum(dim=2)          # residual
+   ```
+   DTW 유사도(`commute_sim`)는 최종 가중치가 아니라 **attention logit에 더해지는 학습 가능한
+   scale+bias**(`commute_dtw_bias`, `nn.Linear(1,1)`)로만 참여한다 — T5/ALiBi의 relative-position
+   bias와 같은 원리로, "DTW가 가까울수록 초기엔 더 믿어라"는 사전지식을 주면서도 실제 반영 비율은
+   loss를 통해 재조정된다. n=3처럼 참조가 적어 multi-head 이득이 크지 않다고 판단해 single-head로
+   구현.
+3. **버퍼 크기와 persistence**: `commute_idx`/`commute_sim`은 `(N,n)`로 작아서(ulsan/porto 기준
+   수백 개 숫자) `idx_table`/`mask_table`과 같은 범주 — `persistent=True`로 등록하고
+   `from_pretrained`가 자동 복원한다. §1-5의 검색 DB(수백MB~GB, `persistent=False`+수동 재로드
+   필요)와는 다른 케이스라 **`test.py` 수정이 필요 없다**.
+4. **`a` 불일치 안전장치**: 전처리 스크립트의 `--a`가 모델 config의 `a`와 다르게 지정되는 실수를
+   막기 위해, `_load_commute_map`이 로드 직후 저장된 모든 참조가 실제로 노드의 체비쇼프 `a` 윈도우
+   밖인지 재검증하고, 어긋나면 바로 `ValueError`를 낸다(조용히 틀린 채로 넘어가지 않음). 이 검증은
+   **반드시 순수 numpy로** 해야 한다 — `from_pretrained`의 meta-device fast-init 중에는 `__init__`
+   안에서 `torch.arange`/`torch.maximum` 등 torch 팩토리 함수로 만든 텐서가 meta tensor가 되어
+   `.any()`/`.item()` 같은 즉시 값 평가가 불가능해지기 때문(개발 중 실제로 재현/확인함 — idx_table
+   등 기존 buffer들이 __init__에서 값을 읽지 않고 등록만 하고 넘어가는 것과 대조적으로, 이번
+   검증처럼 __init__ 안에서 텐서 값을 즉시 읽어 분기해야 하는 경우 이 문제가 새로 발생할 수 있음).
+   numpy 배열은 이 문제에서 자유로우므로, 검증을 numpy로 끝내고 최종 결과만 한 번
+   `torch.from_numpy`로 감싼다.
 
 ## 2. 배치 크롭 구현 방식 (`GridDemandModel._crop_all_nodes`)
 
@@ -176,7 +228,7 @@ class CombinedLoss(nn.Module):
 configs/
 ├── config.yaml          # defaults: [dataset: ulsan, model: baseline]
 ├── dataset/
-│   └── *.yaml           # city(→ data/raw/{city}_temporal_grid.npy), time_step, train/val/test 시간 분할
+│   └── *.yaml           # city(→ data/raw/{city}_temporal_grid.npy), commute_map_path, time_step, train/val/test 시간 분할
 └── model/
     └── baseline.yaml    # 위 1-4 표의 하이퍼파라미터 + loss(gamma, eps)
 ```

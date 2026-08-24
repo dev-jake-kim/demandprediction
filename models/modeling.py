@@ -64,6 +64,21 @@ class GridDemandModel(PreTrainedModel):
         self.register_buffer('idx_table', idx_table, persistent=True)  # (H*W, n_neighbors)
         self.register_buffer('mask_table', mask_table, persistent=True)  # (H*W, n_neighbors)
 
+        # commute-attention 전용: 노드마다 (2a+1)^2 로컬 윈도우 밖에서 DTW 기준 가장 비슷한 n개
+        # 참조 노드(preprocessing/build_commute_map.py가 미리 계산). idx_table/mask_table과 같은
+        # 이유로 persistent=True(크기가 N*n로 작아서 체크포인트에 통째로 저장해도 무방 —
+        # 검색 DB(retrieval_keys 등, 수백MB~GB)와는 다른 케이스).
+        commute_idx, commute_sim = self._load_commute_map(config)
+        self.register_buffer('commute_idx', commute_idx, persistent=True)  # (H*W, n)
+        self.register_buffer('commute_sim', commute_sim, persistent=True)  # (H*W, n)
+
+        self.commute_q_proj = nn.Linear(config.lstm_hidden, config.lstm_hidden, bias=False)
+        self.commute_k_proj = nn.Linear(config.lstm_hidden, config.lstm_hidden, bias=False)
+        self.commute_v_proj = nn.Linear(config.lstm_hidden, config.lstm_hidden, bias=False)
+        # DTW 유사도(스칼라)를 attention logit에 더해지는 학습 가능한 scale+bias로만 씀 — DTW
+        # 자체를 최종 가중치로 쓰지 않는 이유는 docs/MODEL_PLAN.md §1-6 참고.
+        self.commute_dtw_bias = nn.Linear(1, 1)
+
         # 검색 DB(retrieval_keys/values/norms)는 반대로 persistent=False로 등록한다 — config.npy_path의
         # 순수 함수라 idx_table과 마찬가지로 결정론적이지만, 크기가 커서(ulsan ~1.7GB, porto ~4GB, fp32)
         # 체크포인트에 통째로 중복 저장하는 게 낭비이기 때문. 그 대가로 from_pretrained 직후에는 이
@@ -95,6 +110,58 @@ class GridDemandModel(PreTrainedModel):
         mask = valid.reshape(-1)[idx]  # (H*W, n_neighbors)
 
         return idx, mask
+
+    def _load_commute_map(self, config: GridDemandConfig) -> tuple[torch.Tensor, torch.Tensor]:
+        """config.commute_map_path(preprocessing/build_commute_map.py가 만든 npz)를 로드하고,
+        저장된 모든 참조가 실제로 노드의 체비쇼프 a 윈도우 밖인지 재검증한다 — 전처리 스크립트의
+        --a가 모델 config.a와 어긋나면(사용자가 맞춰야 하는 값이라 실수 가능) 조용히 틀린 채로
+        넘어가지 않고 여기서 바로 에러가 나게 하기 위함.
+
+        검증은 전부 순수 numpy로 한다(torch 팩토리 함수 X) — from_pretrained의 meta-device
+        fast-init 중에는 __init__ 안에서 만든 torch.arange 등이 meta tensor가 되어 .any()/.item()
+        같은 즉시 값 평가가 불가능해지기 때문(models/modeling.py 개발 중 재현/확인함). numpy 배열은
+        이 문제에서 자유로우므로, 검증을 numpy로 끝내고 최종 결과만 한 번 torch.from_numpy로 감싼다.
+        """
+        if config.commute_map_path is None:
+            raise ValueError("commute_map_path(원본 commute map npz 절대경로)가 필요함")
+
+        data = np.load(config.commute_map_path)
+        commute_idx_np = data['commute_idx']  # (N,n) int
+        commute_sim_np = data['commute_sim']  # (N,n) float
+
+        H, W, a = self.H, self.W, self.a
+        N = H * W
+
+        if commute_idx_np.ndim != 2 or commute_idx_np.shape[0] == 0 or commute_idx_np.shape[1] == 0:
+            raise ValueError(f"commute_idx shape={commute_idx_np.shape}가 비어있지 않은 (N,n) 2D 배열이어야 함")
+        if commute_idx_np.shape[0] != N:
+            raise ValueError(
+                f"commute_idx의 노드 수({commute_idx_np.shape[0]})가 모델의 N=H*W={N}와 다름"
+            )
+        if commute_sim_np.shape != commute_idx_np.shape:
+            raise ValueError(
+                f"commute_sim shape={commute_sim_np.shape}가 commute_idx shape={commute_idx_np.shape}와 다름"
+            )
+        if not np.issubdtype(commute_idx_np.dtype, np.integer):
+            raise ValueError(f"commute_idx dtype={commute_idx_np.dtype}가 정수형이 아님")
+        if (commute_idx_np < 0).any() or (commute_idx_np >= N).any():
+            raise ValueError(f"commute_idx에 [0,{N}) 범위 밖 인덱스가 있음")
+        if not np.isfinite(commute_sim_np).all():
+            raise ValueError("commute_sim에 NaN/Inf가 있음")
+
+        node_ids = np.arange(N)
+        rows, cols = node_ids // W, node_ids % W
+        ref_rows, ref_cols = rows[commute_idx_np], cols[commute_idx_np]  # (N,n)
+        chebyshev = np.maximum(np.abs(rows[:, None] - ref_rows), np.abs(cols[:, None] - ref_cols))
+        if (chebyshev <= a).any():
+            raise ValueError(
+                f"commute_map_path의 일부 참조가 모델의 로컬 윈도우(a={a}) 안에 있음 — "
+                f"preprocessing/build_commute_map.py를 실행할 때 --a가 이 모델의 a와 다르게 지정된 것으로 보임"
+            )
+
+        commute_idx = torch.from_numpy(commute_idx_np).long()
+        commute_sim = torch.from_numpy(commute_sim_np).float()
+        return commute_idx, commute_sim
 
     # NOTE: _init_weights를 오버라이드하지 않음 — transformers 5.0의 from_pretrained에서
     # 커스텀 _init_weights가 건드리는 nn.Linear/nn.Embedding 모듈만 체크포인트 로드 후에
@@ -260,6 +327,20 @@ class GridDemandModel(PreTrainedModel):
         cls_out = cls_out.permute(0, 2, 1, 3).reshape(B * N, k, d_model)
         lstm_out, _ = self.lstm(cls_out)  # (B*N,k,lstm_hidden)
         last = lstm_out[:, -1, :].reshape(B, N, -1)  # (B,N,lstm_hidden)
+
+        # commute-attention: 로컬 윈도우 밖, DTW로 미리 골라둔 n개 노드의 정보를 주입한다.
+        # "얼마나 반영할지"는 DTW 스칼라로 직접 정하지 않고(노드마다 DTW 분포가 달라 스칼라 하나로
+        # 비교 가능한 신뢰도를 못 만듦) 학습 가능한 cross-attention이 결정하며, DTW 유사도는 그
+        # attention logit에 더해지는 learnable scale+bias(사전지식)로만 참여한다.
+        ref_emb = last[:, self.commute_idx, :]  # (B,N,n,lstm_hidden) — idx_table과 동일한 gather 트릭
+        q = self.commute_q_proj(last).unsqueeze(2)  # (B,N,1,lstm_hidden)
+        ref_k = self.commute_k_proj(ref_emb)  # (B,N,n,lstm_hidden)
+        ref_v = self.commute_v_proj(ref_emb)  # (B,N,n,lstm_hidden)
+        commute_logits = (q * ref_k).sum(-1) / (self.config.lstm_hidden ** 0.5)  # (B,N,n)
+        commute_bias = self.commute_dtw_bias(self.commute_sim.unsqueeze(-1)).squeeze(-1)  # (N,n)
+        commute_weights = torch.softmax(commute_logits + commute_bias, dim=-1)  # (B,N,n)
+        commute_context = (commute_weights.unsqueeze(-1) * ref_v).sum(dim=2)  # (B,N,lstm_hidden)
+        last = last + commute_context  # residual
 
         neural_pred = F.softplus(self.output_proj(last)).squeeze(-1)  # (B,N)
 
