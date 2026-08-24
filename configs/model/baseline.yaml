@@ -7,6 +7,6 @@ dim_feedforward: 128
 dropout: 0.1
 lstm_hidden: 64
 lstm_layers: 1
-retrieval_k: 20
+retrieval_k: 3
 loss_gamma: 1.0
 loss_eps: 0.5

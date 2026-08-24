@@ -48,10 +48,15 @@ class GridDemandModel(PreTrainedModel):
             num_layers=config.lstm_layers,
             batch_first=True,
         )
-        self.output_proj = nn.Linear(config.lstm_hidden, 1)
-        # 검색(retrieval) 브랜치와 뉴럴 브랜치를 게이트로 섞는 레이어. 입력은
-        # [LSTM 마지막 hidden state, 검색 예측 스칼라] concat (최종 레이어 직전 concat).
-        self.lambda_layer = nn.Linear(config.lstm_hidden + 1, 1)
+        # 검색(retrieval) 브랜치를 cross-attention으로 융합하는 Q/K/V 프로젝션 + 최종 예측 레이어.
+        # Q(쿼리 자신)와 K(검색된 후보를 쿼리와 동일한 가중치로 재인코딩한 결과)는 서로 다른
+        # 가중치로 투영해야 하므로 별도 Linear로 둔다. V는 검색된 후보의 실제 수요값을 푸리에
+        # 임베딩한 뒤 투영한 것. single-head로 충분하다고 판단(commute-attention과 동일한 이유).
+        self.retrieval_q_proj = nn.Linear(config.lstm_hidden, config.lstm_hidden, bias=False)
+        self.retrieval_k_proj = nn.Linear(config.lstm_hidden, config.lstm_hidden, bias=False)
+        self.retrieval_v_proj = nn.Linear(config.d_model, config.lstm_hidden, bias=False)
+        # pred = softplus(retrieval_fc(Q + cross_attn(Q,K,V))) — residual 연결.
+        self.retrieval_fc = nn.Linear(config.lstm_hidden, 1)
 
         self.loss_fn = CombinedLoss(gamma=config.loss_gamma, eps=config.loss_eps)
 
@@ -120,6 +125,68 @@ class GridDemandModel(PreTrainedModel):
 
         return values, self.mask_table  # mask: (N, n_neighbors), 배치/시간에 안 붙어도 브로드캐스트됨
 
+    def _encode_from_values(self, values: torch.Tensor) -> torch.Tensor:
+        """values: (Batch,k,N,n_neighbors)(이미 크롭된 로컬 패치 값) -> (Batch,N,lstm_hidden).
+
+        공간 Fourier 임베딩 + CLS/노드 임베딩 + 위치 임베딩 + Transformer 인코더 + LSTM까지의
+        전체 인코딩 로직. 쿼리 자신의 입력(`forward`)과 검색된 후보 시점의 재인코딩
+        (`_encode_retrieval_candidates`) 양쪽에서 완전히 동일한 가중치로 호출된다 — 검색된 후보가
+        "그 시점이 쿼리였다면" 나왔을 임베딩을 만들기 위함.
+        """
+        Batch, k, N, _ = values.shape
+        d_model = self.config.d_model
+
+        log_values = torch.log1p(values.clamp(min=0))
+        neighbor_emb = self.scalar_embed(log_values)  # (Batch,k,N,n,d_model)
+
+        edge_emb = self.special_embed.weight[EDGE_TOKEN_ID]  # (d_model,)
+        mask_expanded = self.mask_table.view(1, 1, N, self.n_neighbors, 1).expand(
+            Batch, k, N, self.n_neighbors, d_model
+        )
+        neighbor_emb = torch.where(mask_expanded, neighbor_emb, edge_emb)
+
+        cls_base = self.special_embed.weight[CLS_TOKEN_ID]  # (d_model,)
+        node_vecs = self.node_embed.weight  # (N, d_model)
+        cls_emb = (cls_base + node_vecs).view(1, 1, N, 1, d_model).expand(Batch, k, N, 1, d_model)
+        seq = torch.cat([cls_emb, neighbor_emb], dim=3)  # (Batch,k,N,seq_len,d_model)
+        seq = seq + self.pos_embed
+
+        seq = seq.reshape(Batch * k * N, self.seq_len, d_model)
+        encoded = self.encoder(seq)  # (Batch*k*N, seq_len, d_model)
+        cls_out = encoded[:, 0, :].reshape(Batch, k, N, d_model)
+
+        cls_out = cls_out.permute(0, 2, 1, 3).reshape(Batch * N, k, d_model)
+        lstm_out, _ = self.lstm(cls_out)  # (Batch*N,k,lstm_hidden)
+        return lstm_out[:, -1, :].reshape(Batch, N, -1)  # (Batch,N,lstm_hidden)
+
+    def _encode_retrieval_candidates(self, cand_keys_flat: torch.Tensor) -> torch.Tensor:
+        """cand_keys_flat: (N,z,flat_dim) -> (N,z,lstm_hidden).
+
+        flat_dim = n_neighbors*time_step는 build_retrieval_db와 동일한 (n_neighbors,time_step)
+        순서로 flatten돼 있다 — 이를 복원해 _encode_from_values로 재인코딩한다(쿼리와 동일한
+        가중치 재사용).
+
+        _encode_from_values 내부의 self.encoder 호출은 (Batch*k*N)을 하나의 배치로 합쳐서 SDPA에
+        넘기는데, PyTorch의 memory-efficient attention 커널은 배치 크기가 65535를 넘으면
+        seed/offset을 만들지 못해 런타임에 크래시한다(z*time_step*N이 이 한도를 넘기 쉬움 — 예:
+        ulsan에서 retrieval_k=20이면 20*24*168=80,640). 결과에 영향 없이(각 (z,t,node)는 서로
+        완전히 독립적으로 계산됨) z 축을 청크로 나눠 여러 번 호출하는 것으로 회피한다.
+        """
+        N, z, _ = cand_keys_flat.shape
+        time_step = self.config.time_step
+        values = cand_keys_flat.reshape(N, z, self.n_neighbors, time_step)
+        values = values.permute(1, 3, 0, 2)  # (z,time_step,N,n_neighbors)
+
+        max_sdpa_batch = 65535
+        chunk_size = max(1, max_sdpa_batch // (time_step * N))
+        if chunk_size >= z:
+            encoded = self._encode_from_values(values)  # (z,N,lstm_hidden)
+        else:
+            chunks = [self._encode_from_values(values[start:start + chunk_size]) for start in range(0, z, chunk_size)]
+            encoded = torch.cat(chunks, dim=0)  # (z,N,lstm_hidden)
+
+        return encoded.permute(1, 0, 2)  # (N,z,lstm_hidden)
+
     def build_retrieval_db(self) -> None:
         """config.npy_path의 원본 grid 전체 시계열로부터 검색(retrieval) DB를 만든다.
 
@@ -182,41 +249,61 @@ class GridDemandModel(PreTrainedModel):
         self.register_buffer('retrieval_values', retrieval_values, persistent=False)
         self.register_buffer('retrieval_norms', retrieval_norms, persistent=False)
 
-    def _retrieve(self, query: torch.Tensor, sample_idx: torch.Tensor) -> torch.Tensor:
-        """query: (B,N,flat_dim), sample_idx: (B,) 절대 시간 인덱스 t -> ir_out (B,N).
+    def _retrieve(
+        self, query: torch.Tensor, sample_idx: torch.Tensor, q_proj_all: torch.Tensor
+    ) -> torch.Tensor:
+        """query: (B,N,flat_dim), sample_idx: (B,) 절대 시간 인덱스 t, q_proj_all: (B,N,lstm_hidden)
+        -> context (B,N,lstm_hidden).
 
-        각 배치 원소 b는 gir 샘플 하나가 이미 전체 N개 노드를 담고 있으므로, 인과적 후보 구간
-        (retrieval_keys[:, time_step:t_b])이 노드에 상관없이 b 하나당 하나로 통일된다 — 그래서
-        원본(IRModule)의 "배치 안 node_id별 group" 루프 대신 배치 원소 b에 대해서만 루프를 돈다.
-        후보 구간을 항상 t_b(자기 자신) 미만으로 슬라이스하므로 미래 시점을 절대 참조하지 않는다.
+        후보 "선택"(인과적 슬라이싱 + 코사인 유사도로 top-z, z=config.retrieval_k)은 기존과 동일.
+        선택된 z개 후보는 각각 (1) 자기 자신의 입력 윈도우(key seq)를 쿼리와 완전히 동일한 가중치로
+        재인코딩한 것을 K로, (2) 그 시점의 실제 수요값을 푸리에 임베딩+투영한 것을 V로 만들어,
+        Q(=q_proj_all)로 cross-attention한다. 배치 원소 b는 gir 샘플 하나가 이미 전체 N개 노드를
+        담고 있으므로, 인과적 후보 구간이 노드에 상관없이 b 하나당 하나로 통일된다 — 그래서 배치
+        원소 b에 대해서만 루프를 돈다. 후보 구간을 항상 t_b(자기 자신) 미만으로 슬라이스하므로
+        미래 시점을 절대 참조하지 않는다.
         """
-        B, N, _ = query.shape
+        B, N, flat_dim = query.shape
         time_step = self.config.time_step
-        top_k = self.config.retrieval_k
+        z_cfg = self.config.retrieval_k
+        hidden = self.config.lstm_hidden
 
-        ir_out = torch.zeros(B, N, device=query.device, dtype=query.dtype)
+        context = torch.zeros(B, N, hidden, device=query.device, dtype=query.dtype)
         for b in range(B):
             t_b = int(sample_idx[b].item())
             num_candidates = t_b - time_step
             if num_candidates <= 0:
-                continue  # 유효 후보 없음 (학습 극초반 샘플) -> ir_out=0, lambda 게이트가 알아서 처리
+                continue  # 유효 후보 없음 (학습 극초반 샘플) -> context=0, residual이 Q만으로 처리
 
             cand_keys = self.retrieval_keys[:, time_step:t_b, :].to(device=query.device, dtype=query.dtype)
             cand_values = self.retrieval_values[:, time_step:t_b].to(device=query.device, dtype=query.dtype)
             cand_norms = self.retrieval_norms[:, time_step:t_b].to(device=query.device, dtype=query.dtype)
 
-            q = query[b]  # (N,flat_dim)
-            q_norm = q.norm(dim=-1).clamp_min(1e-8)  # (N,)
-            sim = torch.einsum('nd,ncd->nc', q, cand_keys)
+            q_sim = query[b]  # (N,flat_dim)
+            q_norm = q_sim.norm(dim=-1).clamp_min(1e-8)  # (N,)
+            sim = torch.einsum('nd,ncd->nc', q_sim, cand_keys)
             sim = sim / (q_norm.unsqueeze(1) * cand_norms.clamp_min(1e-8))  # (N,num_candidates)
 
-            k = min(top_k, num_candidates)
-            top_vals, top_idx = torch.topk(sim, k=k, dim=1)  # (N,k)
-            weights = torch.softmax(top_vals, dim=1)  # (N,k)
-            gathered = torch.gather(cand_values, 1, top_idx)  # (N,k)
-            ir_out[b] = (gathered * weights).sum(dim=1)
+            z = min(z_cfg, num_candidates)
+            _, top_idx = torch.topk(sim, k=z, dim=1)  # (N,z) — 유사도 값 자체는 후보 "선택"에만 씀
 
-        return ir_out
+            gathered_keys_flat = torch.gather(
+                cand_keys, 1, top_idx.unsqueeze(-1).expand(-1, -1, flat_dim)
+            )  # (N,z,flat_dim)
+            gathered_values = torch.gather(cand_values, 1, top_idx)  # (N,z)
+
+            key_lstm_out = self._encode_retrieval_candidates(gathered_keys_flat)  # (N,z,hidden)
+            k_proj = self.retrieval_k_proj(key_lstm_out)  # (N,z,hidden)
+
+            value_emb = self.scalar_embed(torch.log1p(gathered_values.clamp(min=0)))  # (N,z,d_model)
+            v_proj = self.retrieval_v_proj(value_emb)  # (N,z,hidden)
+
+            q_b = q_proj_all[b]  # (N,hidden)
+            attn_logits = (q_b.unsqueeze(1) * k_proj).sum(-1) / (hidden ** 0.5)  # (N,z)
+            attn_weights = torch.softmax(attn_logits, dim=-1)
+            context[b] = (attn_weights.unsqueeze(-1) * v_proj).sum(dim=1)  # (N,hidden)
+
+        return context
 
     def forward(
         self,
@@ -227,47 +314,21 @@ class GridDemandModel(PreTrainedModel):
         if sample_idx is None:
             raise ValueError("이 모델은 검색(retrieval) 브랜치가 필수라 sample_idx가 반드시 필요함")
 
-        B, k, H, W = demands.shape
+        B, _, H, W = demands.shape
         N = H * W
-        d_model = self.config.d_model
 
-        values, mask = self._crop_all_nodes(demands)  # (B,k,N,n) / (N,n)
+        values, _ = self._crop_all_nodes(demands)  # (B,k,N,n)
         # 검색 query: DB(build_retrieval_db)와 동일한 (...,n_neighbors,time_step) 순서로 flatten.
         retrieval_query = values.permute(0, 2, 3, 1).reshape(B, N, -1)  # (B,N,n_neighbors*k)
 
-        log_values = torch.log1p(values.clamp(min=0))
-        neighbor_emb = self.scalar_embed(log_values)  # (B,k,N,n,d_model)
+        last = self._encode_from_values(values)  # (B,N,lstm_hidden)
 
-        edge_emb = self.special_embed.weight[EDGE_TOKEN_ID]  # (d_model,)
-        mask_expanded = mask.view(1, 1, N, self.n_neighbors, 1).expand(B, k, N, self.n_neighbors, d_model)
-        neighbor_emb = torch.where(mask_expanded, neighbor_emb, edge_emb)
+        q_proj_all = self.retrieval_q_proj(last)  # (B,N,lstm_hidden)
+        context = self._retrieve(retrieval_query, sample_idx, q_proj_all)  # (B,N,lstm_hidden)
 
-        # CLS = "CLS 마커" + "이 노드의 고유 임베딩" -> attention이 노드 정체성을 알고 이웃을 취합.
-        # node_id로 한 행만 고르던 걸 전체 N행(node_embed.weight)으로 바꿔 N개 노드 전부의 CLS를 구성.
-        cls_base = self.special_embed.weight[CLS_TOKEN_ID]  # (d_model,)
-        node_vecs = self.node_embed.weight  # (N, d_model)
-        cls_emb = (cls_base + node_vecs).view(1, 1, N, 1, d_model).expand(B, k, N, 1, d_model)
-        seq = torch.cat([cls_emb, neighbor_emb], dim=3)  # (B,k,N,seq_len,d_model)
-        seq = seq + self.pos_embed  # (seq_len,d_model) 브로드캐스트
-
-        # (B,k,N)을 하나의 배치로 합쳐 encoder에 넣음 -> 각 (b,t,node)는 서로 완전히 독립적으로 처리됨
-        # (예전에 (B,k)만 합치던 것과 동일한 원리, node 차원만 추가로 합친 것뿐 -> 노드별 연산은 그대로).
-        seq = seq.reshape(B * k * N, self.seq_len, d_model)
-        encoded = self.encoder(seq)  # (B*k*N, seq_len, d_model)
-        cls_out = encoded[:, 0, :].reshape(B, k, N, d_model)
-
-        # 노드별로 독립적인 시계열이므로 (B,N)을 LSTM 배치로 합치고 k를 시퀀스 축으로 둔다.
-        cls_out = cls_out.permute(0, 2, 1, 3).reshape(B * N, k, d_model)
-        lstm_out, _ = self.lstm(cls_out)  # (B*N,k,lstm_hidden)
-        last = lstm_out[:, -1, :].reshape(B, N, -1)  # (B,N,lstm_hidden)
-
-        neural_pred = F.softplus(self.output_proj(last)).squeeze(-1)  # (B,N)
-
-        ir_out = self._retrieve(retrieval_query, sample_idx)  # (B,N), 이미 실제 수요값의 가중평균이라 비음수
-
-        lambda_input = torch.cat([last, ir_out.unsqueeze(-1)], dim=-1)  # (B,N,lstm_hidden+1)
-        lambda_weight = torch.sigmoid(self.lambda_layer(lambda_input)).squeeze(-1)  # (B,N)
-        pred = lambda_weight * neural_pred + (1 - lambda_weight) * ir_out  # (B,N)
+        # pred = softplus(fc(Q + cross_attn(Q,K,V))) — residual 연결. 후보가 없으면 context=0이라
+        # Q(쿼리 자신의 인코딩)만으로 pred가 자연스럽게 산출됨.
+        pred = F.softplus(self.retrieval_fc(q_proj_all + context)).squeeze(-1)  # (B,N)
 
         logits = pred.reshape(B, H, W)  # labels(B,H,W)와 동일 shape, node_id=row*W+col 순서와 일치
 

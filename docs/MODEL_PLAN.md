@@ -33,14 +33,16 @@ N=H*W(전체 노드 수). 아래 연산은 노드 0..N-1 전부에 대해 **벡�
 x: (B, k, N, (2a+1)^2+1, d_model) → reshape (B*k*N, (2a+1)^2+1, d_model)
   → TransformerEncoder → CLS 출력만 추출                  # (B*k*N, d_model)
   → reshape (B, k, N, d_model) → permute → (B*N, k, d_model)
-  → LSTM(batch_first=True) → 마지막 timestep 출력          # (B*N, d_model) → reshape (B,N,d_model)
-  → Linear(d_model, 1) → Softplus                          # neural_pred (B, N)
+  → LSTM(batch_first=True) → 마지막 timestep 출력          # (B*N, d_model) → reshape (B,N,d_model) = last
+```
+(위 `values→last`까지의 로직은 `GridDemandModel._encode_from_values`로 추출돼 있고, 검색 브랜치의
+후보 재인코딩(§1-5)에서도 동일 가중치로 재사용된다.)
 
-병렬로 검색(retrieval) 브랜치가 같은 입력(로컬 윈도우)으로 ir_out (B,N)을 만들고(§1-5),
-neural_pred와 ir_out을 sigmoid 게이트로 섞은 뒤 reshape:
-  lambda = sigmoid(Linear([last_hidden, ir_out]))          # (B, N), 최종 레이어 직전 concat
-  pred = lambda * neural_pred + (1 - lambda) * ir_out
-  → reshape                                                 # (B, H, W)  (양쪽 다 비음수라 pred도 비음수)
+```
+Q = Linear_q(last)                                        # (B,N,lstm_hidden)
+context = 검색(retrieval) 브랜치의 cross-attention 결과(§1-5)  # (B,N,lstm_hidden)
+pred = Softplus(Linear_fc(Q + context))                    # (B,N), residual 연결
+  → reshape                                                 # (B, H, W)
 ```
 
 ### 1-1. 스칼라 임베딩 `FourierEmbed` (교체 가능하게 설계)
@@ -83,17 +85,17 @@ neural_pred와 ir_out을 sigmoid 게이트로 섞은 뒤 reshape:
 | `dropout` | 0.1 | transformer/lstm dropout |
 | `lstm_hidden` | 64 (=`d_model`) | LSTM hidden size |
 | `lstm_layers` | 1 | LSTM layer 수 |
-| `retrieval_k` | 20 | 검색(retrieval) top-k |
+| `retrieval_k` | 3 | 검색(retrieval) top-z(후보 개수). 원래 20이었으나, 후보마다 공간 인코더+LSTM을 다시 돌리는 §1-5 재설계 이후 학습 시 24GB GPU에서 OOM이 나서 3으로 낮춤(porto가 더 타이트해서 실질적 하한) |
 | `time_step` | 24 | 검색 DB 슬라이딩 윈도우 길이(`train.py`가 `dataset.time_step`으로 주입, yaml에 직접 안 둠) |
 | `npy_path` | (없음, 필수) | 검색 DB를 만들 원본 grid npy **절대경로**(`train.py`가 `dataset.npy_path`를 resolve해서 주입) |
 
 ## 1-5. 검색(retrieval) 앙상블 브랜치
 
 `/home/jinsu/PycharmProjects/DMVST` 저장소 `ir` 브랜치(`IRModule`)에서 아이디어를 가져온
-브랜치(이 저장소도 브랜치명이 `ir`). 뉴럴 브랜치(위 1절)와 별도로, 같은 위치(node)의 **과거** 로컬
-윈도우 중 지금 입력과 코사인 유사도가 가장 높은 top-k를 찾아 그 시점 실제 수요값을 softmax
-가중평균한 값(`ir_out`)을 만들고, `sigmoid` 게이트로 뉴럴 브랜치 예측과 섞는다
-(`GridDemandModel.build_retrieval_db`/`_retrieve`, `models/modeling.py`).
+브랜치(이 저장소도 브랜치명이 `ir`, 이 섹션이 다루는 cross-attention 재설계는 그 위에 얹은
+`ir-emb` 브랜치). 뉴럴 브랜치(위 1절)와 별도로, 같은 위치(node)의 **과거** 로컬 윈도우 중 지금
+입력과 코사인 유사도가 가장 높은 top-z(`retrieval_k`)를 찾은 뒤(`GridDemandModel._retrieve`),
+그 z개 후보를 최종 예측에 반영한다.
 
 **검색 DB(`build_retrieval_db`)**: `config.npy_path`의 원본 grid 전체 시계열(T,H,W)을
 `_crop_all_nodes`로 한 번에 크롭(B=1,k=T로 호출)한 뒤, `time_step` 길이 슬라이딩 윈도우로 잘라
@@ -103,10 +105,35 @@ neural_pred와 ir_out을 sigmoid 게이트로 섞은 뒤 reshape:
 - `retrieval_norms (N,T)` — key 벡터 L2 norm(코사인 유사도 분모 캐시)
 
 `t < time_step` 구간은 유효한 윈도우가 없어 0으로 남겨두고, 후보 슬라이스가 항상
-`[time_step, t)`(자기 자신 미만)로 제한되므로 미래 시점을 참조하지 않는다. 검색(`_retrieve`)은
+`[time_step, t)`(자기 자신 미만)로 제한되므로 미래 시점을 참조하지 않는다. **후보 선택**은
 gir가 이미 한 샘플 = 한 시각(t)에 N개 노드 전부를 담고 있다는 점을 이용해, 원본처럼 배치 안
 `node_id`별로 루프 도는 대신 **배치 원소(B)별로만** 루프를 돈다(후보 구간이 노드에 무관하게
 b 하나당 하나로 통일되기 때문 — B~4-8회로 원본보다 훨씬 적은 반복).
+
+**후보를 최종 예측에 반영하는 방식(cross-attention, `ir-emb`에서 재설계)**: 처음에는(`ir` 브랜치)
+선택된 z개 후보의 실제 수요값을 유사도로 softmax 가중평균한 스칼라 하나를 뉴럴 브랜치 예측에
+`sigmoid` 게이트로 섞었다. 이 방식은 "스칼라 하나를 벡터에 이어붙이는" 정보 손실이 커서, DTW
+유사도를 attention 가중치로 직접 쓰는 것도 노드마다 유사도 분포가 달라 비교 가능한 신뢰도로
+쓰기 부적절하다는 (§1-6과 동일한 계열의) 문제의식으로 cross-attention 기반으로 바꿨다:
+
+- **Q**: 지금 쿼리 자신의 인코딩(`last`, 위 1절)을 `Linear_q`로 투영한 것.
+- **K**: 선택된 z개 후보 각각의 **자기 자신의 입력 윈도우**(`t_i-time_step..t_i-1`, 검색 DB
+  `retrieval_keys`에 이미 저장돼 있는 원본 패치 값)를, **쿼리와 완전히 동일한 가중치**
+  (`scalar_embed`/`node_embed`/공간 인코더/LSTM 전부 공유, `GridDemandModel._encode_from_values`
+  로 추출해 재사용)로 "그 시점이 쿼리였다면" 나왔을 임베딩으로 재인코딩한 뒤 `Linear_k`로 투영한
+  것(`_encode_retrieval_candidates`). `Linear_q`/`Linear_k`는 서로 다른 가중치.
+- **V**: 그 z개 후보의 **실제 수요값**(스칼라)을 `scalar_embed`(공간 인코딩과 동일한 푸리에
+  임베딩 모듈 재사용)로 임베딩한 뒤 `Linear_v`로 투영한 것.
+- `context = softmax(QK^T/√d) · V` (single-head), `pred = Softplus(Linear_fc(Q + context))` —
+  residual 연결. 후보가 0개인 극초반 샘플은 `context=0`으로 남아 `pred`가 자연스럽게 `Q`만으로
+  산출된다(원래의 `ir_out=0, 게이트가 알아서 처리` fallback과 동일한 취지).
+
+**연산/메모리 비용**: 후보 z개마다 공간 인코더+LSTM 전체를 다시 돌려야 해서, `_encode_from_values`
+내부 Transformer가 받는 유효 배치(`z*time_step*N`)가 PyTorch memory-efficient attention 커널의
+배치 상한(65535)을 넘기 쉽다 — `_encode_retrieval_candidates`가 z축을 청크로 나눠 여러 번
+호출해서 회피한다(결과에는 영향 없음, 각 (z,t,node)가 서로 독립적이라 순수 청크 분할). 그래도
+학습 중(gradient 유지) 실제 GPU 메모리 사용량은 여전히 커서, `retrieval_k` 기본값을 20→3으로
+낮췄다(위 1-4 표 참고).
 
 **중요 — `persistent=False` + 수동 재로드**: 위 3개 버퍼는 `config.npy_path`의 순수 함수지만
 크기가 커서(ulsan ~1.7GB, porto ~4GB, fp32) 다른 buffer(`idx_table`/`mask_table`)처럼
