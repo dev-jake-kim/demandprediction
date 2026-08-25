@@ -22,6 +22,9 @@ class GridDemandConfig(PretrainedConfig):
         npy_path: str | None = None,
         retrieval_k: int = 20,
         commute_map_path: str | None = None,
+        weather_csv_path: str | None = None,
+        weather_mean: list[float] | None = None,
+        weather_std: list[float] | None = None,
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
         **kwargs,
@@ -44,6 +47,11 @@ class GridDemandConfig(PretrainedConfig):
         # commute-attention 전용 — preprocessing/build_commute_map.py가 만든 (N,n) 참조 인덱스/유사도
         # npz의 절대경로(train.py가 주입). n은 여기서 별도로 안 두고 로드된 배열의 shape에서 읽는다.
         self.commute_map_path = commute_map_path
+        # 날씨/캘린더 브랜치 전용 — weather_csv_path는 절대경로(train.py가 주입),
+        # weather_mean/std는 train split 통계(3개씩, leakage 방지 위해 train.py가 계산해 주입).
+        self.weather_csv_path = weather_csv_path
+        self.weather_mean = weather_mean
+        self.weather_std = weather_std
         self.loss_gamma = loss_gamma
         self.loss_eps = loss_eps
         super().__init__(**kwargs)

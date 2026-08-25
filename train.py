@@ -59,15 +59,18 @@ class MinEpochEarlyStoppingCallback(EarlyStoppingCallback):
 def build_datasets(cfg: DictConfig) -> tuple[GridDemandDataset, GridDemandDataset, GridDemandDataset]:
     npy_path = cfg.dataset.npy_path
     time_step = cfg.dataset.time_step
+    weather_csv_path = cfg.dataset.weather_csv_path
 
-    full_ds = GridDemandDataset(npy_path, time_step=time_step)
+    full_ds = GridDemandDataset(npy_path, time_step=time_step, weather_csv_path=weather_csv_path)
     T = full_ds.T
     split1 = int(T * cfg.dataset.train_ratio)
     split2 = int(T * (cfg.dataset.train_ratio + cfg.dataset.val_ratio))
 
-    train_ds = GridDemandDataset(npy_path, time_step=time_step, t_end=split1)
-    val_ds = GridDemandDataset(npy_path, time_step=time_step, t_start=split1, t_end=split2)
-    test_ds = GridDemandDataset(npy_path, time_step=time_step, t_start=split2)
+    train_ds = GridDemandDataset(npy_path, time_step=time_step, weather_csv_path=weather_csv_path, t_end=split1)
+    val_ds = GridDemandDataset(
+        npy_path, time_step=time_step, weather_csv_path=weather_csv_path, t_start=split1, t_end=split2
+    )
+    test_ds = GridDemandDataset(npy_path, time_step=time_step, weather_csv_path=weather_csv_path, t_start=split2)
 
     logger.info(
         f"[{cfg.dataset.city}] T={T}, H={full_ds.X}, W={full_ds.Y} | "
@@ -86,6 +89,15 @@ def compute_metrics(eval_pred) -> dict[str, float]:
 def main(cfg: DictConfig) -> None:
     train_ds, val_ds, test_ds = build_datasets(cfg)
 
+    # train split에서만 날씨 정규화 통계를 계산(시간 리크 방지) — STResnet의 demand_mean/std
+    # 계산과 동일 패턴.
+    train_weather = train_ds.weather[train_ds.time_step:train_ds.t_end]
+    weather_mean = train_weather.mean(axis=0)
+    # 적설처럼 train split 내내 값이 고정(분산 0)인 피처가 있을 수 있음(예: porto는 적설이 항상 0) ->
+    # 모델의 (weather - mean) / std 정규화에서 0으로 나누지 않도록 최소값을 둔다.
+    weather_std = train_weather.std(axis=0).clip(min=1e-6)
+    logger.info(f"weather_mean={weather_mean.tolist()}, weather_std={weather_std.tolist()}")
+
     model_kwargs = OmegaConf.to_container(cfg.model, resolve=True)
     model_config = GridDemandConfig(
         H=train_ds.X,
@@ -93,6 +105,9 @@ def main(cfg: DictConfig) -> None:
         time_step=train_ds.time_step,
         npy_path=str(Path(cfg.dataset.npy_path).resolve()),
         commute_map_path=str(Path(cfg.dataset.commute_map_path).resolve()),
+        weather_csv_path=str(Path(cfg.dataset.weather_csv_path).resolve()),
+        weather_mean=weather_mean.tolist(),
+        weather_std=weather_std.tolist(),
         **model_kwargs,
     )
     model = GridDemandModel(model_config)
