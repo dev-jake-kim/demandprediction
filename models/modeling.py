@@ -49,7 +49,24 @@ class GridDemandModel(PreTrainedModel):
         )
         self.output_proj = nn.Linear(config.lstm_hidden, 1)
 
+        # 날씨(Linear 투영, Lambda-F 스타일) + 캘린더(ADFormer의 DataEmbedding과 동일한 임베딩
+        # 테이블 방식) — 둘 다 CLS 토큰에 더해져서 주입된다(forward 참고).
+        self.weather_proj = nn.Linear(3, config.d_model)
+        self.daytime_embedding = nn.Embedding(1440, config.d_model)
+        self.weekday_embedding = nn.Embedding(7, config.d_model)
+
         self.loss_fn = CombinedLoss(gamma=config.loss_gamma, eps=config.loss_eps)
+
+        if config.weather_mean is None or config.weather_std is None:
+            raise ValueError("weather_mean/weather_std(3개씩, train split 통계)가 필요함")
+        # 작은 buffer(3개짜리)라 idx_table과 같은 범주 — persistent=True로 충분, ir의 검색 DB처럼
+        # from_pretrained 이후 수동 재로드가 필요 없다.
+        self.register_buffer(
+            'weather_mean', torch.tensor(config.weather_mean, dtype=torch.float32), persistent=True
+        )
+        self.register_buffer(
+            'weather_std', torch.tensor(config.weather_std, dtype=torch.float32), persistent=True
+        )
 
         # node_id -> (padded grid 기준 이웃 (2a+1)^2개의 flat index, 격자 안 여부)는
         # H,W,a로만 정해지는 순수 함수라 가능한 모든 node_id(H*W개)에 대해 미리 계산해둔다.
@@ -114,7 +131,13 @@ class GridDemandModel(PreTrainedModel):
         demands: torch.Tensor,
         labels: torch.Tensor | None = None,
         sample_idx: torch.Tensor | None = None,
+        weather: torch.Tensor | None = None,
+        hour_of_day: torch.Tensor | None = None,
+        day_of_week: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | None]:
+        if weather is None or hour_of_day is None or day_of_week is None:
+            raise ValueError("이 모델은 날씨/캘린더 피처가 필수라 weather/hour_of_day/day_of_week가 필요함")
+
         B, k, H, W = demands.shape
         N = H * W
         d_model = self.config.d_model
@@ -128,11 +151,22 @@ class GridDemandModel(PreTrainedModel):
         mask_expanded = mask.view(1, 1, N, self.n_neighbors, 1).expand(B, k, N, self.n_neighbors, d_model)
         neighbor_emb = torch.where(mask_expanded, neighbor_emb, edge_emb)
 
-        # CLS = "CLS 마커" + "이 노드의 고유 임베딩" -> attention이 노드 정체성을 알고 이웃을 취합.
+        # 날씨(예보값 가정, GridDemandDataset docstring 참고)+캘린더 -> 시점별(B,k) 임베딩 하나로
+        # 합쳐서 CLS에 더한다(노드 축엔 무관하게 브로드캐스트).
+        weather_norm = (weather - self.weather_mean) / self.weather_std  # (B,k,3)
+        weather_emb = self.weather_proj(weather_norm)  # (B,k,d_model)
+        daytime_idx = (hour_of_day.float() / 24.0 * 1440).round().long().clamp(0, 1439)  # ADFormer와 동일 변환
+        temporal_extra = (
+            weather_emb + self.daytime_embedding(daytime_idx) + self.weekday_embedding(day_of_week)
+        )  # (B,k,d_model)
+
+        # CLS = "CLS 마커" + "이 노드의 고유 임베딩" + "이 시점의 날씨/캘린더" -> attention이 노드
+        # 정체성 + 외부 요인을 함께 알고 이웃을 취합.
         # node_id로 한 행만 고르던 걸 전체 N행(node_embed.weight)으로 바꿔 N개 노드 전부의 CLS를 구성.
         cls_base = self.special_embed.weight[CLS_TOKEN_ID]  # (d_model,)
         node_vecs = self.node_embed.weight  # (N, d_model)
         cls_emb = (cls_base + node_vecs).view(1, 1, N, 1, d_model).expand(B, k, N, 1, d_model)
+        cls_emb = cls_emb + temporal_extra.view(B, k, 1, 1, d_model)  # 노드 축으로 브로드캐스트
         seq = torch.cat([cls_emb, neighbor_emb], dim=3)  # (B,k,N,seq_len,d_model)
         seq = seq + self.pos_embed  # (seq_len,d_model) 브로드캐스트
 

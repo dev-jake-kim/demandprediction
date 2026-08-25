@@ -32,8 +32,11 @@ def evaluate(model: GridDemandModel, loader: DataLoader, device: str) -> dict[st
     with torch.no_grad():
         for batch in tqdm(loader, desc="evaluate"):
             demands = batch["demands"].to(device)
+            weather = batch["weather"].to(device)
+            hour_of_day = batch["hour_of_day"].to(device)
+            day_of_week = batch["day_of_week"].to(device)
 
-            out = model(demands=demands)
+            out = model(demands=demands, weather=weather, hour_of_day=hour_of_day, day_of_week=day_of_week)
             all_preds.append(out["logits"].cpu().numpy())
             all_labels.append(batch["labels"].numpy())
 
@@ -46,6 +49,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="checkpoint_path만 주면 학습 프로세스와 무관하게 단독 실행되는 평가 스크립트")
     parser.add_argument("checkpoint_path", type=str, help="model.save_pretrained()로 저장된 체크포인트 디렉토리")
     parser.add_argument("--npy_path", type=str, required=True, help="예: data/raw/ulsan_temporal_grid.npy")
+    parser.add_argument(
+        "--weather_csv_path", type=str, required=True, help="예: data/raw/ulsan_meteorological_data.csv"
+    )
     parser.add_argument("--time_step", type=int, default=24)
     parser.add_argument("--t_start", type=int, default=None, help="평가에 사용할 target 시간 구간 시작 (예: test split 경계)")
     parser.add_argument("--t_end", type=int, default=None)
@@ -65,6 +71,7 @@ def main() -> None:
     test_ds = GridDemandDataset(
         args.npy_path,
         time_step=args.time_step,
+        weather_csv_path=args.weather_csv_path,
         t_start=args.t_start,
         t_end=args.t_end,
     )

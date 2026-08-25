@@ -141,7 +141,36 @@ configs/
 - `train.py`: `@hydra.main(config_path="configs", config_name="config")` → dataset/model 생성 → `TrainingArguments`(`cfg.train`) → HF `Trainer` → `trainer.train()` → `trainer.save_model()` (hydra run dir = `output/${project_name}/...`, `configs/config.yaml`의 `hydra.run.dir`과 일치).
 - `test.py`: `checkpoint_path` 인자만 받아 `GridDemandModel.from_pretrained(checkpoint_path)`로 복원 후, 별도 test 시간 구간 `GridDemandDataset`으로 RMSE/MAE/MAPE(+1) 계산. 학습 프로세스와 완전히 분리된 독립 실행.
 
-## 8. 아직 정해지지 않은 것 / 기본값으로 진행할 것
+## 8. 날씨 + 캘린더 피처 (`baseline-weather` 브랜치)
+
+`master`의 baseline은 순수 과거 수요값만 입력으로 쓴다(캘린더/날씨 전혀 없음). `baseline-weather`
+브랜치는 여기에 날씨(기온/강수/적설)와 캘린더(시간대/요일) 정보를 추가한다.
+
+- **날씨 임베딩**: Lambda-F 스타일 — `nn.Linear(3, d_model)` 한 번으로 투영(Fourier 미사용).
+  입력 전 train split 통계로 표준화(`(weather - weather_mean) / weather_std`).
+- **캘린더 임베딩**: ADFormer의 `DataEmbedding`과 동일 — `daytime_embedding: nn.Embedding(1440, d_model)`
+  (`round(hour_of_day/24*1440).clamp(0,1439)`로 인덱싱) + `weekday_embedding: nn.Embedding(7, d_model)`.
+- **주입 위치**: 기존 `CLS = special_emb[CLS] + node_embed[node]`에 날씨/캘린더 임베딩 합을 그대로
+  더한다(`cls_emb += weather_emb + daytime_emb + weekday_emb`, 노드 축엔 무관하게 브로드캐스트) —
+  이 프로젝트가 이미 쓰고 있는 "서로 다른 의미의 벡터를 CLS에 더해 합성"하는 패턴의 연장.
+- **날씨 윈도우는 의도적으로 한 칸 밀려 있다**: 수요 입력 윈도우가 `[t-k, t-1]`이면 날씨는
+  `[t-k+1, t]`를 쓴다(예측 대상 시점 `t` 자체의 날씨 포함). "그 시점 예보는 이미 안다"는 가정 —
+  수요 자체를 미리 아는 것과는 다르며, 단기 기상 예보 정확도가 높다는 근거로 채택했다.
+  **이건 leakage 버그가 아니라 의도된 설계다.** 캘린더 정보는 예보가 필요 없는 결정론적 정보라
+  수요와 동일한 비이동 윈도우 `[t-k, t-1]`을 그대로 쓴다(ADFormer와 동일 계산).
+- **날씨 CSV 로딩 시 주의(`dataset_frame/grid_demand_dataset.py`)**: 기상청 관측 데이터 관례상
+  강수량/적설 빈 셀은 "관측값 없음"이 아니라 "0"을 의미한다(비/눈이 없으면 값을 아예 안 채움).
+  `강수량(mm)`/`적설(cm)` 두 컬럼만 `fillna(0.0)`을 적용하고, 기온을 포함한 3개 컬럼 전체에 대해
+  `np.isfinite` 검증을 둬서 진짜 결측/무한값은 zero-fill로 숨기지 않고 명시적 `ValueError`로 드러낸다.
+- **모델 필수 인자**: `forward(demands, labels=None, sample_idx=None, weather=None, hour_of_day=None,
+  day_of_week=None)` — `weather`/`hour_of_day`/`day_of_week` 중 하나라도 `None`이면 `ValueError`
+  (ADFormer의 관례와 동일하게 이 브랜치에서는 세 값 다 필수 취급).
+- `weather_mean`/`weather_std`는 `GridDemandConfig`에 저장되고(`train.py`가 train split에서만 계산해
+  주입, leakage 방지), `GridDemandModel`에는 `persistent=True` buffer로 등록되어 `from_pretrained`
+  이후 자동 복원된다(`idx_table`/`mask_table`과 같은 범주 — transformers 5.0 meta-device fast-init
+  이슈 회피, §1-2-1 참고 패턴과 동일 이유).
+
+## 9. 아직 정해지지 않은 것 / 기본값으로 진행할 것
 
 - `a`, `d_model`, `n_freqs` 등 정확한 하이퍼파라미터 값 — 위 표를 기본값으로 두고 `configs/model/baseline.yaml`에서 조정.
 - train/val/test 시간 분할 비율 — 별도 지시 없으면 시간순 70/15/15로 가정.
