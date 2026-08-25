@@ -10,6 +10,7 @@ multirun
 outputs
 data/
 .omc/
+.codex/
 preprocessing/**/raw/
 preprocessing/**/output/
 *.csv
