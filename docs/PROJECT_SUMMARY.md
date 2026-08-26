@@ -26,28 +26,35 @@ loss(`CombinedLoss`)·같은 평가지표(`compute_regression_metrics`)·같은 
 모델 구현 전 항상 논문 PDF를 먼저 읽고 적용 가능성을 판단한 뒤 진행했고, 모든 구현은 `codex exec`을
 이용한 외부 리뷰(계획 대비 diff 검토, 최소 1~3라운드)를 통과한 뒤 커밋했다.
 
-## 실험 결과 (5시드 평균: seed=245,6835,851,5123,535 — `baseline-tmp`만 3시드: seed=245,6835,851)
+## 실험 결과 (5시드 평균: seed=245,6835,851,5123,535 — `baseline-tmp`는 3시드, `*-weather`(ir/ir-commute/aggregator + 날씨) 3개는 1시드: seed=245만)
 
 | 데이터 | 모델 | RMSE | MAE | MAPE(+1) |
 |---|---|---|---|---|
-| ulsan | ir-commute | **0.7629** | 0.3506 | 15.738 |
+| ulsan | ir-weather (날씨+캘린더, 1시드) | **0.7478** | **0.3460** | 15.870 |
+| ulsan | ir-commute | 0.7629 | 0.3506 | 15.738 |
 | ulsan | ADFormer | 0.7638 | 0.3537 | 15.950 |
 | ulsan | ir | 0.7672 | 0.3520 | 15.715 |
 | ulsan | aggregator | 0.7677 | 0.3526 | 15.915 |
+| ulsan | aggregator-weather (날씨+캘린더, 1시드) | 0.7585 | 0.3484 | 15.740 |
 | ulsan | baseline | 0.7752 | 0.3547 | 15.771 |
+| ulsan | baseline-tmp (날씨+캘린더, 3시드) | 0.7636 | 0.3501 | 15.64 |
+| ulsan | ir-commute-weather (날씨+캘린더, 1시드) | 0.7631 | 0.3499 | **15.635** |
 | ulsan | DMVST | 0.7760 | 0.3575 | 16.107 |
 | ulsan | STResnet | 0.8054 | 0.3685 | 16.281 |
-| ulsan | baseline-tmp (날씨+캘린더, 3시드) | 0.7636 | **0.3501** | **15.64** |
-| porto | ADFormer | **1.6114** | 0.5153 | 16.554 |
-| porto | ir | 1.6118 | **0.5049** | 15.709 |
+| porto | ir-weather (날씨+캘린더, 1시드) | **1.5894** | 0.5048 | **15.512** |
+| porto | ADFormer | 1.6114 | 0.5153 | 16.554 |
+| porto | ir | 1.6118 | 0.5049 | 15.709 |
+| porto | ir-commute-weather (날씨+캘린더, 1시드) | 1.6217 | **0.4999** | 15.805 |
 | porto | ir-commute | 1.6355 | 0.5054 | 15.779 |
 | porto | baseline | 1.7838 | 0.5136 | 15.663 |
+| porto | aggregator-weather (날씨+캘린더, 1시드) | 1.7347 | 0.5140 | 15.567 |
 | porto | aggregator | 1.8157 | 0.5179 | 15.599 |
+| porto | baseline-tmp (날씨+캘린더, 3시드) | 1.8029 | 0.5158 | 15.57 |
 | porto | DMVST | 1.8357 | 0.5375 | 16.922 |
 | porto | STResnet | 1.9385 | 0.5368 | 16.578 |
-| porto | baseline-tmp (날씨+캘린더, 3시드) | 1.8029 | 0.5158 | **15.57** |
 
-각 지표는 도시(ulsan/porto)별로 가장 좋은 값(낮을수록 좋음)만 볼드 처리했다.
+각 지표는 도시(ulsan/porto)별로 가장 좋은 값(낮을수록 좋음)만 볼드 처리했다. `*-weather`/`baseline-tmp`
+행은 시드 수가 다른 모델들과 달라(1~3시드 vs 5시드) 직접 비교 시 표본 크기 차이를 감안해야 한다.
 
 원본 CSV(브랜치/도시별 5개 seed 개별 기록): `docs/{BASELINE,ADFORMER,STRESNET,DMVST,AGGREGATOR,IR,IR_COMMUTE}_RESULTS.csv`
 (ulsan), `docs/{BASELINE,ADFORMER,STRESNET,DMVST,AGGREGATOR,IR,IR_COMMUTE}_RESULTS_PORTO.csv`(porto).
