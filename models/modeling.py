@@ -72,9 +72,11 @@ class GridDemandModel(PreTrainedModel):
         self.register_buffer('commute_idx', commute_idx, persistent=True)  # (H*W, n)
         self.register_buffer('commute_sim', commute_sim, persistent=True)  # (H*W, n)
 
-        self.commute_q_proj = nn.Linear(config.lstm_hidden, config.lstm_hidden, bias=False)
-        self.commute_k_proj = nn.Linear(config.lstm_hidden, config.lstm_hidden, bias=False)
-        self.commute_v_proj = nn.Linear(config.lstm_hidden, config.lstm_hidden, bias=False)
+        # early-commute: commute-attention을 LSTM 이후(last, lstm_hidden 차원)가 아니라 LSTM 직전
+        # (cls_out, k개 시점 각각, d_model 차원)에 적용하는 변형이라 projection 차원이 d_model이다.
+        self.commute_q_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.commute_k_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.commute_v_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         # DTW 유사도(스칼라)를 attention logit에 더해지는 학습 가능한 scale+bias로만 씀 — DTW
         # 자체를 최종 가중치로 쓰지 않는 이유는 docs/MODEL_PLAN.md §1-6 참고.
         self.commute_dtw_bias = nn.Linear(1, 1)
@@ -323,24 +325,26 @@ class GridDemandModel(PreTrainedModel):
         encoded = self.encoder(seq)  # (B*k*N, seq_len, d_model)
         cls_out = encoded[:, 0, :].reshape(B, k, N, d_model)
 
+        # early-commute: commute-attention을 LSTM "이후"(last, 시점 1개)가 아니라 LSTM "직전"
+        # (cls_out, k개 시점 전부)에 적용한다 -> LSTM이 이미 commute 정보가 섞인 시퀀스를 취합하게
+        # 됨. 로컬 윈도우 밖, DTW로 미리 골라둔 n개 노드의 정보를 주입한다. "얼마나 반영할지"는 DTW
+        # 스칼라로 직접 정하지 않고(노드마다 DTW 분포가 달라 스칼라 하나로 비교 가능한 신뢰도를 못
+        # 만듦) 학습 가능한 cross-attention이 결정하며, DTW 유사도는 그 attention logit에 더해지는
+        # learnable scale+bias(사전지식)로만 참여한다.
+        ref_emb = cls_out[:, :, self.commute_idx, :]  # (B,k,N,n,d_model) — idx_table과 동일한 gather 트릭
+        q = self.commute_q_proj(cls_out).unsqueeze(3)  # (B,k,N,1,d_model)
+        ref_k = self.commute_k_proj(ref_emb)  # (B,k,N,n,d_model)
+        ref_v = self.commute_v_proj(ref_emb)  # (B,k,N,n,d_model)
+        commute_logits = (q * ref_k).sum(-1) / (d_model ** 0.5)  # (B,k,N,n)
+        commute_bias = self.commute_dtw_bias(self.commute_sim.unsqueeze(-1)).squeeze(-1)  # (N,n)
+        commute_weights = torch.softmax(commute_logits + commute_bias, dim=-1)  # (B,k,N,n)
+        commute_context = (commute_weights.unsqueeze(-1) * ref_v).sum(dim=3)  # (B,k,N,d_model)
+        cls_out = cls_out + commute_context  # residual, 시점마다
+
         # 노드별로 독립적인 시계열이므로 (B,N)을 LSTM 배치로 합치고 k를 시퀀스 축으로 둔다.
         cls_out = cls_out.permute(0, 2, 1, 3).reshape(B * N, k, d_model)
         lstm_out, _ = self.lstm(cls_out)  # (B*N,k,lstm_hidden)
         last = lstm_out[:, -1, :].reshape(B, N, -1)  # (B,N,lstm_hidden)
-
-        # commute-attention: 로컬 윈도우 밖, DTW로 미리 골라둔 n개 노드의 정보를 주입한다.
-        # "얼마나 반영할지"는 DTW 스칼라로 직접 정하지 않고(노드마다 DTW 분포가 달라 스칼라 하나로
-        # 비교 가능한 신뢰도를 못 만듦) 학습 가능한 cross-attention이 결정하며, DTW 유사도는 그
-        # attention logit에 더해지는 learnable scale+bias(사전지식)로만 참여한다.
-        ref_emb = last[:, self.commute_idx, :]  # (B,N,n,lstm_hidden) — idx_table과 동일한 gather 트릭
-        q = self.commute_q_proj(last).unsqueeze(2)  # (B,N,1,lstm_hidden)
-        ref_k = self.commute_k_proj(ref_emb)  # (B,N,n,lstm_hidden)
-        ref_v = self.commute_v_proj(ref_emb)  # (B,N,n,lstm_hidden)
-        commute_logits = (q * ref_k).sum(-1) / (self.config.lstm_hidden ** 0.5)  # (B,N,n)
-        commute_bias = self.commute_dtw_bias(self.commute_sim.unsqueeze(-1)).squeeze(-1)  # (N,n)
-        commute_weights = torch.softmax(commute_logits + commute_bias, dim=-1)  # (B,N,n)
-        commute_context = (commute_weights.unsqueeze(-1) * ref_v).sum(dim=2)  # (B,N,lstm_hidden)
-        last = last + commute_context  # residual
 
         neural_pred = F.softplus(self.output_proj(last)).squeeze(-1)  # (B,N)
 
