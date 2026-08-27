@@ -33,14 +33,13 @@ N=H*W(전체 노드 수). 아래 연산은 노드 0..N-1 전부에 대해 **벡�
 x: (B, k, N, (2a+1)^2+1, d_model) → reshape (B*k*N, (2a+1)^2+1, d_model)
   → TransformerEncoder → CLS 출력만 추출                  # (B*k*N, d_model)
   → reshape (B, k, N, d_model) → permute → (B*N, k, d_model)
-  → LSTM(batch_first=True) → 마지막 timestep 출력          # (B*N, d_model) → reshape (B,N,d_model)
-  → Linear(d_model, 1) → Softplus                          # neural_pred (B, N)
+  → LSTM(batch_first=True) → 마지막 timestep 출력          # (B*N, d_model) → reshape (B,N,lstm_hidden)
 
-병렬로 검색(retrieval) 브랜치가 같은 입력(로컬 윈도우)으로 ir_out (B,N)을 만들고(§1-5),
-neural_pred와 ir_out을 sigmoid 게이트로 섞은 뒤 reshape:
-  lambda = sigmoid(Linear([last_hidden, ir_out]))          # (B, N), 최종 레이어 직전 concat
-  pred = lambda * neural_pred + (1 - lambda) * ir_out
-  → reshape                                                 # (B, H, W)  (양쪽 다 비음수라 pred도 비음수)
+병렬로 검색(retrieval) 브랜치가 같은 입력(로컬 윈도우)으로 retrieval_vector
+(B,N,retrieval_vec_dim)를 만들고(§1-5), LSTM 출력에 concat해 단일 head로 최종 예측:
+  fused = concat([last_hidden, retrieval_vector])          # (B,N, lstm_hidden+retrieval_vec_dim)
+  pred = softplus(Linear(fused, 1))
+  → reshape                                                 # (B, H, W)  (softplus라 pred는 비음수)
 ```
 
 ### 1-1. 스칼라 임베딩 `FourierEmbed` (교체 가능하게 설계)
@@ -84,16 +83,29 @@ neural_pred와 ir_out을 sigmoid 게이트로 섞은 뒤 reshape:
 | `lstm_hidden` | 64 (=`d_model`) | LSTM hidden size |
 | `lstm_layers` | 1 | LSTM layer 수 |
 | `retrieval_k` | 20 | 검색(retrieval) top-k |
+| `retrieval_vec_dim` | 64 (=`lstm_hidden`) | 검색 후보 값을 벡터화(scalar_embed)+projection한 출력 차원 |
 | `time_step` | 24 | 검색 DB 슬라이딩 윈도우 길이(`train.py`가 `dataset.time_step`으로 주입, yaml에 직접 안 둠) |
 | `npy_path` | (없음, 필수) | 검색 DB를 만들 원본 grid npy **절대경로**(`train.py`가 `dataset.npy_path`를 resolve해서 주입) |
 
 ## 1-5. 검색(retrieval) 앙상블 브랜치
 
 `/home/jinsu/PycharmProjects/DMVST` 저장소 `ir` 브랜치(`IRModule`)에서 아이디어를 가져온
-브랜치(이 저장소도 브랜치명이 `ir`). 뉴럴 브랜치(위 1절)와 별도로, 같은 위치(node)의 **과거** 로컬
-윈도우 중 지금 입력과 코사인 유사도가 가장 높은 top-k를 찾아 그 시점 실제 수요값을 softmax
-가중평균한 값(`ir_out`)을 만들고, `sigmoid` 게이트로 뉴럴 브랜치 예측과 섞는다
-(`GridDemandModel.build_retrieval_db`/`_retrieve`, `models/modeling.py`).
+브랜치(이 저장소도 브랜치명이 `ir`). 같은 위치(node)의 **과거** 로컬 윈도우 중 지금 입력과
+코사인 유사도가 가장 높은 top-k를 찾는 후보 "선택" 단계는 최초 구현(`ir`/`ir-weather`)과 동일하다.
+다만 선택된 후보를 다루는 방식이 `ir-null`에서 바뀌었다 — "단순 스칼라 concat보다 벡터 형태
+정보 주입이 낫다"는 가설로, 후보를 스칼라 하나(softmax 가중평균)로 뭉개는 대신 다음처럼 만든
+벡터(`retrieval_vector`)를 LSTM 출력에 concat해 **단일 head**로 최종 예측한다(이전 버전의
+`ir_out` 스칼라 + `lambda` sigmoid 게이트 혼합은 완전히 대체됨):
+
+- **가중치**: 유사도를 softmax 대신 유리함수(1/x 꼴) `w_i = raw_w_i / Σraw_w_j`,
+  `raw_w_i = 1/(eps + 1 - sim_i)`로 변환한다. `eps = softplus(learnable) + 1e-4`로 항상 양수를
+  유지하며, 얼마나 뾰족하게(top-1 위주로) 가중치를 줄지를 학습이 정하게 한다.
+- **값 표현**: 후보의 실제 수요값(스칼라)을 그대로 평균 내지 않고, `(2a+1)^2` 이웃을 임베딩할
+  때와 동일한 `scalar_embed`(`FourierScalarEmbedding`)로 벡터화한 뒤 `retrieval_value_proj`
+  (`Linear(d_model, retrieval_vec_dim)`)로 projection한다.
+- 최종적으로 `retrieval_vector = Σ_i w_i * retrieval_value_proj(scalar_embed(log1p(value_i)))`
+  (`GridDemandModel.build_retrieval_db`/`_retrieve`, `models/modeling.py`). 유효 후보가 없는
+  극초반 샘플은 `retrieval_vector=0`으로 남아 LSTM 출력만으로 예측(별도 분기 처리 없음).
 
 **검색 DB(`build_retrieval_db`)**: `config.npy_path`의 원본 grid 전체 시계열(T,H,W)을
 `_crop_all_nodes`로 한 번에 크롭(B=1,k=T로 호출)한 뒤, `time_step` 길이 슬라이딩 윈도우로 잘라

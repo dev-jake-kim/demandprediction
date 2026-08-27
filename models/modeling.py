@@ -48,10 +48,16 @@ class GridDemandModel(PreTrainedModel):
             num_layers=config.lstm_layers,
             batch_first=True,
         )
-        self.output_proj = nn.Linear(config.lstm_hidden, 1)
-        # 검색(retrieval) 브랜치와 뉴럴 브랜치를 게이트로 섞는 레이어. 입력은
-        # [LSTM 마지막 hidden state, 검색 예측 스칼라] concat (최종 레이어 직전 concat).
-        self.lambda_layer = nn.Linear(config.lstm_hidden + 1, 1)
+        # 검색(retrieval) 브랜치를 스칼라 예측이 아니라 벡터로 만들어 LSTM 출력에 concat -> 단일
+        # head로 최종 예측(neural_pred/ir_out을 게이트로 섞던 이전 lambda_layer 방식을 대체).
+        self.output_proj = nn.Linear(config.lstm_hidden + config.retrieval_vec_dim, 1)
+        # 검색된 후보의 실제 수요값(스칼라)을 scalar_embed로 벡터화한 뒤 이 Linear로 projection한다
+        # (_retrieve 참고) - (2a+1)^2 이웃을 벡터화할 때와 동일한 scalar_embed를 재사용.
+        self.retrieval_value_proj = nn.Linear(config.d_model, config.retrieval_vec_dim)
+        # 검색 후보 가중치를 만드는 유리함수 w_i = 1/(eps+1-sim_i)의 eps. softplus로 항상 양수
+        # 유지(+1e-4는 sim_i가 1에 극도로 가까울 때 나눗셈이 과도하게 커지는 것을 막는 안전장치).
+        # 시작값은 softplus(0)=ln2≈0.693.
+        self.retrieval_weight_eps_raw = nn.Parameter(torch.zeros(1))
 
         # 날씨(Linear 투영, Lambda-F 스타일) + 캘린더(ADFormer의 DataEmbedding과 동일한 임베딩
         # 테이블 방식) — 둘 다 CLS 토큰에 더해져서 주입된다(forward 참고).
@@ -200,23 +206,32 @@ class GridDemandModel(PreTrainedModel):
         self.register_buffer('retrieval_norms', retrieval_norms, persistent=False)
 
     def _retrieve(self, query: torch.Tensor, sample_idx: torch.Tensor) -> torch.Tensor:
-        """query: (B,N,flat_dim), sample_idx: (B,) 절대 시간 인덱스 t -> ir_out (B,N).
+        """query: (B,N,flat_dim), sample_idx: (B,) 절대 시간 인덱스 t -> retrieval_vec
+        (B,N,retrieval_vec_dim).
 
         각 배치 원소 b는 gir 샘플 하나가 이미 전체 N개 노드를 담고 있으므로, 인과적 후보 구간
         (retrieval_keys[:, time_step:t_b])이 노드에 상관없이 b 하나당 하나로 통일된다 — 그래서
         원본(IRModule)의 "배치 안 node_id별 group" 루프 대신 배치 원소 b에 대해서만 루프를 돈다.
         후보 구간을 항상 t_b(자기 자신) 미만으로 슬라이스하므로 미래 시점을 절대 참조하지 않는다.
+
+        후보 "선택"(코사인 유사도 top-k)은 예전과 동일하되, 선택된 후보를 스칼라 하나로 뭉개
+        평균 내는 대신(softmax 가중평균) 각 후보의 실제 수요값을 scalar_embed로 벡터화 ->
+        projection한 뒤, 유사도를 유리함수(1/x 꼴)로 바꾼 가중치로 가중합해 벡터를 만든다 -
+        스칼라 하나보다 정보 손실이 적은 검색 정보 주입이 목표.
         """
         B, N, _ = query.shape
         time_step = self.config.time_step
         top_k = self.config.retrieval_k
+        vec_dim = self.config.retrieval_vec_dim
 
-        ir_out = torch.zeros(B, N, device=query.device, dtype=query.dtype)
+        retrieval_vec = torch.zeros(B, N, vec_dim, device=query.device, dtype=query.dtype)
+        eps = F.softplus(self.retrieval_weight_eps_raw) + 1e-4  # (1,), 항상 양수
+
         for b in range(B):
             t_b = int(sample_idx[b].item())
             num_candidates = t_b - time_step
             if num_candidates <= 0:
-                continue  # 유효 후보 없음 (학습 극초반 샘플) -> ir_out=0, lambda 게이트가 알아서 처리
+                continue  # 유효 후보 없음 (학습 극초반 샘플) -> retrieval_vec[b]=0, last만으로 예측
 
             cand_keys = self.retrieval_keys[:, time_step:t_b, :].to(device=query.device, dtype=query.dtype)
             cand_values = self.retrieval_values[:, time_step:t_b].to(device=query.device, dtype=query.dtype)
@@ -228,12 +243,18 @@ class GridDemandModel(PreTrainedModel):
             sim = sim / (q_norm.unsqueeze(1) * cand_norms.clamp_min(1e-8))  # (N,num_candidates)
 
             k = min(top_k, num_candidates)
-            top_vals, top_idx = torch.topk(sim, k=k, dim=1)  # (N,k)
-            weights = torch.softmax(top_vals, dim=1)  # (N,k)
-            gathered = torch.gather(cand_values, 1, top_idx)  # (N,k)
-            ir_out[b] = (gathered * weights).sum(dim=1)
+            top_sim, top_idx = torch.topk(sim, k=k, dim=1)  # (N,k) - 후보 "선택"은 기존과 동일
 
-        return ir_out
+            raw_w = 1.0 / (eps + 1.0 - top_sim)  # (N,k) 유리함수(1/x 꼴) 가중치
+            w = raw_w / raw_w.sum(dim=1, keepdim=True)  # 정규화, 합=1
+
+            gathered_values = torch.gather(cand_values, 1, top_idx)  # (N,k)
+            value_emb = self.scalar_embed(torch.log1p(gathered_values.clamp(min=0)))  # (N,k,d_model)
+            value_proj = self.retrieval_value_proj(value_emb)  # (N,k,vec_dim)
+
+            retrieval_vec[b] = (w.unsqueeze(-1) * value_proj).sum(dim=1)  # (N,vec_dim)
+
+        return retrieval_vec
 
     def forward(
         self,
@@ -294,13 +315,9 @@ class GridDemandModel(PreTrainedModel):
         lstm_out, _ = self.lstm(cls_out)  # (B*N,k,lstm_hidden)
         last = lstm_out[:, -1, :].reshape(B, N, -1)  # (B,N,lstm_hidden)
 
-        neural_pred = F.softplus(self.output_proj(last)).squeeze(-1)  # (B,N)
-
-        ir_out = self._retrieve(retrieval_query, sample_idx)  # (B,N), 이미 실제 수요값의 가중평균이라 비음수
-
-        lambda_input = torch.cat([last, ir_out.unsqueeze(-1)], dim=-1)  # (B,N,lstm_hidden+1)
-        lambda_weight = torch.sigmoid(self.lambda_layer(lambda_input)).squeeze(-1)  # (B,N)
-        pred = lambda_weight * neural_pred + (1 - lambda_weight) * ir_out  # (B,N)
+        retrieval_vector = self._retrieve(retrieval_query, sample_idx)  # (B,N,retrieval_vec_dim)
+        fused = torch.cat([last, retrieval_vector], dim=-1)  # (B,N, lstm_hidden+retrieval_vec_dim)
+        pred = F.softplus(self.output_proj(fused)).squeeze(-1)  # (B,N)
 
         logits = pred.reshape(B, H, W)  # labels(B,H,W)와 동일 shape, node_id=row*W+col 순서와 일치
 

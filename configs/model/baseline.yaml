@@ -8,5 +8,6 @@ dropout: 0.1
 lstm_hidden: 64
 lstm_layers: 1
 retrieval_k: 20
+retrieval_vec_dim: 64  # 검색 후보 값을 벡터화(scalar_embed)+projection한 출력 차원
 loss_gamma: 1.0
 loss_eps: 0.5

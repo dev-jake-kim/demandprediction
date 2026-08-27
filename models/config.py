@@ -21,6 +21,7 @@ class GridDemandConfig(PretrainedConfig):
         time_step: int = 24,
         npy_path: str | None = None,
         retrieval_k: int = 20,
+        retrieval_vec_dim: int = 64,
         weather_csv_path: str | None = None,
         weather_mean: list[float] | None = None,
         weather_std: list[float] | None = None,
@@ -43,6 +44,8 @@ class GridDemandConfig(PretrainedConfig):
         self.time_step = time_step
         self.npy_path = npy_path
         self.retrieval_k = retrieval_k
+        # 검색된 후보 값을 scalar_embed로 벡터화한 뒤 projection하는 출력 차원(_retrieve 참고).
+        self.retrieval_vec_dim = retrieval_vec_dim
         # 날씨/캘린더 브랜치 전용 — weather_csv_path는 절대경로(train.py가 주입),
         # weather_mean/std는 train split 통계(3개씩, leakage 방지 위해 train.py가 계산해 주입).
         self.weather_csv_path = weather_csv_path
