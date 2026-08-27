@@ -59,6 +59,27 @@ class GridDemandModel(PreTrainedModel):
         self.daytime_embedding = nn.Embedding(1440, config.d_model)
         self.weekday_embedding = nn.Embedding(7, config.d_model)
 
+        # daily/weekly 주기 브랜치: "정확히 같은 시각"의 과거 수요를 recent와는 별개의 LSTM으로
+        # 인코딩한다. 공간 인코딩(_spatial_encode: scalar_embed/special_embed/node_embed/pos_embed/
+        # encoder)은 recent/daily/weekly가 전부 공유하지만, 이 LSTM들은 브랜치마다 독립된 가중치다.
+        self.daily_lstm = nn.LSTM(config.d_model, config.lstm_hidden, batch_first=True)
+        self.weekly_lstm = nn.LSTM(config.d_model, config.lstm_hidden, batch_first=True)
+        # 0-init: 학습 시작 시점엔 daily/weekly의 기여가 정확히 0이라 순수 ir-weather와 동일하게
+        # 시작하고, 필요한 만큼만 학습되며 서서히 섞여 들어간다("중립 보정" 초기화).
+        # [ablation: assemble-random-init] "중립 보정"(0-init) 트릭을 안 쓰고 전부 랜덤 초기화 그대로
+        # 둔다 — daily_projection/weekly_projection은 post_init()이 적용하는 기본
+        # normal_(0,0.02)/bias=0을 그대로 유지(zeros_ 호출 삭제).
+        self.daily_projection = nn.Linear(config.lstm_hidden, config.lstm_hidden)
+        self.weekly_projection = nn.Linear(config.lstm_hidden, config.lstm_hidden)
+
+        # recent를 Query, daily/weekly를 Key/Value 후보로 하는 attention 융합. 학습 가능한
+        # "null" key를 하나 더 둬서 attention이 "daily도 weekly도 안 쓰겠다"를 선택할 자유를 준다.
+        self.periodic_attn_query = nn.Linear(config.lstm_hidden, config.lstm_hidden, bias=False)
+        self.periodic_attn_key = nn.Linear(config.lstm_hidden, config.lstm_hidden, bias=False)
+        # [ablation: assemble-random-init] null key도 0이 아니라 다른 임베딩류(pos_embed 등)와
+        # 동일한 스케일의 랜덤값으로 초기화.
+        self.periodic_null_key = nn.Parameter(torch.randn(config.lstm_hidden) * 0.02)
+
         self.loss_fn = CombinedLoss(gamma=config.loss_gamma, eps=config.loss_eps)
 
         if config.weather_mean is None or config.weather_std is None:
@@ -89,6 +110,9 @@ class GridDemandModel(PreTrainedModel):
         self.build_retrieval_db()
 
         self.post_init()
+        # [ablation: assemble-random-init] "중립 보정" 0-init을 여기서 하지 않음 — daily_projection/
+        # weekly_projection/periodic_null_key 전부 랜덤 초기화 그대로 학습을 시작한다(assemble의
+        # 0-init 버전과 비교하기 위한 실험).
 
     def _build_neighbor_tables(self) -> tuple[torch.Tensor, torch.Tensor]:
         H, W, a = self.H, self.W, self.a
@@ -136,6 +160,55 @@ class GridDemandModel(PreTrainedModel):
         values = padded_flat[:, :, flat_idx].reshape(B, k, N, self.n_neighbors)
 
         return values, self.mask_table  # mask: (N, n_neighbors), 배치/시간에 안 붙어도 브로드캐스트됨
+
+    def _spatial_encode(
+        self,
+        demand_window: torch.Tensor,
+        weather: torch.Tensor | None = None,
+        hour_of_day: torch.Tensor | None = None,
+        day_of_week: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """demand_window: (B,k,H,W) -> (B,k,N,d_model).
+
+        recent/daily/weekly 세 브랜치가 전부 이 메서드를 그대로 호출한다 -> scalar_embed/
+        special_embed/node_embed/pos_embed/encoder(로컬 (2a+1)^2 공간 인코딩)를 공유한다. k(시퀀스
+        길이)는 브랜치마다 다를 수 있다(recent=time_step, daily=daily_lag_count 등) — 이 메서드
+        자체는 k에 무관하게 동작한다.
+
+        weather/hour_of_day/day_of_week는 recent 브랜치에서만 넘어온다(daily/weekly는 CLS에
+        날씨/캘린더를 더하지 않음 — main model도 주기 브랜치엔 캘린더/날씨를 안 넣는 것과 동일한
+        설계, GridDemandModel.forward 참고).
+        """
+        B, k, H, W = demand_window.shape
+        N = H * W
+        d_model = self.config.d_model
+
+        values, mask = self._crop_all_nodes(demand_window)  # (B,k,N,n) / (N,n)
+        log_values = torch.log1p(values.clamp(min=0))
+        neighbor_emb = self.scalar_embed(log_values)  # (B,k,N,n,d_model)
+
+        edge_emb = self.special_embed.weight[EDGE_TOKEN_ID]  # (d_model,)
+        mask_expanded = mask.view(1, 1, N, self.n_neighbors, 1).expand(B, k, N, self.n_neighbors, d_model)
+        neighbor_emb = torch.where(mask_expanded, neighbor_emb, edge_emb)
+
+        cls_base = self.special_embed.weight[CLS_TOKEN_ID]  # (d_model,)
+        node_vecs = self.node_embed.weight  # (N, d_model)
+        cls_emb = (cls_base + node_vecs).view(1, 1, N, 1, d_model).expand(B, k, N, 1, d_model)
+        if weather is not None:
+            weather_norm = (weather - self.weather_mean) / self.weather_std  # (B,k,3)
+            weather_emb = self.weather_proj(weather_norm)  # (B,k,d_model)
+            daytime_idx = (hour_of_day.float() / 24.0 * 1440).round().long().clamp(0, 1439)
+            temporal_extra = (
+                weather_emb + self.daytime_embedding(daytime_idx) + self.weekday_embedding(day_of_week)
+            )  # (B,k,d_model)
+            cls_emb = cls_emb + temporal_extra.view(B, k, 1, 1, d_model)
+
+        seq = torch.cat([cls_emb, neighbor_emb], dim=3)  # (B,k,N,seq_len,d_model)
+        seq = seq + self.pos_embed  # (seq_len,d_model) 브로드캐스트
+
+        seq = seq.reshape(B * k * N, self.seq_len, d_model)
+        encoded = self.encoder(seq)  # (B*k*N, seq_len, d_model)
+        return encoded[:, 0, :].reshape(B, k, N, d_model)
 
     def build_retrieval_db(self) -> None:
         """config.npy_path의 원본 grid 전체 시계열로부터 검색(retrieval) DB를 만든다.
@@ -243,62 +316,63 @@ class GridDemandModel(PreTrainedModel):
         weather: torch.Tensor | None = None,
         hour_of_day: torch.Tensor | None = None,
         day_of_week: torch.Tensor | None = None,
+        daily_demands: torch.Tensor | None = None,
+        weekly_demands: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | None]:
         if sample_idx is None:
             raise ValueError("이 모델은 검색(retrieval) 브랜치가 필수라 sample_idx가 반드시 필요함")
         if weather is None or hour_of_day is None or day_of_week is None:
             raise ValueError("이 모델은 날씨/캘린더 피처가 필수라 weather/hour_of_day/day_of_week가 필요함")
+        if daily_demands is None or weekly_demands is None:
+            raise ValueError("이 모델은 daily/weekly 주기 브랜치가 필수라 daily_demands/weekly_demands가 필요함")
 
         B, k, H, W = demands.shape
         N = H * W
         d_model = self.config.d_model
+        lstm_hidden = self.config.lstm_hidden
 
-        values, mask = self._crop_all_nodes(demands)  # (B,k,N,n) / (N,n)
+        # _spatial_encode가 내부에서 다시 crop하지만(재사용성을 위한 트레이드오프, cheap한 인덱싱
+        # 연산이라 비용 무시 가능), 검색 query는 여기서 한 번 더 뽑아야 한다 — mask는 여기선 불필요.
+        values, _ = self._crop_all_nodes(demands)  # (B,k,N,n)
         # 검색 query: DB(build_retrieval_db)와 동일한 (...,n_neighbors,time_step) 순서로 flatten.
+        # daily/weekly와는 무관 — 검색기 앙상블은 recent 윈도우만 사용(스코프 밖).
         retrieval_query = values.permute(0, 2, 3, 1).reshape(B, N, -1)  # (B,N,n_neighbors*k)
 
-        log_values = torch.log1p(values.clamp(min=0))
-        neighbor_emb = self.scalar_embed(log_values)  # (B,k,N,n,d_model)
-
-        edge_emb = self.special_embed.weight[EDGE_TOKEN_ID]  # (d_model,)
-        mask_expanded = mask.view(1, 1, N, self.n_neighbors, 1).expand(B, k, N, self.n_neighbors, d_model)
-        neighbor_emb = torch.where(mask_expanded, neighbor_emb, edge_emb)
-
-        # 날씨(예보값 가정, GridDemandDataset docstring 참고)+캘린더 -> 시점별(B,k) 임베딩 하나로
-        # 합쳐서 CLS에 더한다(노드 축엔 무관하게 브로드캐스트).
-        weather_norm = (weather - self.weather_mean) / self.weather_std  # (B,k,3)
-        weather_emb = self.weather_proj(weather_norm)  # (B,k,d_model)
-        daytime_idx = (hour_of_day.float() / 24.0 * 1440).round().long().clamp(0, 1439)  # ADFormer와 동일 변환
-        temporal_extra = (
-            weather_emb + self.daytime_embedding(daytime_idx) + self.weekday_embedding(day_of_week)
-        )  # (B,k,d_model)
-
-        # CLS = "CLS 마커" + "이 노드의 고유 임베딩" + "이 시점의 날씨/캘린더" -> attention이 노드
-        # 정체성 + 외부 요인을 함께 알고 이웃을 취합.
-        # node_id로 한 행만 고르던 걸 전체 N행(node_embed.weight)으로 바꿔 N개 노드 전부의 CLS를 구성.
-        cls_base = self.special_embed.weight[CLS_TOKEN_ID]  # (d_model,)
-        node_vecs = self.node_embed.weight  # (N, d_model)
-        cls_emb = (cls_base + node_vecs).view(1, 1, N, 1, d_model).expand(B, k, N, 1, d_model)
-        cls_emb = cls_emb + temporal_extra.view(B, k, 1, 1, d_model)  # 노드 축으로 브로드캐스트
-        seq = torch.cat([cls_emb, neighbor_emb], dim=3)  # (B,k,N,seq_len,d_model)
-        seq = seq + self.pos_embed  # (seq_len,d_model) 브로드캐스트
-
-        # (B,k,N)을 하나의 배치로 합쳐 encoder에 넣음 -> 각 (b,t,node)는 서로 완전히 독립적으로 처리됨
-        # (예전에 (B,k)만 합치던 것과 동일한 원리, node 차원만 추가로 합친 것뿐 -> 노드별 연산은 그대로).
-        seq = seq.reshape(B * k * N, self.seq_len, d_model)
-        encoded = self.encoder(seq)  # (B*k*N, seq_len, d_model)
-        cls_out = encoded[:, 0, :].reshape(B, k, N, d_model)
-
-        # 노드별로 독립적인 시계열이므로 (B,N)을 LSTM 배치로 합치고 k를 시퀀스 축으로 둔다.
+        # recent 공간 인코딩 (날씨/캘린더 CLS에 포함) -> LSTM(recent 전용 가중치).
+        cls_out = self._spatial_encode(demands, weather, hour_of_day, day_of_week)  # (B,k,N,d_model)
         cls_out = cls_out.permute(0, 2, 1, 3).reshape(B * N, k, d_model)
         lstm_out, _ = self.lstm(cls_out)  # (B*N,k,lstm_hidden)
         last = lstm_out[:, -1, :].reshape(B, N, -1)  # (B,N,lstm_hidden)
 
-        neural_pred = F.softplus(self.output_proj(last)).squeeze(-1)  # (B,N)
+        # daily/weekly 공간 인코딩은 recent와 동일한 _spatial_encode(=동일 가중치)를 쓰지만
+        # 날씨/캘린더는 안 넣는다. 각자 독립된 LSTM(daily_lstm/weekly_lstm)으로 취합.
+        daily_k = daily_demands.shape[1]
+        weekly_k = weekly_demands.shape[1]
+        daily_cls = self._spatial_encode(daily_demands)  # (B,daily_k,N,d_model)
+        weekly_cls = self._spatial_encode(weekly_demands)  # (B,weekly_k,N,d_model)
+        daily_cls = daily_cls.permute(0, 2, 1, 3).reshape(B * N, daily_k, d_model)
+        weekly_cls = weekly_cls.permute(0, 2, 1, 3).reshape(B * N, weekly_k, d_model)
+        _, (_, daily_h) = self.daily_lstm(daily_cls)
+        _, (_, weekly_h) = self.weekly_lstm(weekly_cls)
+        daily_last = self.daily_projection(daily_h[-1]).reshape(B, N, lstm_hidden)  # 랜덤 초기화 투영
+        weekly_last = self.weekly_projection(weekly_h[-1]).reshape(B, N, lstm_hidden)
+
+        # recent(Query) <-> {daily, weekly, null}(Key) attention 융합. null 옵션 덕분에 attention이
+        # 주기 브랜치를 아예 안 쓰는 것도 선택할 수 있다.
+        periodic = torch.stack([daily_last, weekly_last], dim=2)  # (B,N,2,lstm_hidden)
+        query = self.periodic_attn_query(last).unsqueeze(2)  # (B,N,1,lstm_hidden)
+        keys = self.periodic_attn_key(periodic)  # (B,N,2,lstm_hidden)
+        branch_scores = (query * keys).sum(-1) / (lstm_hidden ** 0.5)  # (B,N,2)
+        null_score = (query * self.periodic_null_key.view(1, 1, 1, -1)).sum(-1)  # (B,N,1)
+        weights = torch.softmax(torch.cat([branch_scores, null_score], dim=-1), dim=-1)  # (B,N,3)
+        periodic_correction = weights[..., 0:1] * daily_last + weights[..., 1:2] * weekly_last  # (B,N,lstm_hidden)
+        fused = last + self.config.residual_scale * periodic_correction  # (B,N,lstm_hidden)
+
+        neural_pred = F.softplus(self.output_proj(fused)).squeeze(-1)  # (B,N)
 
         ir_out = self._retrieve(retrieval_query, sample_idx)  # (B,N), 이미 실제 수요값의 가중평균이라 비음수
 
-        lambda_input = torch.cat([last, ir_out.unsqueeze(-1)], dim=-1)  # (B,N,lstm_hidden+1)
+        lambda_input = torch.cat([fused, ir_out.unsqueeze(-1)], dim=-1)  # (B,N,lstm_hidden+1)
         lambda_weight = torch.sigmoid(self.lambda_layer(lambda_input)).squeeze(-1)  # (B,N)
         pred = lambda_weight * neural_pred + (1 - lambda_weight) * ir_out  # (B,N)
 

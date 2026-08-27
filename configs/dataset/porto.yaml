@@ -2,6 +2,8 @@ city: porto
 npy_path: data/raw/porto_temporal_grid.npy
 weather_csv_path: data/raw/porto_meteorological_data.csv
 time_step: 24
+daily_lag_count: 6   # 정확히 같은 시각의 과거 6일치 수요 (assemble: daily/weekly 주기 브랜치)
+weekly_lag_count: 4  # 정확히 같은 시각의 과거 4주치 수요
 # 시간순 분할 (셔플 X) - train_ratio + val_ratio < 1, 나머지는 test
 train_ratio: 0.7
 val_ratio: 0.15

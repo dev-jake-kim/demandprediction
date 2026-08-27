@@ -60,23 +60,29 @@ def build_datasets(cfg: DictConfig) -> tuple[GridDemandDataset, GridDemandDatase
     npy_path = cfg.dataset.npy_path
     time_step = cfg.dataset.time_step
     weather_csv_path = cfg.dataset.weather_csv_path
+    daily_lag_count = cfg.dataset.daily_lag_count
+    weekly_lag_count = cfg.dataset.weekly_lag_count
 
-    full_ds = GridDemandDataset(npy_path, time_step=time_step, weather_csv_path=weather_csv_path)
+    common_kwargs = dict(
+        time_step=time_step,
+        weather_csv_path=weather_csv_path,
+        daily_lag_count=daily_lag_count,
+        weekly_lag_count=weekly_lag_count,
+    )
+    full_ds = GridDemandDataset(npy_path, **common_kwargs)
     T = full_ds.T
     split1 = int(T * cfg.dataset.train_ratio)
     split2 = int(T * (cfg.dataset.train_ratio + cfg.dataset.val_ratio))
 
-    train_ds = GridDemandDataset(npy_path, time_step=time_step, weather_csv_path=weather_csv_path, t_end=split1)
-    val_ds = GridDemandDataset(
-        npy_path, time_step=time_step, weather_csv_path=weather_csv_path, t_start=split1, t_end=split2
-    )
-    test_ds = GridDemandDataset(npy_path, time_step=time_step, weather_csv_path=weather_csv_path, t_start=split2)
+    train_ds = GridDemandDataset(npy_path, **common_kwargs, t_end=split1)
+    val_ds = GridDemandDataset(npy_path, **common_kwargs, t_start=split1, t_end=split2)
+    test_ds = GridDemandDataset(npy_path, **common_kwargs, t_start=split2)
 
     logger.info(
         f"[{cfg.dataset.city}] T={T}, H={full_ds.X}, W={full_ds.Y} | "
-        f"train t=[{time_step},{split1}) ({len(train_ds):,} samples), "
-        f"val t=[{split1},{split2}) ({len(val_ds):,} samples), "
-        f"test t=[{split2},{T}) ({len(test_ds):,} samples)"
+        f"train t=[{train_ds.t_start},{split1}) ({len(train_ds):,} samples), "
+        f"val t=[{val_ds.t_start},{split2}) ({len(val_ds):,} samples), "
+        f"test t=[{test_ds.t_start},{T}) ({len(test_ds):,} samples)"
     )
     return train_ds, val_ds, test_ds
 
@@ -107,6 +113,8 @@ def main(cfg: DictConfig) -> None:
         weather_csv_path=str(Path(cfg.dataset.weather_csv_path).resolve()),
         weather_mean=weather_mean.tolist(),
         weather_std=weather_std.tolist(),
+        daily_lag_count=train_ds.daily_lag_count,
+        weekly_lag_count=train_ds.weekly_lag_count,
         **model_kwargs,
     )
     model = GridDemandModel(model_config)

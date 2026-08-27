@@ -186,7 +186,39 @@ configs/
 - `train.py`: `@hydra.main(config_path="configs", config_name="config")` → dataset/model 생성 → `TrainingArguments`(`cfg.train`) → HF `Trainer` → `trainer.train()` → `trainer.save_model()` (hydra run dir = `output/${project_name}/...`, `configs/config.yaml`의 `hydra.run.dir`과 일치).
 - `test.py`: `checkpoint_path` 인자만 받아 `GridDemandModel.from_pretrained(checkpoint_path)`로 복원 후, 별도 test 시간 구간 `GridDemandDataset`으로 RMSE/MAE/MAPE(+1) 계산. 학습 프로세스와 완전히 분리된 독립 실행.
 
-## 8. 아직 정해지지 않은 것 / 기본값으로 진행할 것
+## 8. daily/weekly 주기 브랜치 + null-option attention 융합 (`assemble` 브랜치)
+
+`ir-weather`(검색기 앙상블 + 날씨/캘린더) 위에, 사용자가 별도 제공한 참고 구현("main model",
+N2MSDWGateTarget)에서 두 아이디어만 가져와 얹은 브랜치다.
+
+- **daily/weekly 주기 브랜치**: "정확히 같은 시각"의 과거 6일치(daily)/4주치(weekly) 수요를
+  `dataset_frame/grid_demand_dataset.py`가 `daily_demands`/`weekly_demands`(오래된 것→최근 것 순,
+  `[t-144,...,t-24]`/`[t-672,...,t-168]`)로 반환한다. 가장 먼 daily/weekly lag 둘 다 항상 유효해야
+  하므로 `t_start` 하한이 `max(time_step, daily_lag_count*24, weekly_lag_count*168)`로 올라간다
+  (기본값 6/4 기준 672시간) — 부족분을 0-패딩하지 않고 무효 구간 자체를 샘플에서 제외하는 이
+  클래스의 기존 관례를 그대로 따름. 이 때문에 train 샘플 수가 ulsan -21%, porto -11% 감소한다.
+- **공유 vs 독립 가중치**: 로컬 `(2a+1)²` 공간 인코딩(`scalar_embed`/CLS 구성/`pos_embed`/
+  `encoder`)은 recent/daily/weekly 세 브랜치가 `GridDemandModel._spatial_encode()`라는 단일 공유
+  메서드를 통해 **동일 가중치**로 처리한다. 반면 그 뒤 시간축 취합은 `self.lstm`(recent)/
+  `self.daily_lstm`/`self.weekly_lstm`로 **브랜치마다 독립된 가중치**를 쓴다. 날씨/캘린더는
+  recent에만 주입되고(`_spatial_encode`의 `weather` 인자가 `None`이면 CLS에 안 더함), daily/weekly는
+  순수 수요값만 본다 — main model 자체도 주기 브랜치엔 날씨/캘린더를 안 넣는 것과 동일한 설계.
+- **null-option attention 융합**: recent LSTM 출력(`last`)을 Query, daily/weekly LSTM 출력(각각
+  `daily_projection`/`weekly_projection`으로 투영한 것)을 Key/Value 후보로 하고, 학습 가능한
+  "null" key를 하나 더 둬서 attention이 "daily도 weekly도 안 쓰겠다"를 선택할 자유를 준다.
+  `fused = last + residual_scale * (daily/weekly 가중합)`으로 residual correction을 만들고, 이후
+  `neural_pred`/검색기 게이트 입력 전부 `last` 대신 `fused`를 쓴다(검색기 앙상블 자체, 즉
+  `retrieval_query`/`_retrieve`는 recent 윈도우만 그대로 사용 — daily/weekly와 무관, 스코프 밖).
+- **"중립 시작" 초기화**: `daily_projection`/`weekly_projection`을 0-init해서, 학습 시작 시점엔
+  `daily_last`/`weekly_last`가 정확히 0 → `periodic_correction=0` → `fused==last`, 즉 순수
+  `ir-weather`와 동일하게 시작하고 daily/weekly의 기여는 학습되며 서서히 커진다. **주의**:
+  `PreTrainedModel.post_init()`이 내부적으로 호출하는 `init_weights()`가 (이 코드베이스가
+  `_init_weights`를 오버라이드하지 않으므로) 기본 구현을 통해 모든 `nn.Linear.weight`를
+  `normal_(0,0.02)`로 재초기화한다(bias는 0으로) — `__init__` 중간에 0-init을 하면 뒤이은
+  `self.post_init()`이 지워버리므로, 0-init은 반드시 **`self.post_init()` 호출 이후**에 해야
+  실제로 유지된다(`models/modeling.py` 개발 중 확인/수정함).
+
+## 9. 아직 정해지지 않은 것 / 기본값으로 진행할 것
 
 - `a`, `d_model`, `n_freqs` 등 정확한 하이퍼파라미터 값 — 위 표를 기본값으로 두고 `configs/model/baseline.yaml`에서 조정.
 - train/val/test 시간 분할 비율 — 별도 지시 없으면 시간순 70/15/15로 가정.

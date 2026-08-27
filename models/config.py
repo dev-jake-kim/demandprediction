@@ -24,6 +24,9 @@ class GridDemandConfig(PretrainedConfig):
         weather_csv_path: str | None = None,
         weather_mean: list[float] | None = None,
         weather_std: list[float] | None = None,
+        daily_lag_count: int = 6,
+        weekly_lag_count: int = 4,
+        residual_scale: float = 0.1,
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
         **kwargs,
@@ -48,6 +51,11 @@ class GridDemandConfig(PretrainedConfig):
         self.weather_csv_path = weather_csv_path
         self.weather_mean = weather_mean
         self.weather_std = weather_std
+        # daily/weekly 주기 브랜치 전용 — daily_lag_count/weekly_lag_count는 dataset과 값이
+        # 반드시 일치해야 하므로 train.py가 train_ds에서 그대로 읽어 주입(time_step과 동일 패턴).
+        self.daily_lag_count = daily_lag_count
+        self.weekly_lag_count = weekly_lag_count
+        self.residual_scale = residual_scale
         self.loss_gamma = loss_gamma
         self.loss_eps = loss_eps
         super().__init__(**kwargs)

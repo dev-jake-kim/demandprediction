@@ -36,6 +36,8 @@ def evaluate(model: GridDemandModel, loader: DataLoader, device: str) -> dict[st
             weather = batch["weather"].to(device)
             hour_of_day = batch["hour_of_day"].to(device)
             day_of_week = batch["day_of_week"].to(device)
+            daily_demands = batch["daily_demands"].to(device)
+            weekly_demands = batch["weekly_demands"].to(device)
 
             out = model(
                 demands=demands,
@@ -43,6 +45,8 @@ def evaluate(model: GridDemandModel, loader: DataLoader, device: str) -> dict[st
                 weather=weather,
                 hour_of_day=hour_of_day,
                 day_of_week=day_of_week,
+                daily_demands=daily_demands,
+                weekly_demands=weekly_demands,
             )
             all_preds.append(out["logits"].cpu().numpy())
             all_labels.append(batch["labels"].numpy())
@@ -97,10 +101,15 @@ def main() -> None:
     model.build_retrieval_db()
     model = model.to(device)
 
+    # daily_lag_count/weekly_lag_count는 체크포인트 config 값을 그대로 써서(별도 CLI 인자를 안 둠)
+    # dataset과 model이 항상 일치하도록 원천 차단한다 — time_step처럼 어긋나면 에러날 값을 사용자가
+    # 직접 맞춰 넘겨야 하는 부담을 없앰.
     test_ds = GridDemandDataset(
         args.npy_path,
         time_step=args.time_step,
         weather_csv_path=args.weather_csv_path,
+        daily_lag_count=model.config.daily_lag_count,
+        weekly_lag_count=model.config.weekly_lag_count,
         t_start=args.t_start,
         t_end=args.t_end,
     )
