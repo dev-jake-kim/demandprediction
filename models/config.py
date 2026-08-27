@@ -24,6 +24,8 @@ class GridDemandConfig(PretrainedConfig):
         weather_csv_path: str | None = None,
         weather_mean: list[float] | None = None,
         weather_std: list[float] | None = None,
+        ir_node_mask: list[bool] | None = None,
+        ir_top_pct: float | None = None,
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
         **kwargs,
@@ -48,6 +50,10 @@ class GridDemandConfig(PretrainedConfig):
         self.weather_csv_path = weather_csv_path
         self.weather_mean = weather_mean
         self.weather_std = weather_std
+        # 검색기 앙상블을 적용할 노드만 True인 마스크(H*W개, train split 수요 기준 상위 N% 노드
+        # 선정, leakage 방지 위해 train.py가 계산해 주입). False인 노드는 검색 없이 뉴럴 예측만 씀.
+        self.ir_node_mask = ir_node_mask
+        self.ir_top_pct = ir_top_pct  # 기록용(재현/추적) — 마스크 계산 자체는 train.py가 함
         self.loss_gamma = loss_gamma
         self.loss_eps = loss_eps
         super().__init__(**kwargs)

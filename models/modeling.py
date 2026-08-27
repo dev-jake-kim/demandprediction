@@ -72,6 +72,18 @@ class GridDemandModel(PreTrainedModel):
             'weather_std', torch.tensor(config.weather_std, dtype=torch.float32), persistent=True
         )
 
+        if config.ir_node_mask is None:
+            raise ValueError("ir_node_mask(H*W개, train split 수요 상위 N% 노드 마스크)가 필요함")
+        if len(config.ir_node_mask) != self.H * self.W:
+            raise ValueError(
+                f"ir_node_mask 길이({len(config.ir_node_mask)})가 H*W={self.H * self.W}와 다름"
+            )
+        # 작은 buffer(N개짜리)라 idx_table과 같은 범주 — persistent=True, from_pretrained 이후
+        # 수동 재로드 불필요.
+        self.register_buffer(
+            'ir_node_mask', torch.tensor(config.ir_node_mask, dtype=torch.bool), persistent=True
+        )
+
         # node_id -> (padded grid 기준 이웃 (2a+1)^2개의 flat index, 격자 안 여부)는
         # H,W,a로만 정해지는 순수 함수라 가능한 모든 node_id(H*W개)에 대해 미리 계산해둔다.
         # persistent=True로 저장해야 함: persistent=False 버퍼는 transformers 5.0의
@@ -300,7 +312,10 @@ class GridDemandModel(PreTrainedModel):
 
         lambda_input = torch.cat([last, ir_out.unsqueeze(-1)], dim=-1)  # (B,N,lstm_hidden+1)
         lambda_weight = torch.sigmoid(self.lambda_layer(lambda_input)).squeeze(-1)  # (B,N)
-        pred = lambda_weight * neural_pred + (1 - lambda_weight) * ir_out  # (B,N)
+        gated_pred = lambda_weight * neural_pred + (1 - lambda_weight) * ir_out  # (B,N)
+        # ir_node_mask=False인 노드는 검색기 앙상블을 아예 적용하지 않고 뉴럴 예측만 사용한다
+        # (train split 수요 상위 N% 노드에서만 검색을 적용하는 실험 — ir_node_mask 계산은 train.py 참고).
+        pred = torch.where(self.ir_node_mask.view(1, N), gated_pred, neural_pred)  # (B,N)
 
         logits = pred.reshape(B, H, W)  # labels(B,H,W)와 동일 shape, node_id=row*W+col 순서와 일치
 

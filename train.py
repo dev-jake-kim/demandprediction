@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 import hydra
+import numpy as np
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from transformers import EarlyStoppingCallback, Trainer, TrainerCallback, TrainingArguments
@@ -98,6 +99,23 @@ def main(cfg: DictConfig) -> None:
     weather_std = train_weather.std(axis=0).clip(min=1e-6)
     logger.info(f"weather_mean={weather_mean.tolist()}, weather_std={weather_std.tolist()}")
 
+    # train split 수요만으로 상위 ir_top_pct% 노드를 골라 검색기 앙상블 적용 대상을 정한다
+    # (leakage 방지 위해 val/test 구간은 안 봄 — weather_mean/std 계산과 동일한 이유).
+    N = train_ds.X * train_ds.Y
+    train_grid = train_ds.grid[:train_ds.t_end]  # (t_end, X, Y) — train 샘플이 실제로 보는 구간까지만
+    node_avg_demand = train_grid.reshape(train_grid.shape[0], N).mean(axis=0)  # (N,)
+    ir_top_pct = cfg.model.ir_top_pct
+    if not 0.0 <= ir_top_pct <= 1.0:
+        raise ValueError(f"ir_top_pct는 [0,1] 범위여야 함: got {ir_top_pct}")
+    n_top = round(ir_top_pct * N)
+    top_node_ids = np.argsort(-node_avg_demand)[:n_top]
+    ir_node_mask = np.zeros(N, dtype=bool)
+    ir_node_mask[top_node_ids] = True
+    logger.info(
+        f"ir_node_mask: train split 수요 상위 {ir_top_pct * 100:.0f}% = {n_top}/{N}개 노드에만 "
+        f"검색기 앙상블 적용"
+    )
+
     model_kwargs = OmegaConf.to_container(cfg.model, resolve=True)
     model_config = GridDemandConfig(
         H=train_ds.X,
@@ -107,6 +125,7 @@ def main(cfg: DictConfig) -> None:
         weather_csv_path=str(Path(cfg.dataset.weather_csv_path).resolve()),
         weather_mean=weather_mean.tolist(),
         weather_std=weather_std.tolist(),
+        ir_node_mask=ir_node_mask.tolist(),
         **model_kwargs,
     )
     model = GridDemandModel(model_config)

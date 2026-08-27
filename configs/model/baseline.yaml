@@ -8,5 +8,6 @@ dropout: 0.1
 lstm_hidden: 64
 lstm_layers: 1
 retrieval_k: 20
+ir_top_pct: 0.45  # train split 수요 기준 상위 N%의 노드에만 검색기 앙상블 적용, 나머지는 뉴럴 예측만
 loss_gamma: 1.0
 loss_eps: 0.5
