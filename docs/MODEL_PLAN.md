@@ -12,7 +12,7 @@
 - `B`: batch, `k`: 입력 시간 길이(`time_step`), `t`: 예측 대상 시각
 - `H, W`: 도시별 격자 크기 (ulsan 14×12, porto 19×20 — `grid_size=700m` 기준)
 - `a`: 이웃 반경 (한 변 `(2a+1)`인 정사각 윈도우)
-- `d_model`: transformer/embedding 차원
+- `d_model`: 임베딩/CNN 채널 차원
 
 ## 1. 모델 아키텍처
 
@@ -22,17 +22,19 @@ N=H*W(전체 노드 수). 아래 연산은 노드 0..N-1 전부에 대해 **벡�
 
 ```
 노드 0..N-1 각각에 대해 (h,w) = divmod(node, W):
-  각 (b, t)에 대해 (2a+1)^2개 이웃 위치 (h+di, w+dj), di,dj ∈ [-a, a]:
+  각 (b, t)에 대해 (2a+1)x(2a+1) 이웃 위치 (h+di, w+dj), di,dj ∈ [-a, a]:
       격자 안  → emb = FourierEmbed(log1p(demand[b, t, h+di, w+dj]))   # (d_model,)
       격자 밖  → emb = special_emb[EDGE]                                # (d_model,)
+  neighbor_grid = (2a+1, 2a+1, d_model)  # 위 이웃 임베딩을 (di,dj) 순서 그대로 2D grid로 배치
 
-  CLS = special_emb[CLS] + node_emb[node]  # (d_model,) — 노드 고유 임베딩을 CLS에 더함
-  seq = concat([CLS, emb_1, ..., emb_(2a+1)^2])           # ((2a+1)^2+1, d_model)
-  seq = seq + positional_emb                               # learnable, 길이 (2a+1)^2+1
+  cls_vec = special_emb[CLS] + node_emb[node]  # (d_model,) — 노드 고유 임베딩을 CLS 마커에 더함
+  neighbor_grid += cls_vec  # (2a+1,2a+1) 모든 셀에 브로드캐스트 — 노드 정체성을 공간 인코딩 전체에 주입
 
-x: (B, k, N, (2a+1)^2+1, d_model) → reshape (B*k*N, (2a+1)^2+1, d_model)
-  → TransformerEncoder → CLS 출력만 추출                  # (B*k*N, d_model)
-  → reshape (B, k, N, d_model) → permute → (B*N, k, d_model)
+x: (B, k, N, 2a+1, 2a+1, d_model) → permute+reshape (B*k*N, d_model, 2a+1, 2a+1)  # 채널=d_model인 2D 이미지
+  → Conv2d(d_model,d_model,kernel=3,padding=0)를 a번 통과 (ReLU+Dropout은 마지막 레이어 제외 매 레이어 사이)
+    # 레이어마다 한 변이 정확히 2씩 줄어 (2a+1) - 2a = 1 → 항상 정확히 단일 벡터로 압축됨(§1-1-1)
+  → reshape (B, k, N, d_model)  # CNN 출력 = "CLS 출력"의 대체물
+  → permute → (B*N, k, d_model)
   → LSTM(batch_first=True) → 마지막 timestep 출력          # (B*N, d_model) → reshape (B,N,d_model)
   → Linear(d_model, 1) → Softplus → reshape                # (B, H, W)  (수요는 음수 불가)
 ```
@@ -55,26 +57,43 @@ x: (B, k, N, (2a+1)^2+1, d_model) → reshape (B*k*N, (2a+1)^2+1, d_model)
 ### 1-2-1. 노드 고유 임베딩
 
 - `nn.Embedding(H*W, d_model)`. 모든 노드를 한 번에 예측하므로 `node_embed.weight`(N,d_model) 전체를
-  그대로 `special_emb[CLS]`에 더해 N개 노드 각각의 CLS를 구성한다 (`CLS = special_emb[CLS] + node_embed.weight`).
-- 이웃 수요 패턴만으로는 "이 노드가 원래 어떤 위치인지"(상습 hotspot vs 조용한 곳 등)를 구분 못 하는 문제를 보완 — CLS 자체가 "이 노드 전용 CLS"가 되어 스스로 attention부터 노드 정체성을 반영.
-- 노드 정체성은 각 timestep(`k`)마다 동일하므로, CLS에 한 번 실어서 encoder 전체 시퀀스에 전파되게 함.
+  그대로 `special_emb[CLS]`에 더해 N개 노드 각각의 `cls_vec`을 구성한다
+  (`cls_vec = special_emb[CLS] + node_embed.weight`).
+- 이웃 수요 패턴만으로는 "이 노드가 원래 어떤 위치인지"(상습 hotspot vs 조용한 곳 등)를 구분 못 하는
+  문제를 보완 — `cls_vec`이 (2a+1)x(2a+1) 이웃 grid 전체에 브로드캐스트로 더해져 CNN 계산 전체에
+  노드 정체성이 스며들게 함(§1-1-1).
+- 노드 정체성은 각 timestep(`k`)마다 동일하므로, `cls_vec`에 한 번 실어서 매 timestep의 CNN 입력에
+  동일하게 주입한다.
 
-### 1-3. Positional embedding
+### 1-1-1. 공간 인코더: CNN (`base-cnn` 브랜치)
 
-- `nn.Parameter(shape=((2a+1)^2 + 1, d_model))`, learnable, 시퀀스에 elementwise 덧셈.
-- CLS 포함 전체 시퀀스 길이만큼 슬롯을 두고, 인덱스 0을 CLS 자리로 고정.
+`master`/`baseline-weather`는 (2a+1)^2 이웃을 CLS와 함께 하나의 시퀀스로 묶어 `TransformerEncoder`에
+태웠다(self-attention). `base-cnn` 브랜치는 이 공간 인코더를 CNN으로 교체한다:
+
+- (2a+1)x(2a+1) 이웃 임베딩을 채널=`d_model`인 2D 이미지로 보고, `Conv2d(d_model, d_model,
+  kernel_size=3, padding=0)`를 `a`번 쌓는다. `kernel=3, padding=0`이면 매 레이어 한 변이 정확히
+  2씩 줄어들므로, `a`번 통과시키면 `(2a+1) - 2a = 1`로 **항상 정확히 단일 벡터(1x1)**로 압축된다.
+- conv 레이어 수를 별도 하이퍼파라미터로 노출하지 않고 `a`에서 직접 유도한다 — 독립적으로 조절할
+  이유가 없는 값이고(어긋나면 shape이 깨지거나 1x1이 아닌 출력이 나옴), `a`와 항상 기하학적으로
+  정확히 맞물리게 하는 쪽이 안전하다.
+- CLS 역할(`cls_vec` = CLS 마커 + 노드 임베딩 + 날씨/캘린더, §1-2-1/§8)은 더 이상 별도 시퀀스
+  토큰이 아니라, 이웃 grid의 모든 셀에 브로드캐스트로 더해져(`neighbor_grid + cls_vec`) 노드
+  정체성+외부 요인이 CNN 계산 전체에 스며들게 한다 — "서로 다른 의미의 벡터를 더해 합성"하는 이
+  프로젝트의 기존 관례 연장.
+- 레이어 사이(마지막 레이어 제외)에 `ReLU` + `Dropout(dropout)`을 적용, 마지막 conv 레이어는
+  활성화 없이 그대로 LSTM에 전달(Transformer 버전에서 CLS 출력에 별도 활성화를 안 씌웠던 것,
+  `STResNetBranch`의 마지막 conv에 활성화가 없는 것과 동일한 관례).
+- CNN은 커널의 상대 위치 자체가 공간 구조(어느 이웃 오프셋인지)를 표현하므로, Transformer
+  버전에 있던 positional embedding은 필요 없어 제거했다.
 
 ### 1-4. 하이퍼파라미터 (기본값, `configs/model/*.yaml`에서 조정)
 
 | 이름 | 기본값 | 설명 |
 |---|---|---|
-| `a` | 2 | 이웃 반경 → 5×5=25 이웃 + CLS = 26 토큰 |
-| `d_model` | 64 | 임베딩/transformer 차원 |
+| `a` | 2 | 이웃 반경 → 5×5 이웃 grid, conv 레이어 수도 `a`로 결정(§1-1-1) |
+| `d_model` | 64 | 임베딩/CNN 채널 차원 |
 | `n_freqs` (m) | 32 | `2m = d_model` |
-| `n_layers` | 2 | TransformerEncoder layer 수 |
-| `n_heads` | 4 | attention head 수 |
-| `dim_feedforward` | 128 | transformer FFN 차원 |
-| `dropout` | 0.1 | transformer/lstm dropout |
+| `dropout` | 0.1 | conv/lstm dropout |
 | `lstm_hidden` | 64 (=`d_model`) | LSTM hidden size |
 | `lstm_layers` | 1 | LSTM layer 수 |
 
@@ -150,9 +169,11 @@ configs/
   입력 전 train split 통계로 표준화(`(weather - weather_mean) / weather_std`).
 - **캘린더 임베딩**: ADFormer의 `DataEmbedding`과 동일 — `daytime_embedding: nn.Embedding(1440, d_model)`
   (`round(hour_of_day/24*1440).clamp(0,1439)`로 인덱싱) + `weekday_embedding: nn.Embedding(7, d_model)`.
-- **주입 위치**: 기존 `CLS = special_emb[CLS] + node_embed[node]`에 날씨/캘린더 임베딩 합을 그대로
-  더한다(`cls_emb += weather_emb + daytime_emb + weekday_emb`, 노드 축엔 무관하게 브로드캐스트) —
-  이 프로젝트가 이미 쓰고 있는 "서로 다른 의미의 벡터를 CLS에 더해 합성"하는 패턴의 연장.
+- **주입 위치**: 기존 `cls_vec = special_emb[CLS] + node_embed[node]`에 날씨/캘린더 임베딩 합을
+  그대로 더한다(`cls_vec += weather_emb + daytime_emb + weekday_emb`, 노드 축엔 무관하게
+  브로드캐스트) — 이 프로젝트가 이미 쓰고 있는 "서로 다른 의미의 벡터를 더해 합성"하는 패턴의
+  연장(`base-cnn`에서는 이 `cls_vec`이 다시 (2a+1)x(2a+1) 이웃 grid 전체에 브로드캐스트되어
+  CNN 계산에 스며든다, §1-1-1).
 - **날씨 윈도우는 의도적으로 한 칸 밀려 있다**: 수요 입력 윈도우가 `[t-k, t-1]`이면 날씨는
   `[t-k+1, t]`를 쓴다(예측 대상 시점 `t` 자체의 날씨 포함). "그 시점 예보는 이미 안다"는 가정 —
   수요 자체를 미리 아는 것과는 다르며, 단기 기상 예보 정확도가 높다는 근거로 채택했다.

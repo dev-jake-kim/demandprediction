@@ -25,21 +25,22 @@ class GridDemandModel(PreTrainedModel):
         self.W = config.W
         self.n_side = 2 * config.a + 1
         self.n_neighbors = self.n_side * self.n_side
-        self.seq_len = self.n_neighbors + 1  # + CLS
 
         self.scalar_embed = FourierScalarEmbedding(config.d_model)
         self.special_embed = nn.Embedding(2, config.d_model)  # 0=CLS, 1=EDGE(격자 밖)
         self.node_embed = nn.Embedding(self.H * self.W, config.d_model)  # 노드 고유 임베딩 (node_id로 조회)
-        self.pos_embed = nn.Parameter(torch.randn(self.seq_len, config.d_model) * 0.02)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model,
-            nhead=config.n_heads,
-            dim_feedforward=config.dim_feedforward,
-            dropout=config.dropout,
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.n_layers)
+        # 공간 인코더: (2a+1)x(2a+1) 이웃을 채널=d_model인 2D 이미지로 보고 kernel=3,
+        # padding=0인 Conv2d를 a번 통과시킨다 - 매 레이어 한 변이 정확히 2씩 줄어들어
+        # (2a+1) - 2a = 1, 즉 항상 정확히 단일 벡터(1x1)로 압축된다. 레이어 수를 별도
+        # 하이퍼파라미터로 노출하지 않고 a에서 직접 유도 - a와 어긋나면 shape이 깨지므로
+        # 애초에 독립적으로 조절할 이유가 없다. CNN은 커널의 상대 위치 자체가 공간 구조를
+        # 표현하므로 Transformer 버전에 있던 positional embedding은 불필요(제거).
+        self.spatial_convs = nn.ModuleList([
+            nn.Conv2d(config.d_model, config.d_model, kernel_size=3, padding=0)
+            for _ in range(self.a)
+        ])
+        self.spatial_dropout = nn.Dropout(config.dropout)
 
         self.lstm = nn.LSTM(
             input_size=config.d_model,
@@ -160,21 +161,26 @@ class GridDemandModel(PreTrainedModel):
             weather_emb + self.daytime_embedding(daytime_idx) + self.weekday_embedding(day_of_week)
         )  # (B,k,d_model)
 
-        # CLS = "CLS 마커" + "이 노드의 고유 임베딩" + "이 시점의 날씨/캘린더" -> attention이 노드
-        # 정체성 + 외부 요인을 함께 알고 이웃을 취합.
-        # node_id로 한 행만 고르던 걸 전체 N행(node_embed.weight)으로 바꿔 N개 노드 전부의 CLS를 구성.
+        # cls_vec = "CLS 마커" + "이 노드의 고유 임베딩" + "이 시점의 날씨/캘린더" -> 노드 정체성 +
+        # 외부 요인을 나타내는 벡터. Transformer 버전처럼 별도 토큰으로 넣는 대신, 아래에서 5x5
+        # 이웃 grid의 모든 셀에 브로드캐스트로 더해 CNN 전체 계산에 스며들게 한다("서로 다른 의미의
+        # 벡터를 더해 합성"하는 이 프로젝트의 기존 관례 연장).
+        # node_id로 한 행만 고르던 걸 전체 N행(node_embed.weight)으로 바꿔 N개 노드 전부의 cls_vec을 구성.
         cls_base = self.special_embed.weight[CLS_TOKEN_ID]  # (d_model,)
         node_vecs = self.node_embed.weight  # (N, d_model)
-        cls_emb = (cls_base + node_vecs).view(1, 1, N, 1, d_model).expand(B, k, N, 1, d_model)
-        cls_emb = cls_emb + temporal_extra.view(B, k, 1, 1, d_model)  # 노드 축으로 브로드캐스트
-        seq = torch.cat([cls_emb, neighbor_emb], dim=3)  # (B,k,N,seq_len,d_model)
-        seq = seq + self.pos_embed  # (seq_len,d_model) 브로드캐스트
+        cls_vec = (cls_base + node_vecs).view(1, 1, N, d_model).expand(B, k, N, d_model)
+        cls_vec = cls_vec + temporal_extra.view(B, k, 1, d_model)  # 노드 축으로 브로드캐스트
 
-        # (B,k,N)을 하나의 배치로 합쳐 encoder에 넣음 -> 각 (b,t,node)는 서로 완전히 독립적으로 처리됨
+        # (B,k,N)을 하나의 배치로 합쳐 CNN에 넣음 -> 각 (b,t,node)는 서로 완전히 독립적으로 처리됨
         # (예전에 (B,k)만 합치던 것과 동일한 원리, node 차원만 추가로 합친 것뿐 -> 노드별 연산은 그대로).
-        seq = seq.reshape(B * k * N, self.seq_len, d_model)
-        encoded = self.encoder(seq)  # (B*k*N, seq_len, d_model)
-        cls_out = encoded[:, 0, :].reshape(B, k, N, d_model)
+        neighbor_grid = neighbor_emb.reshape(B, k, N, self.n_side, self.n_side, d_model)
+        neighbor_grid = neighbor_grid + cls_vec.view(B, k, N, 1, 1, d_model)  # 노드정체성+외부요인 주입
+        x = neighbor_grid.permute(0, 1, 2, 5, 3, 4).reshape(B * k * N, d_model, self.n_side, self.n_side)
+        for i, conv in enumerate(self.spatial_convs):
+            x = conv(x)
+            if i < len(self.spatial_convs) - 1:
+                x = self.spatial_dropout(F.relu(x))
+        cls_out = x.reshape(B, k, N, d_model)  # conv를 a번 거치면 공간차원이 정확히 1x1로 압축됨
 
         # 노드별로 독립적인 시계열이므로 (B,N)을 LSTM 배치로 합치고 k를 시퀀스 축으로 둔다.
         cls_out = cls_out.permute(0, 2, 1, 3).reshape(B * N, k, d_model)
