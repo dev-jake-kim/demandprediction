@@ -26,8 +26,9 @@ class GridDemandDataset(Dataset):
 
     `sample_idx`는 이 Dataset 인스턴스 내부의 0-base idx가 아니라 **절대 시간 인덱스**
     (`t = t_start + idx`, 원본 npy 배열 기준)다. train/val/test가 전부 같은 근본 grid의
-    서로 다른 `t_start`/`t_end` 슬라이스이므로, 절대 인덱스를 써야 어느 split에서 온
-    샘플이든 검색(retrieval) 브랜치의 인과적 prefix 계산에 그대로 정렬돼서 쓸 수 있다.
+    서로 다른 `t_start`/`t_end` 슬라이스이므로, 절대 인덱스를 써야 어느 split에서 온 샘플이든
+    같은 좌표계로 정렬된다(검색(retrieval) 브랜치가 있는 다른 모델 변형이 이 인과적 prefix
+    계산에 사용 — `GridDemandModel`(assemble-no-ir)은 이 필드를 받기만 하고 쓰지 않는다).
 
     `weather`는 `weather_csv_path`의 기온/강수량/적설 3개 컬럼을 시간 인덱스로 그대로 정렬해
     읽은 것이다. **수요 윈도우([t-time_step, t-1])보다 한 칸 밀린 [t-time_step+1, t]를 쓴다** —

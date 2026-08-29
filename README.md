@@ -29,14 +29,14 @@ python train.py train.num_train_epochs=50 model.d_model=128   # 하이퍼파라�
 학습 프로세스와 무관하게, 체크포인트 경로만 있으면 언제든 독립 실행된다.
 
 ```bash
-python test.py <checkpoint_path> --npy_path data/raw/ulsan_temporal_grid.npy --time_step 24 --t_start <test 구간 시작 timestep>
+python test.py <checkpoint_path> --npy_path data/raw/ulsan_temporal_grid.npy --weather_csv_path data/raw/ulsan_meteorological_data.csv --time_step 24 --t_start <test 구간 시작 timestep>
 ```
 
 - `<checkpoint_path>`: train.py가 저장한 `output/.../` 디렉토리 (`config.json` + `model.safetensors`가 있는 곳)
 - `--t_start`: train.py 로그에 찍힌 val 구간 끝 지점(=test 구간 시작)을 그대로 넣으면 됨. 생략하면 `time_step` 이후 전체 구간을 평가.
-- `--npy_path`/`--time_step`은 **반드시 학습 때 쓴 값과 같아야 함** — 이 모델은 검색(retrieval) 앙상블
-  브랜치가 있어서(`docs/MODEL_PLAN.md` §1-5), 체크포인트의 `config.npy_path`/`config.time_step`과
-  다르면 test.py가 시작하자마자 명확한 에러를 낸다(조용히 틀린 결과가 나오는 걸 막기 위함).
+- `--npy_path`/`--time_step`은 **반드시 학습 때 쓴 값과 같아야 함** — 이 모델은 검색(retrieval)
+  브랜치가 없어서 test.py가 별도로 검증하지 않으므로, 값이 어긋나도 에러 없이 비교 불가능한
+  지표가 조용히 나올 수 있다.
 - 출력: RMSE, MAE, MAPE(+1, 0-수요 스무딩)
 
 ## 전처리 (원본 데이터 -> npy)

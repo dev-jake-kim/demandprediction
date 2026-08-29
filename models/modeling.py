@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,9 +48,6 @@ class GridDemandModel(PreTrainedModel):
             batch_first=True,
         )
         self.output_proj = nn.Linear(config.lstm_hidden, 1)
-        # 검색(retrieval) 브랜치와 뉴럴 브랜치를 게이트로 섞는 레이어. 입력은
-        # [LSTM 마지막 hidden state, 검색 예측 스칼라] concat (최종 레이어 직전 concat).
-        self.lambda_layer = nn.Linear(config.lstm_hidden + 1, 1)
 
         # 날씨(Linear 투영, Lambda-F 스타일) + 캘린더(ADFormer의 DataEmbedding과 동일한 임베딩
         # 테이블 방식) — 둘 다 CLS 토큰에 더해져서 주입된다(forward 참고).
@@ -101,13 +97,6 @@ class GridDemandModel(PreTrainedModel):
         idx_table, mask_table = self._build_neighbor_tables()
         self.register_buffer('idx_table', idx_table, persistent=True)  # (H*W, n_neighbors)
         self.register_buffer('mask_table', mask_table, persistent=True)  # (H*W, n_neighbors)
-
-        # 검색 DB(retrieval_keys/values/norms)는 반대로 persistent=False로 등록한다 — config.npy_path의
-        # 순수 함수라 idx_table과 마찬가지로 결정론적이지만, 크기가 커서(ulsan ~1.7GB, porto ~4GB, fp32)
-        # 체크포인트에 통째로 중복 저장하는 게 낭비이기 때문. 그 대가로 from_pretrained 직후에는 이
-        # 버퍼가 깨져 있으므로(meta-device fast-init이 persistent=False 버퍼를 복원 안 함), 호출자가
-        # build_retrieval_db()를 명시적으로 다시 호출해야 한다 (test.py 참고).
-        self.build_retrieval_db()
 
         self.post_init()
         # [ablation: assemble-random-init] "중립 보정" 0-init을 여기서 하지 않음 — daily_projection/
@@ -210,104 +199,6 @@ class GridDemandModel(PreTrainedModel):
         encoded = self.encoder(seq)  # (B*k*N, seq_len, d_model)
         return encoded[:, 0, :].reshape(B, k, N, d_model)
 
-    def build_retrieval_db(self) -> None:
-        """config.npy_path의 원본 grid 전체 시계열로부터 검색(retrieval) DB를 만든다.
-
-        DB는 절대 시간 인덱스 t(0..T-1)로 인덱싱된다: retrieval_keys[:, t]는 t시점을 예측하는
-        입력 윈도우(grid[t-time_step:t])와 동일한 (2a+1)^2 로컬 패치 히스토리를 _crop_all_nodes로
-        뽑아 flatten한 것, retrieval_values[:, t]는 t시점의 실제 수요값이다. t < time_step인
-        구간은 유효한 윈도우가 없어 0으로 남겨두고(forward에서 후보 구간 계산 시 자동으로 제외됨).
-
-        __init__에서 자동 호출되지만(fresh construction 시 그걸로 충분), persistent=False 버퍼라
-        from_pretrained 이후에는 반드시 호출자가 다시 호출해야 한다(test.py 참고).
-        """
-        if self.config.npy_path is None:
-            raise ValueError("검색 DB를 만들려면 config.npy_path(원본 grid npy 절대경로)가 필요함")
-
-        # 재구성(예: from_pretrained 이후 재호출) 시 이전 buffer를 새로 만들기 전에 먼저 참조를
-        # 끊어야 한다 — 안 그러면 "이전 buffer + 재구성 중간 텐서(keys_by_window) + 새 buffer"가
-        # 동시에 메모리에 존재해서 porto 기준 host RAM에서 최대 ~12GB까지 순간적으로 잡아먹음.
-        for name in ('retrieval_keys', 'retrieval_values', 'retrieval_norms'):
-            if name in self._buffers:
-                self._buffers[name] = None
-
-        device = next(self.parameters()).device
-        time_step = self.config.time_step
-        N = self.H * self.W
-
-        grid = np.load(self.config.npy_path).astype(np.float32)  # (T, H, W)
-        if grid.shape[1:] != (self.H, self.W):
-            raise ValueError(
-                f"grid의 공간 shape({grid.shape[1:]})이 모델 config의 (H,W)=({self.H},{self.W})와 다름 — "
-                f"검색 DB가 잘못된 이웃 구조를 쓰게 되므로(총 셀 개수가 같아도 위험) 진행 불가"
-            )
-        T = grid.shape[0]
-        if T <= time_step:
-            raise ValueError(
-                f"grid 길이(T={T})가 time_step({time_step})보다 커야 검색 DB를 만들 수 있음"
-            )
-
-        grid_t = torch.from_numpy(grid).to(device)
-        with torch.no_grad():
-            values, _ = self._crop_all_nodes(grid_t.unsqueeze(0))  # (1,T,N,n_neighbors)
-        values = values.squeeze(0).permute(1, 0, 2)  # (N,T,n_neighbors)
-
-        # (N,T,n_neighbors) -> unfold(dim=1, time_step) -> (N,T-time_step+1,n_neighbors,time_step).
-        # 이 (...,n_neighbors,time_step) 순서가 flatten의 정본(canonical) 순서다 — forward()의 query
-        # 생성도 반드시 동일한 순서로 permute한 뒤 flatten해야 코사인 유사도가 의미를 가짐.
-        windows = values.unfold(1, time_step, 1)
-        windows = windows[:, :T - time_step, :, :]  # 마지막 윈도우는 라벨(t=T)이 없어 제외
-        flat_dim = self.n_neighbors * time_step
-        keys_by_window = windows.reshape(N, T - time_step, flat_dim)  # window s -> 예측 대상 t=s+time_step
-
-        retrieval_keys = torch.zeros(N, T, flat_dim, device=device)
-        retrieval_keys[:, time_step:T, :] = keys_by_window
-
-        retrieval_norms = torch.zeros(N, T, device=device)
-        retrieval_norms[:, time_step:T] = keys_by_window.norm(dim=-1)
-
-        retrieval_values = grid_t.reshape(T, N).transpose(0, 1).contiguous()  # (N,T)
-
-        self.register_buffer('retrieval_keys', retrieval_keys, persistent=False)
-        self.register_buffer('retrieval_values', retrieval_values, persistent=False)
-        self.register_buffer('retrieval_norms', retrieval_norms, persistent=False)
-
-    def _retrieve(self, query: torch.Tensor, sample_idx: torch.Tensor) -> torch.Tensor:
-        """query: (B,N,flat_dim), sample_idx: (B,) 절대 시간 인덱스 t -> ir_out (B,N).
-
-        각 배치 원소 b는 gir 샘플 하나가 이미 전체 N개 노드를 담고 있으므로, 인과적 후보 구간
-        (retrieval_keys[:, time_step:t_b])이 노드에 상관없이 b 하나당 하나로 통일된다 — 그래서
-        원본(IRModule)의 "배치 안 node_id별 group" 루프 대신 배치 원소 b에 대해서만 루프를 돈다.
-        후보 구간을 항상 t_b(자기 자신) 미만으로 슬라이스하므로 미래 시점을 절대 참조하지 않는다.
-        """
-        B, N, _ = query.shape
-        time_step = self.config.time_step
-        top_k = self.config.retrieval_k
-
-        ir_out = torch.zeros(B, N, device=query.device, dtype=query.dtype)
-        for b in range(B):
-            t_b = int(sample_idx[b].item())
-            num_candidates = t_b - time_step
-            if num_candidates <= 0:
-                continue  # 유효 후보 없음 (학습 극초반 샘플) -> ir_out=0, lambda 게이트가 알아서 처리
-
-            cand_keys = self.retrieval_keys[:, time_step:t_b, :].to(device=query.device, dtype=query.dtype)
-            cand_values = self.retrieval_values[:, time_step:t_b].to(device=query.device, dtype=query.dtype)
-            cand_norms = self.retrieval_norms[:, time_step:t_b].to(device=query.device, dtype=query.dtype)
-
-            q = query[b]  # (N,flat_dim)
-            q_norm = q.norm(dim=-1).clamp_min(1e-8)  # (N,)
-            sim = torch.einsum('nd,ncd->nc', q, cand_keys)
-            sim = sim / (q_norm.unsqueeze(1) * cand_norms.clamp_min(1e-8))  # (N,num_candidates)
-
-            k = min(top_k, num_candidates)
-            top_vals, top_idx = torch.topk(sim, k=k, dim=1)  # (N,k)
-            weights = torch.softmax(top_vals, dim=1)  # (N,k)
-            gathered = torch.gather(cand_values, 1, top_idx)  # (N,k)
-            ir_out[b] = (gathered * weights).sum(dim=1)
-
-        return ir_out
-
     def forward(
         self,
         demands: torch.Tensor,
@@ -319,8 +210,6 @@ class GridDemandModel(PreTrainedModel):
         daily_demands: torch.Tensor | None = None,
         weekly_demands: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | None]:
-        if sample_idx is None:
-            raise ValueError("이 모델은 검색(retrieval) 브랜치가 필수라 sample_idx가 반드시 필요함")
         if weather is None or hour_of_day is None or day_of_week is None:
             raise ValueError("이 모델은 날씨/캘린더 피처가 필수라 weather/hour_of_day/day_of_week가 필요함")
         if daily_demands is None or weekly_demands is None:
@@ -330,13 +219,6 @@ class GridDemandModel(PreTrainedModel):
         N = H * W
         d_model = self.config.d_model
         lstm_hidden = self.config.lstm_hidden
-
-        # _spatial_encode가 내부에서 다시 crop하지만(재사용성을 위한 트레이드오프, cheap한 인덱싱
-        # 연산이라 비용 무시 가능), 검색 query는 여기서 한 번 더 뽑아야 한다 — mask는 여기선 불필요.
-        values, _ = self._crop_all_nodes(demands)  # (B,k,N,n)
-        # 검색 query: DB(build_retrieval_db)와 동일한 (...,n_neighbors,time_step) 순서로 flatten.
-        # daily/weekly와는 무관 — 검색기 앙상블은 recent 윈도우만 사용(스코프 밖).
-        retrieval_query = values.permute(0, 2, 3, 1).reshape(B, N, -1)  # (B,N,n_neighbors*k)
 
         # recent 공간 인코딩 (날씨/캘린더 CLS에 포함) -> LSTM(recent 전용 가중치).
         cls_out = self._spatial_encode(demands, weather, hour_of_day, day_of_week)  # (B,k,N,d_model)
@@ -380,13 +262,7 @@ class GridDemandModel(PreTrainedModel):
         scale_correction = (1.0 - self.config.residual_scale * vec2_norm / (vec1_norm + eps)).clamp(min=0.0)
         fused = scale_correction * last + self.config.residual_scale * periodic_correction  # (B,N,lstm_hidden)
 
-        neural_pred = F.softplus(self.output_proj(fused)).squeeze(-1)  # (B,N)
-
-        ir_out = self._retrieve(retrieval_query, sample_idx)  # (B,N), 이미 실제 수요값의 가중평균이라 비음수
-
-        lambda_input = torch.cat([fused, ir_out.unsqueeze(-1)], dim=-1)  # (B,N,lstm_hidden+1)
-        lambda_weight = torch.sigmoid(self.lambda_layer(lambda_input)).squeeze(-1)  # (B,N)
-        pred = lambda_weight * neural_pred + (1 - lambda_weight) * ir_out  # (B,N)
+        pred = F.softplus(self.output_proj(fused)).squeeze(-1)  # (B,N)
 
         logits = pred.reshape(B, H, W)  # labels(B,H,W)와 동일 shape, node_id=row*W+col 순서와 일치
 

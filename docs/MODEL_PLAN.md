@@ -43,6 +43,10 @@ neural_pred와 ir_out을 sigmoid 게이트로 섞은 뒤 reshape:
   → reshape                                                 # (B, H, W)  (양쪽 다 비음수라 pred도 비음수)
 ```
 
+**`assemble-no-ir` 브랜치는 검색(retrieval) 서브시스템 자체가 없다** — 위 검색 브랜치 결합(§1-5
+포함)은 이 브랜치에 해당 안 되며, `pred = neural_pred`(daily/weekly 주기 브랜치까지 반영한 `fused`를
+`output_proj`+`Softplus`에 통과시킨 값)를 그대로 최종 출력으로 쓴다(§8, `models/modeling.py`).
+
 ### 1-1. 스칼라 임베딩 `FourierEmbed` (교체 가능하게 설계)
 
 ```
@@ -83,11 +87,17 @@ neural_pred와 ir_out을 sigmoid 게이트로 섞은 뒤 reshape:
 | `dropout` | 0.1 | transformer/lstm dropout |
 | `lstm_hidden` | 64 (=`d_model`) | LSTM hidden size |
 | `lstm_layers` | 1 | LSTM layer 수 |
-| `retrieval_k` | 20 | 검색(retrieval) top-k |
-| `time_step` | 24 | 검색 DB 슬라이딩 윈도우 길이(`train.py`가 `dataset.time_step`으로 주입, yaml에 직접 안 둠) |
-| `npy_path` | (없음, 필수) | 검색 DB를 만들 원본 grid npy **절대경로**(`train.py`가 `dataset.npy_path`를 resolve해서 주입) |
+| `retrieval_k` | 20 | 검색(retrieval) top-k — **`assemble-no-ir`에는 없는 필드**(§1-5 참고) |
+| `time_step` | 24 | 검색 DB 슬라이딩 윈도우 길이(`train.py`가 `dataset.time_step`으로 주입, yaml에 직접 안 둠) — **`assemble-no-ir`에는 없는 필드** |
+| `npy_path` | (없음, 필수) | 검색 DB를 만들 원본 grid npy **절대경로**(`train.py`가 `dataset.npy_path`를 resolve해서 주입) — **`assemble-no-ir`에는 없는 필드** |
 
 ## 1-5. 검색(retrieval) 앙상블 브랜치
+
+**`assemble-no-ir` 브랜치에는 이 절 전체(검색 DB, `_retrieve`, `lambda` 게이트)가 존재하지 않는다**
+— `GridDemandModel`에 `build_retrieval_db`/`_retrieve`/`lambda_layer`가 전부 제거됐고,
+`GridDemandConfig`/`configs/model/baseline.yaml`에도 `time_step`/`npy_path`/`retrieval_k` 필드가
+없다. 아래 설명은 이 서브시스템이 있는 다른 브랜치(`ir`, `ir-weather`, `assemble`,
+`assemble-random-init` 등) 기준이다.
 
 `/home/jinsu/PycharmProjects/DMVST` 저장소 `ir` 브랜치(`IRModule`)에서 아이디어를 가져온
 브랜치(이 저장소도 브랜치명이 `ir`). 뉴럴 브랜치(위 1절)와 별도로, 같은 위치(node)의 **과거** 로컬
@@ -164,7 +174,7 @@ class CombinedLoss(nn.Module):
 ## 5. HuggingFace 통합
 
 - `models/config.py`: `GridDemandConfig(PretrainedConfig)` — 위 1-4 하이퍼파라미터 + `H, W`(도시별 격자 크기)를 필드로.
-- `models/modeling.py`: `GridDemandModel(PreTrainedModel)` — `forward(demands, labels=None, sample_idx=None)` → `logits`는 `(B,H,W)`(전체 노드), `labels`가 있으면 `{'loss', 'logits'}`, 없으면 `{'logits'}` 반환 (HF `Trainer` 호환). 검색 브랜치(§1-5) 때문에 `sample_idx`는 사실상 필수(`None`이면 `ValueError`) — `GridDemandDataset`이 반환하는 `sample_idx`는 split-local idx가 아니라 **절대 시간 인덱스** `t`임에 유의.
+- `models/modeling.py`: `GridDemandModel(PreTrainedModel)` — `forward(demands, labels=None, sample_idx=None, ...)` → `logits`는 `(B,H,W)`(전체 노드), `labels`가 있으면 `{'loss', 'logits'}`, 없으면 `{'logits'}` 반환 (HF `Trainer` 호환). 검색 브랜치(§1-5)가 있는 브랜치에서는 `sample_idx`가 사실상 필수(`None`이면 `ValueError`)지만, **`assemble-no-ir`은 검색 브랜치가 없어 `sample_idx`를 시그니처로 받기만 하고 forward 내부에서 쓰지 않는다**(`remove_unused_columns: false`로 `Trainer`가 넘기는 배치 키를 그냥 다 받아주는 것 — `None`이어도 에러 없음). `GridDemandDataset`이 반환하는 `sample_idx`는 어느 브랜치든 split-local idx가 아니라 **절대 시간 인덱스** `t`임에 유의.
 - 노드별 backprop을 없애고 한 forward에서 N=H*W개 노드를 다 예측하도록 바꾸면서 step당 연산량이 N배로
   늘어남 (ulsan N=168, porto N=200) → `configs/config.yaml`의 `per_device_train/eval_batch_size`를
   그만큼 낮춰야 함 (기본값 4/8, 실제 GPU 메모리에 맞춰 조정).
@@ -207,8 +217,10 @@ N2MSDWGateTarget)에서 두 아이디어만 가져와 얹은 브랜치다.
   출력(각각 `daily_projection`/`weekly_projection`으로 투영한 것)을 Key/Value 후보로 하고,
   학습 가능한 "null" key를 하나 더 둬서 attention이 "daily도 weekly도 안 쓰겠다"를 선택할 자유를
   준다. `periodic_correction`(vec_2)은 이 softmax 가중치로 만든 daily/weekly 가중합이고, 이후
-  `neural_pred`/검색기 게이트 입력 전부 `last` 대신 `fused`를 쓴다(검색기 앙상블 자체, 즉
-  `retrieval_query`/`_retrieve`는 recent 윈도우만 그대로 사용 — daily/weekly와 무관, 스코프 밖).
+  `neural_pred`/검색기 게이트 입력 전부 `last` 대신 `fused`를 쓴다(검색기 앙상블이 있는 브랜치에서는
+  그 자체, 즉 `retrieval_query`/`_retrieve`는 recent 윈도우만 그대로 사용 — daily/weekly와 무관,
+  스코프 밖. **`assemble-no-ir`은 검색기 앙상블이 아예 없으므로 `fused`가 `output_proj`+`Softplus`를
+  거쳐 바로 최종 `pred`가 된다** — §1 참고).
 - **`assemble`(0-init)**: `daily_projection`/`weekly_projection`을 0-init해서, 학습 시작 시점엔
   `daily_last`/`weekly_last`가 정확히 0 → `periodic_correction=0` → `fused==last`, 즉 순수
   `ir-weather`와 동일하게 시작하고 daily/weekly의 기여는 학습되며 서서히 커진다("중립 시작").
@@ -235,7 +247,30 @@ N2MSDWGateTarget)에서 두 아이디어만 가져와 얹은 브랜치다.
   `periodic_correction=0`이 되는 매 순간(예: null-option이 완전히 이길 때)에 `fused=last`가
   된다는 구조적 성질만 보장된다.
 
-## 9. 아직 정해지지 않은 것 / 기본값으로 진행할 것
+## 9. 검색(retrieval) 서브시스템 제거 ablation (`assemble-no-ir` 브랜치)
+
+`assemble-random-init`(§8)은 검색기 앙상블(`ir`)과 daily/weekly 주기 브랜치가 동시에 들어가 있어서
+"주기 브랜치 자체가 도움이 되는지"를 검색기 효과와 분리해서 볼 수 없다. `assemble-no-ir`은
+`assemble-random-init`에서 분기해 **검색(retrieval) 서브시스템만 제거**한 것 — 순수하게
+"baseline-weather(주기 브랜치도 검색기도 없는 원본) + daily/weekly 주기 브랜치"가 baseline-weather
+대비 나은지 확인하기 위한 ablation이다.
+
+- `GridDemandModel`에서 `build_retrieval_db`/`_retrieve`/`lambda_layer` 제거 → `pred = neural_pred`
+  (daily/weekly 융합 이후의 `fused`를 `output_proj`+`Softplus`에 통과시킨 값)를 그대로 최종 출력으로
+  사용(§1, §8 참고).
+- `GridDemandConfig`/`configs/model/baseline.yaml`에서 `time_step`/`npy_path`/`retrieval_k` 제거.
+- `sample_idx`는 시그니처에 남아있지만(`Trainer`의 `remove_unused_columns: false` 때문에 받아야 함)
+  forward 내부에서 쓰이지 않음.
+- `test.py`도 검색 서브시스템의 소비자였음 — 체크포인트 `config.npy_path`/`config.time_step`과
+  `--npy_path`/`--time_step` 일치 검증, `build_retrieval_db()` 호출을 제거하고
+  `from_pretrained(...).to(device)`로 바로 로드하도록 단순화(`baseline-weather`의 `test.py`와
+  동일한 형태). `--npy_path`/`--time_step` 자체는 평가 데이터셋 생성에 여전히 필요하지만, 값이
+  학습 때와 어긋나도 더 이상 명확한 에러로 막아주지 않는다(검색 DB 보호용이었을 뿐이라 이 ablation
+  범위 밖 — `baseline-weather`도 원래 이 검증이 없었다).
+- 기존 `assemble-random-init` 체크포인트와는 `lambda_layer` 제거로 파라미터 구조가 달라져 완전
+  비호환 — 새로 학습해야 한다.
+
+## 10. 아직 정해지지 않은 것 / 기본값으로 진행할 것
 
 - `a`, `d_model`, `n_freqs` 등 정확한 하이퍼파라미터 값 — 위 표를 기본값으로 두고 `configs/model/baseline.yaml`에서 조정.
 - train/val/test 시간 분할 비율 — 별도 지시 없으면 시간순 70/15/15로 가정.

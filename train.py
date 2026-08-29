@@ -108,8 +108,6 @@ def main(cfg: DictConfig) -> None:
     model_config = GridDemandConfig(
         H=train_ds.X,
         W=train_ds.Y,
-        time_step=train_ds.time_step,
-        npy_path=str(Path(cfg.dataset.npy_path).resolve()),
         weather_csv_path=str(Path(cfg.dataset.weather_csv_path).resolve()),
         weather_mean=weather_mean.tolist(),
         weather_std=weather_std.tolist(),
