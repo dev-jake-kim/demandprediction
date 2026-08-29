@@ -186,7 +186,7 @@ configs/
 - `train.py`: `@hydra.main(config_path="configs", config_name="config")` → dataset/model 생성 → `TrainingArguments`(`cfg.train`) → HF `Trainer` → `trainer.train()` → `trainer.save_model()` (hydra run dir = `output/${project_name}/...`, `configs/config.yaml`의 `hydra.run.dir`과 일치).
 - `test.py`: `checkpoint_path` 인자만 받아 `GridDemandModel.from_pretrained(checkpoint_path)`로 복원 후, 별도 test 시간 구간 `GridDemandDataset`으로 RMSE/MAE/MAPE(+1) 계산. 학습 프로세스와 완전히 분리된 독립 실행.
 
-## 8. daily/weekly 주기 브랜치 + null-option attention 융합 (`assemble` 브랜치)
+## 8. daily/weekly 주기 브랜치 + null-option attention 융합 (`assemble`/`assemble-random-init` 브랜치)
 
 `ir-weather`(검색기 앙상블 + 날씨/캘린더) 위에, 사용자가 별도 제공한 참고 구현("main model",
 N2MSDWGateTarget)에서 두 아이디어만 가져와 얹은 브랜치다.
@@ -203,20 +203,37 @@ N2MSDWGateTarget)에서 두 아이디어만 가져와 얹은 브랜치다.
   `self.daily_lstm`/`self.weekly_lstm`로 **브랜치마다 독립된 가중치**를 쓴다. 날씨/캘린더는
   recent에만 주입되고(`_spatial_encode`의 `weather` 인자가 `None`이면 CLS에 안 더함), daily/weekly는
   순수 수요값만 본다 — main model 자체도 주기 브랜치엔 날씨/캘린더를 안 넣는 것과 동일한 설계.
-- **null-option attention 융합**: recent LSTM 출력(`last`)을 Query, daily/weekly LSTM 출력(각각
-  `daily_projection`/`weekly_projection`으로 투영한 것)을 Key/Value 후보로 하고, 학습 가능한
-  "null" key를 하나 더 둬서 attention이 "daily도 weekly도 안 쓰겠다"를 선택할 자유를 준다.
-  `fused = last + residual_scale * (daily/weekly 가중합)`으로 residual correction을 만들고, 이후
+- **null-option attention 융합**: recent LSTM 출력(`last`, vec_1)을 Query, daily/weekly LSTM
+  출력(각각 `daily_projection`/`weekly_projection`으로 투영한 것)을 Key/Value 후보로 하고,
+  학습 가능한 "null" key를 하나 더 둬서 attention이 "daily도 weekly도 안 쓰겠다"를 선택할 자유를
+  준다. `periodic_correction`(vec_2)은 이 softmax 가중치로 만든 daily/weekly 가중합이고, 이후
   `neural_pred`/검색기 게이트 입력 전부 `last` 대신 `fused`를 쓴다(검색기 앙상블 자체, 즉
   `retrieval_query`/`_retrieve`는 recent 윈도우만 그대로 사용 — daily/weekly와 무관, 스코프 밖).
-- **"중립 시작" 초기화**: `daily_projection`/`weekly_projection`을 0-init해서, 학습 시작 시점엔
+- **`assemble`(0-init)**: `daily_projection`/`weekly_projection`을 0-init해서, 학습 시작 시점엔
   `daily_last`/`weekly_last`가 정확히 0 → `periodic_correction=0` → `fused==last`, 즉 순수
-  `ir-weather`와 동일하게 시작하고 daily/weekly의 기여는 학습되며 서서히 커진다. **주의**:
-  `PreTrainedModel.post_init()`이 내부적으로 호출하는 `init_weights()`가 (이 코드베이스가
-  `_init_weights`를 오버라이드하지 않으므로) 기본 구현을 통해 모든 `nn.Linear.weight`를
-  `normal_(0,0.02)`로 재초기화한다(bias는 0으로) — `__init__` 중간에 0-init을 하면 뒤이은
-  `self.post_init()`이 지워버리므로, 0-init은 반드시 **`self.post_init()` 호출 이후**에 해야
-  실제로 유지된다(`models/modeling.py` 개발 중 확인/수정함).
+  `ir-weather`와 동일하게 시작하고 daily/weekly의 기여는 학습되며 서서히 커진다("중립 시작").
+  **주의**: `PreTrainedModel.post_init()`이 내부적으로 호출하는 `init_weights()`가 (이
+  코드베이스가 `_init_weights`를 오버라이드하지 않으므로) 기본 구현을 통해 모든
+  `nn.Linear.weight`를 `normal_(0,0.02)`로 재초기화한다(bias는 0으로) — `__init__` 중간에
+  0-init을 하면 뒤이은 `self.post_init()`이 지워버리므로, 0-init은 반드시
+  **`self.post_init()` 호출 이후**에 해야 실제로 유지된다(`models/modeling.py` 개발 중
+  확인/수정함). 이 버전의 융합식은 `fused = last + residual_scale * periodic_correction`.
+- **`assemble-random-init`(랜덤 초기화 + 스케일 보정, ablation)**: `daily_projection`/
+  `weekly_projection`/`periodic_null_key`를 0-init하지 않고 `post_init()`의 기본 랜덤 초기화
+  그대로 둔다 — "중립 시작" 없이 학습 시작부터 daily/weekly 신호가 섞인 채로 출발하면 결과가
+  어떻게 달라지는지 보는 ablation. 여기에 추가로, `vec_1=last`는 항상 풀스케일로 더해지고
+  `vec_2=periodic_correction`만 null-option 가중치에 따라 크기가 흔들리다 보니 `fused`의 노름이
+  샘플마다 들쭉날쭉해지는 문제가 있어 스케일 보정을 넣었다:
+  ```python
+  scale_correction = (1 - residual_scale * ||periodic_correction|| / (||last|| + eps)).clamp(min=0)
+  fused = scale_correction * last + residual_scale * periodic_correction
+  ```
+  `periodic_correction`이 0에 가까울수록 `scale_correction→1`(`fused≈last`)이고, daily/weekly가
+  강하게 관여할수록 `last`의 기여가 줄어 `fused`의 스케일이 안정된다(두 벡터가 평행하지 않아
+  완벽한 노름 보존은 아님). 단, 이 브랜치는 랜덤 초기화라 학습 시작 시점에 `periodic_correction`이
+  정확히 0이 되는 건 아니므로 `assemble`의 "중립 시작" 보장은 없음 — 오직
+  `periodic_correction=0`이 되는 매 순간(예: null-option이 완전히 이길 때)에 `fused=last`가
+  된다는 구조적 성질만 보장된다.
 
 ## 9. 아직 정해지지 않은 것 / 기본값으로 진행할 것
 

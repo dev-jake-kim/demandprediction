@@ -365,8 +365,20 @@ class GridDemandModel(PreTrainedModel):
         branch_scores = (query * keys).sum(-1) / (lstm_hidden ** 0.5)  # (B,N,2)
         null_score = (query * self.periodic_null_key.view(1, 1, 1, -1)).sum(-1)  # (B,N,1)
         weights = torch.softmax(torch.cat([branch_scores, null_score], dim=-1), dim=-1)  # (B,N,3)
-        periodic_correction = weights[..., 0:1] * daily_last + weights[..., 1:2] * weekly_last  # (B,N,lstm_hidden)
-        fused = last + self.config.residual_scale * periodic_correction  # (B,N,lstm_hidden)
+        periodic_correction = weights[..., 0:1] * daily_last + weights[..., 1:2] * weekly_last  # (B,N,lstm_hidden), vec_2
+
+        # 스케일 보정: vec_1(last)은 원래 매번 풀스케일로 더해지고 vec_2(periodic_correction)만
+        # 샘플마다(null-option이 얼마나 이겼는지에 따라) 크기가 흔들려서, 단순히 last + gate*vec_2로
+        # 더하면 fused의 노름이 "주기 정보를 얼마나 섞었는지"에 따라 들쭉날쭉해진다. vec_2가 gate만큼
+        # 관여하는 크기를 vec_1의 노름 대비 비율로 계산해 vec_1을 그만큼 깎아준다 -> null이 이겨서
+        # periodic_correction≈0이면 correction≈1(vec_1 그대로, null-option의 "순수 recent" 의미 유지),
+        # daily/weekly가 강하게 관여할수록 vec_1의 기여가 줄어 fused의 스케일이 안정된다(vec_1/vec_2가
+        # 평행하지 않으므로 완벽한 노름 보존은 아니지만, vec_1이 항상 풀스케일로 고정되던 문제는 완화됨).
+        eps = 1e-6
+        vec1_norm = last.norm(dim=-1, keepdim=True)  # (B,N,1)
+        vec2_norm = periodic_correction.norm(dim=-1, keepdim=True)  # (B,N,1)
+        scale_correction = (1.0 - self.config.residual_scale * vec2_norm / (vec1_norm + eps)).clamp(min=0.0)
+        fused = scale_correction * last + self.config.residual_scale * periodic_correction  # (B,N,lstm_hidden)
 
         neural_pred = F.softplus(self.output_proj(fused)).squeeze(-1)  # (B,N)
 
