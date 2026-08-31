@@ -14,4 +14,5 @@ preprocessing/**/raw/
 preprocessing/**/output/
 *.csv
 .claude/
+.codex/
 docs/PROJECT_SUMMARY.md

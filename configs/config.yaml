@@ -1,5 +1,7 @@
 defaults:
   - dataset: ulsan
+  # 이 브랜치는 모델 구현이 비어 있어 configs/model/도 비어 있다 —
+  # 새 모델을 추가할 때 configs/model/<이름>.yaml을 만들고 아래 이름을 맞춰야 한다.
   - model: baseline
   - _self_
 
