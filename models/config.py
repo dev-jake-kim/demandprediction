@@ -24,6 +24,7 @@ class GridDemandConfig(PretrainedConfig):
         weather_csv_path: str | None = None,
         weather_mean: list[float] | None = None,
         weather_std: list[float] | None = None,
+        loss_type: str = 'combined',
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
         **kwargs,
@@ -48,6 +49,9 @@ class GridDemandConfig(PretrainedConfig):
         self.weather_csv_path = weather_csv_path
         self.weather_mean = weather_mean
         self.weather_std = weather_std
+        # 'combined'(기본, CombinedLoss=제곱오차+gamma*상대오차제곱) 또는 'mae'(L1).
+        # 'mae'는 merged_model과 손실을 맞춰 비교하기 위한 옵션 — loss_gamma/loss_eps는 무시된다.
+        self.loss_type = loss_type
         self.loss_gamma = loss_gamma
         self.loss_eps = loss_eps
         super().__init__(**kwargs)

@@ -28,3 +28,18 @@ class CombinedLoss(nn.Module):
         if self.reduction == 'sum':
             return loss.sum()
         return loss
+
+
+def build_loss(config) -> nn.Module:
+    """config.loss_type에 따라 손실 모듈을 만든다.
+
+    'combined'(기본)은 이 저장소의 모든 기존 실험이 쓴 CombinedLoss고, 'mae'는 raw 스케일
+    L1으로 merged_model(F.l1_loss)과 목적함수를 맞추기 위한 것이다. 'mae'일 때
+    loss_gamma/loss_eps는 쓰이지 않는다.
+    """
+    loss_type = getattr(config, 'loss_type', 'combined')
+    if loss_type == 'combined':
+        return CombinedLoss(gamma=config.loss_gamma, eps=config.loss_eps)
+    if loss_type == 'mae':
+        return nn.L1Loss()
+    raise ValueError(f"알 수 없는 loss_type: {loss_type!r} (가능: 'combined', 'mae')")

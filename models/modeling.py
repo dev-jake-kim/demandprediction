@@ -8,7 +8,7 @@ from transformers import PreTrainedModel
 
 from .config import GridDemandConfig
 from .embeddings import FourierScalarEmbedding
-from .losses import CombinedLoss
+from .losses import build_loss
 
 CLS_TOKEN_ID = 0
 EDGE_TOKEN_ID = 1
@@ -59,7 +59,7 @@ class GridDemandModel(PreTrainedModel):
         self.daytime_embedding = nn.Embedding(1440, config.d_model)
         self.weekday_embedding = nn.Embedding(7, config.d_model)
 
-        self.loss_fn = CombinedLoss(gamma=config.loss_gamma, eps=config.loss_eps)
+        self.loss_fn = build_loss(config)
 
         if config.weather_mean is None or config.weather_std is None:
             raise ValueError("weather_mean/weather_std(3개씩, train split 통계)가 필요함")
