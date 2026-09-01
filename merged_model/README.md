@@ -26,7 +26,43 @@ daily/weekly fusion and MAE objective are explicit.
 - raw causal cosine retrieval with `tau < target_time`, computed in CPU chunks;
 - another-style node-wise gate between neural and retrieval predictions;
 - one forward pass, one optimizer, and raw-scale MAE;
-- no main recent branch and no weather input.
+- weather and calendar features concatenated onto **all three** LSTM inputs;
+- no main recent branch.
+
+### Weather and calendar features
+
+Each of the three LSTMs receives a shared 15-dimensional context vector
+concatenated to its per-step input:
+
+| Feature | Dimensions | How it is encoded |
+| --- | --- | --- |
+| weather (temperature, precipitation, snow) | 3 | normalized `(x - mean) / std`, **no embedding layer** |
+| day of week | 7 | `nn.Embedding(7, 7)` |
+| hour of day | 5 | `nn.Embedding(24, 5)` |
+
+This changes the LSTM input widths to `64 + 15 = 79` for the history branch and
+`1 + 15 = 16` for the daily and weekly branches. The embedding tables are owned
+by `UnifiedDemandModel` and shared across branches.
+
+Normalization statistics come from the **training split only**
+(`weather[time_step:train_end]`), computed in `train.py` and stored as model
+buffers, so validation and test windows never leak into them. `std` is clamped
+at `1e-6` because some features are constant within the training split (Porto's
+snow column is always zero).
+
+The recent branch reads weather over `[t-k+1, t+1)` — shifted by one step so it
+includes the target hour's weather. This mirrors the `ir-weather` branch's
+deliberate "short-range weather forecasts are already known" assumption; it is
+not the same as knowing future demand. Calendar features need no forecast and
+use the same `[t-k, t)` window as demand.
+
+Weekly lags are multiples of 168 hours, so every weekly lag shares the target's
+weekday and hour — the calendar input is constant within a weekly sequence
+(weather still varies). This is structural, not a bug.
+
+The weather CSV must be cp949-encoded and contain `기온(°C)`, `강수량(mm)`, and
+`적설(cm)`; its row count must equal the temporal grid length. Paths are set per
+dataset under `datasets.<name>.weather_path` in `config.yaml`.
 
 ## Run
 

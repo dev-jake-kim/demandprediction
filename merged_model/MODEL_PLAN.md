@@ -17,7 +17,8 @@ neural branch는 이 모델 내부에서 attention으로 결합하고, retrieval
 - attention 후보: `daily`, `weekly`, `h_neural` 세 branch
 - attention query: `h_neural`
 - retrieval search query: raw local demand window 유지
-- weather: **사용하지 않음**
+- weather: **사용함** — 정규화한 3값(기온/강수/적설)을 요일(7차원)·시간대(5차원) 임베딩과 함께
+  세 LSTM 입력에 concat(총 15차원). 날씨는 임베딩하지 않는다.
 - normalization: another_model 형식의 `log1p` 기반 입력
 - retrieval value: raw demand 사용
 - 최종 loss: **MAE만 사용**
@@ -234,7 +235,8 @@ raw local window에서 만들고, neural branch와 daily/weekly branch의 입력
 ## 10. 데이터 계약
 
 다른 비교 모델과 같은 `comparison_models/data` 아래의 temporal grid를 공통 원천으로 사용한다.
-weather CSV는 이번 통합 모델 입력에서 제외한다.
+weather CSV(cp949, 기온/강수량/적설)도 함께 읽으며, 경로는 `datasets.<name>.weather_path`로
+지정한다. 정규화 통계는 train split(`[time_step, train_end)`)에서만 계산한다.
 
 ```text
 data/
@@ -275,7 +277,6 @@ loss = mean(abs(prediction - target))
 - branch별 optimizer
 - branch별 backward
 - main recent branch
-- weather feature
 
 학습 단위는 다음과 같다.
 

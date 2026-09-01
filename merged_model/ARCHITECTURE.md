@@ -13,18 +13,18 @@ dataset or training loop.
 
 | Path | Responsibility | Typical changes |
 | --- | --- | --- |
-| `data.py` | temporal-grid loading, split, lag tables, invalid masks | time split, lag count, `lag_radius` |
-| `model.py` | branch wiring and raw-scale MAE contract | tensor flow or output keys |
+| `data.py` | temporal-grid loading, split, lag tables, invalid masks, weather/calendar tables | time split, lag count, `lag_radius`, weather source |
+| `model.py` | branch wiring, weather/calendar context assembly, raw-scale MAE contract | tensor flow or output keys |
 | `modules/embeddings.py` | scalar/Fourier token embedding | scalar feature encoding |
-| `modules/history.py` | local crop, EDGE/CLS tokens, Transformer, history LSTM | another neural branch |
-| `modules/periodic.py` | daily/weekly LSTM and invalid-lag compaction | periodic encoders |
+| `modules/history.py` | local crop, EDGE/CLS tokens, Transformer, history LSTM (context concatenated) | another neural branch |
+| `modules/periodic.py` | daily/weekly LSTM, invalid-lag compaction, context concatenation | periodic encoders |
 | `modules/attention.py` | node-wise daily/weekly/neural attention | branch selection/fusion |
 | `modules/retrieval.py` | raw causal cosine retrieval and cache | retrieval scope/top-k/chunking |
 | `modules/fusion.py` | neural/retrieval output gate | final prediction fusion |
 | `components.py` | compatibility re-exports only | keep imports stable; no new logic |
 | `train.py` | optimizer, early stopping, metrics, result JSON | training schedule or CLI |
 | `validate.py` | structural, gradient, mask, and causal checks | regression checks |
-| `config.yaml` | experiment defaults | dimensions, lags, retrieval policy |
+| `config.yaml` | experiment defaults | dimensions, lags, retrieval policy, `weather_path`, `weekday_dim`, `hour_dim` |
 | `README.md` | run instructions and behavior summary | user-facing usage |
 
 ## Directory layout
@@ -53,10 +53,12 @@ merged_model/
 ## Forward data flow
 
 ```text
+context (per branch, 15 dims) = normalized weather (3) ⊕ weekday_emb (7) ⊕ hour_emb (5)
+
 raw history
-  ├─ LocalHistoryEncoder: crop → log1p/Fourier → Transformer → LSTM → h_neural
-  ├─ PeriodicLSTMEncoder: daily raw lags → log1p/LSTM → h_daily
-  └─ PeriodicLSTMEncoder: weekly raw lags → log1p/LSTM → h_weekly
+  ├─ LocalHistoryEncoder: crop → log1p/Fourier → Transformer → cls ⊕ context → LSTM(79) → h_neural
+  ├─ PeriodicLSTMEncoder: daily raw lags → log1p ⊕ context → LSTM(16) → h_daily
+  └─ PeriodicLSTMEncoder: weekly raw lags → log1p ⊕ context → LSTM(16) → h_weekly
 
 h_neural → query
 [h_daily, h_weekly, h_neural] → key/value candidates → branch attention → h_attn
@@ -68,6 +70,13 @@ h_attn + ir_out → NeuralRetrievalGate → prediction → MAE(target)
 The daily/weekly masks are applied twice: valid lags are compacted before the
 LSTM, and invalid branch tokens are excluded from attention. `h_neural` is
 always a valid candidate, so all-invalid periodic samples remain well-defined.
+
+Weather and calendar are node-independent, so the context is broadcast across
+nodes before concatenation. Weather is normalized with training-split statistics
+held as model buffers; it has no embedding layer. Invalid periodic lags carry
+zeroed context and are dropped by compaction, so the widened feature dimension
+must flow through the `gather` in `periodic.py` — `validate.py` pins this with a
+reference-implementation comparison.
 
 The retrieval module uses raw values and only candidate times
 `[time_step, target_time)`. Its CPU cache is not part of the checkpoint; it is
