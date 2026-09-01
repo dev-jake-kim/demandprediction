@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterable, Literal
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
@@ -20,6 +21,13 @@ DATASET_FILES = {
     "ulsan": ("ulsan", "ulsan_temporal_grid.npy"),
     "porto": ("prtu", "porto_temporal_grid.npy"),
 }
+
+# 날씨 CSV 규약은 ir-weather 브랜치의 dataset_frame/grid_demand_dataset.py를 그대로 따른다.
+WEATHER_COLUMNS = ["기온(°C)", "강수량(mm)", "적설(cm)"]
+# 기상청 관측 데이터 관례상 강수량/적설의 빈 셀은 "관측값 없음"이 아니라 0을 뜻한다
+# (강수/적설이 없으면 값을 아예 안 채움). 기온은 이 관례가 적용되지 않으므로 제외한다.
+ZERO_FILL_WEATHER_COLUMNS = ["강수량(mm)", "적설(cm)"]
+NUM_WEATHER_FEATURES = len(WEATHER_COLUMNS)
 
 
 def _unique_existing(paths: Iterable[Path]) -> list[Path]:
@@ -85,6 +93,45 @@ def _chronological_lags(period: int, count: int, radius: int) -> np.ndarray:
     return np.asarray(sorted(lags, reverse=True), dtype=np.int64)
 
 
+def load_weather_table(weather_csv_path: str | Path, total_steps: int) -> np.ndarray:
+    """날씨 CSV를 ``[T, 3]``(기온/강수량/적설)로 읽는다.
+
+    ir-weather와 동일한 규약: cp949 인코딩, 강수량/적설만 결측을 0으로 채운다.
+    행 수가 temporal grid의 길이와 다르면 시간 정렬이 깨진 것이므로 즉시 실패시킨다.
+    """
+
+    path = Path(weather_csv_path).expanduser().resolve()
+    frame = pd.read_csv(path, encoding="cp949")
+    missing = [column for column in WEATHER_COLUMNS if column not in frame.columns]
+    if missing:
+        raise ValueError(
+            f"날씨 CSV에 필요한 컬럼이 없음: {missing} ({path}). "
+            f"있는 컬럼: {list(frame.columns)}"
+        )
+    frame = frame.copy()
+    frame[ZERO_FILL_WEATHER_COLUMNS] = frame[ZERO_FILL_WEATHER_COLUMNS].fillna(0.0)
+    weather = frame[WEATHER_COLUMNS].to_numpy(dtype=np.float32)
+    if weather.shape[0] != total_steps:
+        raise ValueError(
+            f"날씨 행 수({weather.shape[0]})가 temporal grid 길이({total_steps})와 다름: {path}"
+        )
+    if not np.isfinite(weather).all():
+        raise ValueError(f"날씨에 결측/비유한값이 남아 있음: {path}")
+    return weather
+
+
+def _calendar_features(times: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """절대 시간 인덱스 -> (hour_of_day, day_of_week).
+
+    ir-weather와 동일한 인덱스 기반 합성 캘린더다(실제 달력 날짜가 아님) — 저장소의 다른
+    브랜치들과 같은 값을 쓰기 위해 공식을 그대로 맞춘다.
+    """
+
+    hour = (times % 24).astype(np.int64)
+    day_of_week = ((times // 24) % 7).astype(np.int64)
+    return hour, day_of_week
+
+
 @dataclass(frozen=True)
 class SplitBounds:
     train_end: int
@@ -106,6 +153,7 @@ class UnifiedDemandDataset(Dataset):
         data_path: str | Path,
         split: Literal["train", "val", "test"] = "train",
         *,
+        weather_csv_path: str | Path,
         time_step: int = 24,
         daily_period: int = 24,
         daily_lags: int = 6,
@@ -156,8 +204,36 @@ class UnifiedDemandDataset(Dataset):
         self.split = split
         self.indices = np.arange(start, end, dtype=np.int64)
 
+        self.weather = load_weather_table(weather_csv_path, self.total_steps)
+        self.weather_csv_path = Path(weather_csv_path).expanduser().resolve()
+        all_times = np.arange(self.total_steps, dtype=np.int64)
+        self.hour_table, self.day_of_week_table = _calendar_features(all_times)
+
         self.daily_values, self.daily_mask = self._make_lag_table(self.daily_lag_values)
         self.weekly_values, self.weekly_mask = self._make_lag_table(self.weekly_lag_values)
+        self.daily_context = self._make_lag_context(self.daily_lag_values)
+        self.weekly_context = self._make_lag_context(self.weekly_lag_values)
+
+    def _make_lag_context(self, lags: np.ndarray) -> dict[str, np.ndarray]:
+        """lag 시점별 날씨/캘린더를 ``[T, L, ...]``로 미리 만든다.
+
+        무효 lag(``source_time < 0``)는 ``_make_lag_table``이 수요를 0으로 채우는 것과 같은
+        방식으로 0을 채운다. 어차피 PeriodicLSTMEncoder의 compaction에서 제외되지만,
+        ``safe_times`` clip 때문에 그냥 두면 엉뚱한 시점의 값이 들어가므로 방어적으로 지운다.
+        """
+
+        source_times = np.arange(self.total_steps, dtype=np.int64)[:, None] - lags[None, :]
+        valid = source_times >= 0
+        safe_times = np.clip(source_times, 0, self.total_steps - 1)
+
+        weather = np.where(valid[..., None], self.weather[safe_times], 0.0).astype(np.float32)
+        hour = np.where(valid, self.hour_table[safe_times], 0).astype(np.int64)
+        day_of_week = np.where(valid, self.day_of_week_table[safe_times], 0).astype(np.int64)
+        return {
+            "weather": np.ascontiguousarray(weather),
+            "hour": np.ascontiguousarray(hour),
+            "day_of_week": np.ascontiguousarray(day_of_week),
+        }
 
     def _make_lag_table(self, lags: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         source_times = np.arange(self.total_steps, dtype=np.int64)[:, None] - lags[None, :]
@@ -176,6 +252,14 @@ class UnifiedDemandDataset(Dataset):
         target_time = int(self.indices[item])
         history = self.grid[target_time - self.time_step : target_time]
         target = self.grid[target_time]
+
+        # 날씨는 수요 윈도우보다 한 칸 밀린 [t-k+1, t+1)을 쓴다 — 예측 시점 t의 날씨까지 포함하는
+        # 의도적 설계로, ir-weather가 채택한 "단기 날씨 예보는 이미 안다"는 가정을 그대로 따른다
+        # (수요를 미리 아는 것과는 다름). 캘린더는 예보가 필요 없으므로 수요와 같은 [t-k, t)를 쓴다.
+        recent_weather = self.weather[target_time - self.time_step + 1 : target_time + 1]
+        recent_times = np.arange(target_time - self.time_step, target_time, dtype=np.int64)
+        recent_hour, recent_day_of_week = _calendar_features(recent_times)
+
         return {
             "demand_history": torch.from_numpy(np.array(history, dtype=np.float32, copy=True)),
             "daily_demand": torch.from_numpy(self.daily_values[target_time]),
@@ -184,6 +268,15 @@ class UnifiedDemandDataset(Dataset):
             "weekly_mask": torch.from_numpy(self.weekly_mask[target_time]),
             "target": torch.from_numpy(np.array(target, dtype=np.float32, copy=True)),
             "sample_idx": torch.tensor(target_time, dtype=torch.long),
+            "weather": torch.from_numpy(np.array(recent_weather, dtype=np.float32, copy=True)),
+            "hour_of_day": torch.from_numpy(recent_hour),
+            "day_of_week": torch.from_numpy(recent_day_of_week),
+            "daily_weather": torch.from_numpy(self.daily_context["weather"][target_time]),
+            "daily_hour": torch.from_numpy(self.daily_context["hour"][target_time]),
+            "daily_day_of_week": torch.from_numpy(self.daily_context["day_of_week"][target_time]),
+            "weekly_weather": torch.from_numpy(self.weekly_context["weather"][target_time]),
+            "weekly_hour": torch.from_numpy(self.weekly_context["hour"][target_time]),
+            "weekly_day_of_week": torch.from_numpy(self.weekly_context["day_of_week"][target_time]),
         }
 
     @property
@@ -195,4 +288,4 @@ class UnifiedDemandDataset(Dataset):
         return self.bounds.val_end
 
 
-__all__ = ["UnifiedDemandDataset", "resolve_dataset_path"]
+__all__ = ["UnifiedDemandDataset", "load_weather_table", "resolve_dataset_path"]

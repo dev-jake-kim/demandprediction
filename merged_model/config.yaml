@@ -1,8 +1,11 @@
 datasets:
   ulsan:
     path: data/raw/ulsan_temporal_grid.npy
+    # cp949 인코딩, 기온/강수량/적설 컬럼 필요. mm_data/ 쪽 CSV는 ulsan에 적설이 없어 쓰면 안 된다.
+    weather_path: data/raw/ulsan_meteorological_data.csv
   porto:
     path: data/raw/porto_temporal_grid.npy
+    weather_path: data/raw/porto_meteorological_data.csv
 
 data:
   time_step: 24
@@ -27,6 +30,10 @@ model:
   dropout: 0.10
   retrieval_k: 20
   retrieval_chunk_size: 256
+  # 요일/시간대 임베딩 차원. 날씨는 임베딩하지 않고 정규화한 3값을 그대로 concat하므로,
+  # 세 LSTM에 붙는 보조 텐서는 3 + weekday_dim + hour_dim = 15차원이 된다.
+  weekday_dim: 7
+  hour_dim: 5
 
 training:
   seed: 2026

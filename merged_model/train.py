@@ -7,7 +7,7 @@ import json
 import random
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.yaml"))
     parser.add_argument("--dataset", choices=("ulsan", "porto"), default="ulsan")
     parser.add_argument("--data-path", type=Path, default=None)
+    parser.add_argument("--weather-path", type=Path, default=None)
     parser.add_argument("--device", default="auto", help="auto, cpu, or cuda:0")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--patience", type=int, default=None)
@@ -143,6 +144,8 @@ def build_model(
     data_path: Path,
     train_end: int,
     retrieval_scope: str,
+    weather_mean: Sequence[float],
+    weather_std: Sequence[float],
 ) -> UnifiedDemandModel:
     model_cfg = cfg.get("model", {})
     data_kwargs = build_dataset_kwargs(cfg)
@@ -165,6 +168,10 @@ def build_model(
         retrieval_chunk_size=int(model_cfg.get("retrieval_chunk_size", 256)),
         retrieval_scope=retrieval_scope,
         retrieval_train_end=train_end,
+        weather_mean=weather_mean,
+        weather_std=weather_std,
+        weekday_dim=int(model_cfg.get("weekday_dim", 7)),
+        hour_dim=int(model_cfg.get("hour_dim", 5)),
     )
 
 
@@ -179,7 +186,16 @@ def main() -> None:
     dataset_cfg = cfg.get("datasets", {}).get(args.dataset, {})
     configured_path = args.data_path if args.data_path is not None else dataset_cfg.get("path")
     data_path = resolve_dataset_path(args.dataset, configured_path)
+    weather_path = args.weather_path if args.weather_path is not None else dataset_cfg.get("weather_path")
+    if weather_path is None:
+        raise ValueError(
+            f"datasets.{args.dataset}.weather_path가 설정에 없음 — --weather-path로 주거나 config.yaml에 추가할 것"
+        )
+    weather_path = Path(weather_path).expanduser()
+    if not weather_path.is_absolute():
+        weather_path = Path.cwd() / weather_path
     dataset_kwargs = build_dataset_kwargs(cfg)
+    dataset_kwargs["weather_csv_path"] = weather_path
     if args.train_ratio is not None:
         dataset_kwargs["train_ratio"] = args.train_ratio
     if args.val_ratio is not None:
@@ -187,6 +203,12 @@ def main() -> None:
     train_set = UnifiedDemandDataset(data_path, "train", **dataset_kwargs)
     val_set = UnifiedDemandDataset(data_path, "val", **dataset_kwargs)
     test_set = UnifiedDemandDataset(data_path, "test", **dataset_kwargs)
+
+    # 날씨 정규화 통계는 train 구간에서만 계산한다(시간 리크 방지) — ir-weather의 train.py와 동일 패턴.
+    # 적설처럼 train 내내 값이 고정(분산 0)인 피처가 있어 std에 하한을 둔다(porto 적설이 실제로 그렇다).
+    train_weather = train_set.weather[train_set.time_step : train_set.train_end]
+    weather_mean = train_weather.mean(axis=0)
+    weather_std = train_weather.std(axis=0).clip(min=1e-6)
 
     batch_size = int(args.batch_size if args.batch_size is not None else train_cfg.get("batch_size", 2))
     workers = int(args.num_workers if args.num_workers is not None else train_cfg.get("num_workers", 0))
@@ -208,6 +230,8 @@ def main() -> None:
         data_path=data_path,
         train_end=train_set.train_end,
         retrieval_scope=retrieval_scope,
+        weather_mean=weather_mean.tolist(),
+        weather_std=weather_std.tolist(),
     ).to(device)
     lr = float(args.lr if args.lr is not None else train_cfg.get("lr", 1e-3))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=float(train_cfg.get("weight_decay", 1e-4)))
@@ -224,6 +248,9 @@ def main() -> None:
                 "device": str(device),
                 "retrieval_scope": retrieval_scope,
                 "objective": "MAE",
+                "weather_path": str(weather_path),
+                "weather_mean": weather_mean.tolist(),
+                "weather_std": weather_std.tolist(),
             },
             ensure_ascii=False,
         )
@@ -263,6 +290,9 @@ def main() -> None:
     result = {
         "dataset": args.dataset,
         "data_path": str(data_path),
+        "weather_path": str(weather_path),
+        "weather_mean": weather_mean.tolist(),
+        "weather_std": weather_std.tolist(),
         "device": str(device),
         "retrieval_scope": retrieval_scope,
         "objective": "MAE",

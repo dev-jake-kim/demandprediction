@@ -27,8 +27,11 @@ class LocalHistoryEncoder(nn.Module):
         transformer_ffn: int,
         history_hidden: int,
         dropout: float,
+        extra_dim: int = 0,
     ) -> None:
         super().__init__()
+        if extra_dim < 0:
+            raise ValueError("extra_dim must be non-negative")
         self.height = height
         self.width = width
         self.num_nodes = height * width
@@ -36,6 +39,7 @@ class LocalHistoryEncoder(nn.Module):
         self.local_radius = local_radius
         self.window_size = 2 * local_radius + 1
         self.num_neighbors = self.window_size * self.window_size
+        self.extra_dim = extra_dim
 
         self.register_buffer("neighbor_valid", self._make_neighbor_valid(), persistent=False)
         self.scalar_embedding = FourierScalarEmbedding(d_model, num_fourier_bands)
@@ -57,7 +61,7 @@ class LocalHistoryEncoder(nn.Module):
             num_layers=transformer_layers,
             enable_nested_tensor=False,
         )
-        self.history_lstm = nn.LSTM(d_model, history_hidden, batch_first=True)
+        self.history_lstm = nn.LSTM(d_model + extra_dim, history_hidden, batch_first=True)
 
     def _make_neighbor_valid(self) -> Tensor:
         valid = np.zeros((self.num_nodes, self.num_neighbors), dtype=bool)
@@ -87,11 +91,18 @@ class LocalHistoryEncoder(nn.Module):
         patches = F.unfold(padded, kernel_size=self.window_size)
         return patches.transpose(1, 2).reshape(batch, steps, self.num_nodes, self.num_neighbors)
 
-    def forward(self, demands: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, demands: Tensor, extra: Tensor | None = None) -> tuple[Tensor, Tensor]:
         local_crop = self.crop(demands)
         batch, steps, nodes, neighbors = local_crop.shape
         if steps != self.time_step or nodes != self.num_nodes or neighbors != self.num_neighbors:
             raise ValueError("Unexpected local crop shape")
+        if self.extra_dim > 0:
+            if extra is None:
+                raise ValueError(f"extra_dim={self.extra_dim}인데 extra가 None임")
+            if extra.shape != (batch, steps, self.extra_dim):
+                raise ValueError(f"extra must be [B,k,{self.extra_dim}], got {tuple(extra.shape)}")
+        elif extra is not None:
+            raise ValueError("extra_dim=0인데 extra가 주어짐")
 
         valid = self.neighbor_valid.to(device=local_crop.device)
         log_values = torch.log1p(torch.clamp(local_crop, min=0.0)).unsqueeze(-1)
@@ -106,6 +117,16 @@ class LocalHistoryEncoder(nn.Module):
         encoded = self.transformer(tokens.reshape(batch * steps * nodes, 1 + neighbors, -1))
         cls = encoded[:, 0].reshape(batch, steps, nodes, -1)
         sequence = cls.permute(0, 2, 1, 3).reshape(batch * nodes, steps, -1)
+
+        # 날씨/캘린더는 노드에 무관하므로 [B,k,E]를 노드 축으로 브로드캐스트해 LSTM 입력에 붙인다.
+        if self.extra_dim > 0:
+            expanded_extra = (
+                extra[:, None, :, :]
+                .expand(batch, nodes, steps, self.extra_dim)
+                .reshape(batch * nodes, steps, self.extra_dim)
+            )
+            sequence = torch.cat([sequence, expanded_extra], dim=-1)
+
         _, (hidden, _) = self.history_lstm(sequence)
         return local_crop, hidden[-1].reshape(batch, nodes, -1)
 
