@@ -90,7 +90,10 @@ def run_epoch(
     model.train(training)
     total_abs = 0.0
     total_sq = 0.0
+    total_relative_plus1 = 0.0
+    total_relative_nonzero = 0.0
     total_count = 0
+    nonzero_count = 0
     batches = 0
 
     for batch_index, raw_batch in enumerate(loader):
@@ -107,9 +110,21 @@ def run_epoch(
                 clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
 
-        error = output["prediction"] - batch["target"]
-        total_abs += error.detach().abs().sum().item()
+        target_values = batch["target"]
+        error = output["prediction"] - target_values
+        absolute_error = error.detach().abs()
+        total_abs += absolute_error.sum().item()
         total_sq += error.detach().square().sum().item()
+        # MAPE(+1): 저장소 공용 지표(models/metrics.py의 compute_regression_metrics)와 같은 식.
+        # 수요 0인 셀이 많아 분모에 +1 스무딩을 넣은 변형이라 표준 MAPE가 아니다.
+        total_relative_plus1 += (absolute_error / (target_values.abs() + 1.0)).sum().item()
+        # MAPE(0제외): 실제 수요가 0인 셀을 분자/분모 양쪽에서 빼고 계산한 것.
+        nonzero = target_values != 0
+        if bool(nonzero.any()):
+            total_relative_nonzero += (
+                absolute_error[nonzero] / target_values[nonzero].abs()
+            ).sum().item()
+            nonzero_count += int(nonzero.sum().item())
         total_count += error.numel()
         batches += 1
 
@@ -118,6 +133,10 @@ def run_epoch(
     return {
         "mae": total_abs / total_count,
         "rmse": float(np.sqrt(total_sq / total_count)),
+        "mape_plus1": total_relative_plus1 / total_count * 100.0,
+        "mape_excl_zero": (
+            total_relative_nonzero / nonzero_count * 100.0 if nonzero_count else float("nan")
+        ),
         "batches": float(batches),
     }
 
@@ -309,7 +328,32 @@ def main() -> None:
     output_path = output_path.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # best_state를 디스크에도 남긴다 — 이게 없으면 나중에 지표를 하나 더 재려고 할 때
+    # 전체 재학습이 필요해진다(실제로 MAPE를 추가할 때 그 비용을 치렀다).
+    # 재현에 필요한 설정도 함께 저장해 체크포인트만으로 모델을 되살릴 수 있게 한다.
+    checkpoint_path = output_path.with_suffix(".pt")
+    torch.save(
+        {
+            "state_dict": best_state,
+            "dataset": args.dataset,
+            "data_path": str(data_path),
+            "weather_path": str(weather_path),
+            "weather_mean": weather_mean.tolist(),
+            "weather_std": weather_std.tolist(),
+            "model_config": cfg.get("model", {}),
+            "dataset_kwargs": {
+                key: (str(value) if isinstance(value, Path) else value)
+                for key, value in dataset_kwargs.items()
+            },
+            "retrieval_scope": retrieval_scope,
+            "seed": seed,
+            "best_epoch": best_epoch,
+        },
+        checkpoint_path,
+    )
     print(f"result_json={output_path}")
+    print(f"checkpoint={checkpoint_path}")
 
 
 if __name__ == "__main__":
