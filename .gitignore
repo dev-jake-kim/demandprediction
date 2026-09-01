@@ -9,6 +9,9 @@ checkpoints/
 multirun
 outputs
 data/
+# merged_model이 참조용으로 들고 온 데이터 사본 — temporal_grid npy가 data/raw와
+# 바이트 단위로 동일함을 확인했고(14MB), data/가 이미 제외 대상이라 같이 제외한다.
+mm_data/
 .omc/
 preprocessing/**/raw/
 preprocessing/**/output/

@@ -1,0 +1,39 @@
+datasets:
+  ulsan:
+    path: data/raw/ulsan_temporal_grid.npy
+  porto:
+    path: data/raw/porto_temporal_grid.npy
+
+data:
+  time_step: 24
+  daily_period: 24
+  daily_lags: 6
+  weekly_period: 168
+  weekly_lags: 4
+  lag_radius: 0
+  train_ratio: 0.80
+  val_ratio: 0.10
+
+model:
+  local_radius: 2
+  d_model: 64
+  num_fourier_bands: 8
+  transformer_layers: 2
+  transformer_heads: 4
+  transformer_ffn: 128
+  history_hidden: 64
+  periodic_hidden: 64
+  fusion_dim: 128
+  dropout: 0.10
+  retrieval_k: 20
+  retrieval_chunk_size: 256
+
+training:
+  seed: 2026
+  batch_size: 8
+  num_workers: 0
+  lr: 0.001
+  weight_decay: 0.0001
+  epochs: 2000
+  patience: 20
+  retrieval_scope: observed_past

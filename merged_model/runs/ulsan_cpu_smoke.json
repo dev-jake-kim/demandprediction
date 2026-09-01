@@ -1,0 +1,29 @@
+{
+  "dataset": "ulsan",
+  "data_path": "/home/jinu/lab/research_700x700/comparison_models/data/ulsan/ulsan_temporal_grid.npy",
+  "device": "cpu",
+  "retrieval_scope": "observed_past",
+  "objective": "MAE",
+  "best_epoch": 1,
+  "best_val_mae": 0.5439154307047526,
+  "test": {
+    "mae": 0.49019763583228704,
+    "rmse": 0.8253428155627408,
+    "batches": 1.0
+  },
+  "history": [
+    {
+      "epoch": 1,
+      "train": {
+        "mae": 0.6232588631766183,
+        "rmse": 0.8693730826694794,
+        "batches": 1.0
+      },
+      "val": {
+        "mae": 0.5439154307047526,
+        "rmse": 0.9307310819523555,
+        "batches": 1.0
+      }
+    }
+  ]
+}
