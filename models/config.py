@@ -34,6 +34,7 @@ class ADFormerConfig(PretrainedConfig):
         cluster_map_path: str | None = None,
         demand_mean: float = 0.0,
         demand_std: float = 1.0,
+        loss_type: str = 'combined',
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
         **kwargs,
@@ -58,6 +59,10 @@ class ADFormerConfig(PretrainedConfig):
         self.cluster_map_path = cluster_map_path
         self.demand_mean = demand_mean
         self.demand_std = demand_std
+        # 'combined'(기본, CombinedLoss=제곱오차+gamma*상대오차제곱) 또는 'mae'(L1).
+        # 'mae'는 ADFormer 논문 공식 구현의 목적함수(raw 스케일 F.l1_loss)와 맞추기 위한
+        # 옵션 — loss_gamma/loss_eps는 무시된다.
+        self.loss_type = loss_type
         self.loss_gamma = loss_gamma
         self.loss_eps = loss_eps
         super().__init__(**kwargs)

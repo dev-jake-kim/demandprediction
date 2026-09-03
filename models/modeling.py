@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel
 
 from .config import ADFormerConfig
-from .losses import CombinedLoss
+from .losses import build_loss
 
 EXT_DIM = 8  # time_in_day(1) + day_of_week one-hot(7)
 
@@ -389,7 +389,7 @@ class ADFormerModel(PreTrainedModel):
         self.end_conv1 = nn.Conv2d(config.time_step, 1, kernel_size=1, bias=True)  # window -> horizon(1)
         self.end_conv2 = nn.Conv2d(config.skip_dim, 1, kernel_size=1, bias=True)  # skip_dim -> output_dim(1)
 
-        self.loss_fn = CombinedLoss(gamma=config.loss_gamma, eps=config.loss_eps)
+        self.loss_fn = build_loss(config)
 
         self.post_init()
 
