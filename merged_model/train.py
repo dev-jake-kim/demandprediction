@@ -1,4 +1,9 @@
-"""Train and validate the unified model with one MAE objective."""
+"""Train and validate the unified model with one end-to-end objective.
+
+The objective is selectable: ``combined`` (this repository's shared
+``CombinedLoss``, so merged_model is comparable to every other branch) or
+``mae`` (the original raw-scale L1 this model was first trained with).
+"""
 
 from __future__ import annotations
 
@@ -45,6 +50,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument(
+        "--loss-type",
+        choices=("combined", "mae"),
+        default=None,
+        help="combined: 저장소 공용 CombinedLoss(다른 모델과 동일) | mae: 원래의 raw 스케일 L1",
+    )
     parser.add_argument("--retrieval-scope", choices=("observed_past", "train_prefix"), default=None)
     parser.add_argument("--train-ratio", type=float, default=None)
     parser.add_argument("--val-ratio", type=float, default=None)
@@ -88,6 +99,7 @@ def run_epoch(
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
+    total_loss = 0.0
     total_abs = 0.0
     total_sq = 0.0
     total_relative_plus1 = 0.0
@@ -110,6 +122,7 @@ def run_epoch(
                 clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
 
+        total_loss += output["loss_sum"].item()
         target_values = batch["target"]
         error = output["prediction"] - target_values
         absolute_error = error.detach().abs()
@@ -131,6 +144,9 @@ def run_epoch(
     if total_count == 0:
         raise RuntimeError("No batches were processed")
     return {
+        # 학습에 실제로 쓰인 목적함수의 원소 평균. 조기 종료/최적 체크포인트 선택 기준이며,
+        # loss_type=mae일 때는 아래 "mae"와 정확히 같은 값이 된다.
+        "loss": total_loss / total_count,
         "mae": total_abs / total_count,
         "rmse": float(np.sqrt(total_sq / total_count)),
         "mape_plus1": total_relative_plus1 / total_count * 100.0,
@@ -165,6 +181,7 @@ def build_model(
     retrieval_scope: str,
     weather_mean: Sequence[float],
     weather_std: Sequence[float],
+    loss_type: str,
 ) -> UnifiedDemandModel:
     model_cfg = cfg.get("model", {})
     data_kwargs = build_dataset_kwargs(cfg)
@@ -191,6 +208,9 @@ def build_model(
         weather_std=weather_std,
         weekday_dim=int(model_cfg.get("weekday_dim", 7)),
         hour_dim=int(model_cfg.get("hour_dim", 5)),
+        loss_type=loss_type,
+        loss_gamma=float(cfg.get("training", {}).get("loss_gamma", 1.0)),
+        loss_eps=float(cfg.get("training", {}).get("loss_eps", 0.5)),
     )
 
 
@@ -242,6 +262,7 @@ def main() -> None:
     test_loader = DataLoader(test_set, shuffle=False, drop_last=False, **loader_kwargs)
 
     retrieval_scope = args.retrieval_scope or train_cfg.get("retrieval_scope", "observed_past")
+    loss_type = args.loss_type or str(train_cfg.get("loss_type", "combined"))
     model = build_model(
         cfg,
         height=train_set.height,
@@ -251,6 +272,7 @@ def main() -> None:
         retrieval_scope=retrieval_scope,
         weather_mean=weather_mean.tolist(),
         weather_std=weather_std.tolist(),
+        loss_type=loss_type,
     ).to(device)
     lr = float(args.lr if args.lr is not None else train_cfg.get("lr", 1e-3))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=float(train_cfg.get("weight_decay", 1e-4)))
@@ -266,7 +288,8 @@ def main() -> None:
                 "split": {"train_end": train_set.train_end, "val_end": train_set.val_end},
                 "device": str(device),
                 "retrieval_scope": retrieval_scope,
-                "objective": "MAE",
+                "objective": loss_type,
+                "seed": seed,
                 "weather_path": str(weather_path),
                 "weather_mean": weather_mean.tolist(),
                 "weather_std": weather_std.tolist(),
@@ -290,8 +313,10 @@ def main() -> None:
         history.append(record)
         print(json.dumps(record, ensure_ascii=False))
 
-        if val_metrics["mae"] < best_val:
-            best_val = val_metrics["mae"]
+        # 선택 기준은 학습에 쓴 목적함수 자체 — 저장소 공용 하네스의
+        # metric_for_best_model="loss"와 같은 규약이다. loss_type=mae면 이전과 동일하게 MAE다.
+        if val_metrics["loss"] < best_val:
+            best_val = val_metrics["loss"]
             best_epoch = epoch
             stale = 0
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
@@ -314,9 +339,10 @@ def main() -> None:
         "weather_std": weather_std.tolist(),
         "device": str(device),
         "retrieval_scope": retrieval_scope,
-        "objective": "MAE",
+        "objective": loss_type,
+        "seed": seed,
         "best_epoch": best_epoch,
-        "best_val_mae": best_val,
+        "best_val_loss": best_val,
         "test": test_metrics,
         "history": history,
     }
@@ -347,6 +373,7 @@ def main() -> None:
                 for key, value in dataset_kwargs.items()
             },
             "retrieval_scope": retrieval_scope,
+            "loss_type": loss_type,
             "seed": seed,
             "best_epoch": best_epoch,
         },

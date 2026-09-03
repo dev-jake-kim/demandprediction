@@ -44,3 +44,9 @@ training:
   epochs: 2000
   patience: 20
   retrieval_scope: observed_past
+  # 'combined'이면 저장소 공용 CombinedLoss(다른 모든 브랜치와 동일한 목적함수),
+  # 'mae'이면 merged_model이 원래 쓰던 raw 스케일 L1. loss_gamma/loss_eps는 combined 전용이며
+  # 값도 저장소 공용 설정(configs/model/*.yaml)과 같다.
+  loss_type: combined
+  loss_gamma: 1.0
+  loss_eps: 0.5

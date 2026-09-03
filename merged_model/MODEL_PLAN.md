@@ -22,6 +22,10 @@ neural branch는 이 모델 내부에서 attention으로 결합하고, retrieval
 - normalization: another_model 형식의 `log1p` 기반 입력
 - retrieval value: raw demand 사용
 - 최종 loss: **MAE만 사용**
+  - **구현상의 편차**: 이후 저장소의 다른 모델들과 목적함수를 맞춰 비교하려고
+    `training.loss_type`(`combined` | `mae`) 스위치를 추가했다. 기본값은 `combined`
+    (저장소 공용 `CombinedLoss`)이고, `mae`가 이 문서가 원래 규정한 목적함수다.
+    자세한 내용은 `README.md`의 "Objective" 절을 참고.
 - optimizer, forward, checkpoint: 하나
 
 ## 2. 최종 채택 구조 Mermaid

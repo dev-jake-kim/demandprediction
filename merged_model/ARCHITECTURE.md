@@ -14,7 +14,8 @@ dataset or training loop.
 | Path | Responsibility | Typical changes |
 | --- | --- | --- |
 | `data.py` | temporal-grid loading, split, lag tables, invalid masks, weather/calendar tables | time split, lag count, `lag_radius`, weather source |
-| `model.py` | branch wiring, weather/calendar context assembly, raw-scale MAE contract | tensor flow or output keys |
+| `model.py` | branch wiring, weather/calendar context assembly, raw-scale loss contract | tensor flow or output keys |
+| `losses.py` | the two selectable objectives (`combined`, `mae`); port of the shared `models/losses.py` | the objective itself |
 | `modules/embeddings.py` | scalar/Fourier token embedding | scalar feature encoding |
 | `modules/history.py` | local crop, EDGE/CLS tokens, Transformer, history LSTM (context concatenated) | another neural branch |
 | `modules/periodic.py` | daily/weekly LSTM, invalid-lag compaction, context concatenation | periodic encoders |
@@ -33,7 +34,8 @@ dataset or training loop.
 merged_model/
 ├── data.py                 # temporal-grid Dataset
 ├── model.py                # one UnifiedDemandModel graph
-├── train.py                # one MAE training entry point
+├── losses.py               # combined | mae objectives
+├── train.py                # single-objective training entry point
 ├── validate.py             # fast pre-training checks
 ├── modules/                # independently maintainable model blocks
 │   ├── embeddings.py
@@ -64,7 +66,7 @@ h_neural → query
 [h_daily, h_weekly, h_neural] → key/value candidates → branch attention → h_attn
 
 raw local crop + absolute sample_idx → CausalRetrieval → ir_out
-h_attn + ir_out → NeuralRetrievalGate → prediction → MAE(target)
+h_attn + ir_out → NeuralRetrievalGate → prediction → loss(target)   # combined | mae
 ```
 
 The daily/weekly masks are applied twice: valid lags are compacted before the

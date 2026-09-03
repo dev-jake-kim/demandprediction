@@ -57,6 +57,7 @@ def _check_dataset(name: str, cfg: dict, device: torch.device) -> dict:
         retrieval_scope="observed_past",
         weather_mean=weather_mean.tolist(),
         weather_std=weather_std.tolist(),
+        loss_type=str(cfg.get("training", {}).get("loss_type", "combined")),
     ).to(device)
     model.eval()
     with torch.no_grad():
@@ -131,6 +132,7 @@ def _check_dataset(name: str, cfg: dict, device: torch.device) -> dict:
             "weekly": model.weekly_branch.lstm.input_size,
         },
         "weather_sensitivity": weather_sensitivity,
+        "loss_type": model.loss_type,
         "all_pass": True,
     }
 

@@ -1,7 +1,7 @@
 """High-level orchestration for the unified demand model.
 
 Branch-specific code lives in :mod:`components`; this file intentionally
-contains only model construction, data flow, and the final MAE calculation.
+contains only model construction, data flow, and the final loss calculation.
 """
 
 from __future__ import annotations
@@ -11,9 +11,9 @@ from typing import Literal, Sequence
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
 
 from .data import NUM_WEATHER_FEATURES
+from .losses import build_loss
 from .modules import (
     BranchAttention,
     CausalRetrieval,
@@ -51,6 +51,9 @@ class UnifiedDemandModel(nn.Module):
         weather_std: Sequence[float] | None = None,
         weekday_dim: int = 7,
         hour_dim: int = 5,
+        loss_type: str = "combined",
+        loss_gamma: float = 1.0,
+        loss_eps: float = 0.5,
     ) -> None:
         super().__init__()
         if height <= 0 or width <= 0:
@@ -124,6 +127,11 @@ class UnifiedDemandModel(nn.Module):
             retrieval_train_end=retrieval_train_end,
         )
         self.output_gate = NeuralRetrievalGate(fusion_dim)
+        # 이 저장소의 다른 모델들과 목적함수를 맞추려면 'combined'(CombinedLoss)를 쓴다.
+        # 'mae'는 merged_model이 원래 쓰던 raw 스케일 L1이며, 두 경우 모두 reduction='none'
+        # 이라 아래 forward에서 mean/sum을 각각 뽑는다.
+        self.loss_type = loss_type
+        self.loss_fn = build_loss(loss_type, gamma=loss_gamma, eps=loss_eps)
 
     # Keep the old debugging entry points available while the implementation
     # is organized under named components.
@@ -193,7 +201,11 @@ class UnifiedDemandModel(nn.Module):
             "weekly_valid": weekly_valid,
         }
         if target is not None:
-            output["loss"] = F.l1_loss(prediction_grid, target)
+            # reduction='none'으로 한 번만 계산하고 mean(역전파용)과 sum(에폭 집계용)을 함께 낸다.
+            # 배치 크기가 균일하지 않아(drop_last=False) 배치 평균의 평균은 원소 평균과 다르다.
+            elementwise = self.loss_fn(prediction_grid, target)
+            output["loss"] = elementwise.mean()
+            output["loss_sum"] = elementwise.detach().sum()
         return output
 
 

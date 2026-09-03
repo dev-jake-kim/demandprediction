@@ -14,7 +14,7 @@ PyYAML. It does not call a paid API or hosted inference service. The neural
 backbone follows the architecture described by the public `ir` branch of
 [`dev-jake-kim/demandprediction`](https://github.com/dev-jake-kim/demandprediction/tree/ir),
 but the code here is a standalone PyTorch implementation so that the new
-daily/weekly fusion and MAE objective are explicit.
+daily/weekly fusion and the selectable objective are explicit.
 
 ## What is implemented
 
@@ -25,9 +25,34 @@ daily/weekly fusion and MAE objective are explicit.
   also as a key/value candidate;
 - raw causal cosine retrieval with `tau < target_time`, computed in CPU chunks;
 - another-style node-wise gate between neural and retrieval predictions;
-- one forward pass, one optimizer, and raw-scale MAE;
+- one forward pass, one optimizer, and one raw-scale objective
+  (`combined` or `mae` — see below);
 - weather and calendar features concatenated onto **all three** LSTM inputs;
 - no main recent branch.
+
+### Objective (`training.loss_type`)
+
+The model optimizes exactly one loss, chosen by `training.loss_type` in
+`config.yaml` or `--loss-type` on the command line:
+
+| Value | Loss | Why |
+| --- | --- | --- |
+| `combined` (default) | `CombinedLoss(gamma=1.0, eps=0.5)` = `(y-ŷ)² + gamma·((y-ŷ)/(y+eps))²` | The objective every other branch in this repository trains with, so merged_model numbers are directly comparable to the `docs/PROJECT_SUMMARY.md` table |
+| `mae` | raw-scale `L1` | The objective this model was originally specified and first trained with (`MODEL_PLAN.md`) |
+
+`merged_model/losses.py` is a port of the repository's shared
+`models/losses.py`; the two were checked to produce bit-identical values.
+Both losses are built with `reduction='none'` so the epoch aggregate is a true
+element mean rather than a mean of batch means (batches are uneven because
+`drop_last=False`).
+
+Early stopping and best-checkpoint selection use the **validation value of
+whichever loss is active**, matching the shared harness's
+`metric_for_best_model: loss`. Under `loss_type=mae` that value is identical to
+validation MAE, so runs recorded before this option existed reproduce exactly.
+
+Reported metrics (MAE / RMSE / MAPE(+1) / MAPE(0-excluded)) do not depend on
+`loss_type` — only the thing being minimized does.
 
 ### Weather and calendar features
 
@@ -75,9 +100,19 @@ CUDA_VISIBLE_DEVICES=0 python -m comparison_models.merged_model.train \
   --dataset ulsan --device cuda:0
 ```
 
-The configured defaults are `epochs=2000`, `patience=20`, `batch_size=8`, and
-`retrieval_scope=observed_past`. Override them explicitly when reproducing an
-experiment.
+The configured defaults are `epochs=2000`, `patience=20`, `batch_size=8`,
+`retrieval_scope=observed_past`, and `loss_type=combined`. Override them
+explicitly when reproducing an experiment.
+
+For a multi-seed sweep (the repository's shared five seeds), use the driver
+script — it skips runs whose result JSON already exists:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 ./merged_model/run_seeds.sh ulsan combined
+```
+
+`train.py` deliberately accepts only `--device cuda:0`; select a physical GPU
+with `CUDA_VISIBLE_DEVICES`.
 
 For a short smoke test:
 
