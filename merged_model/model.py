@@ -55,6 +55,7 @@ class UnifiedDemandModel(nn.Module):
         use_weekly: bool = True,
         use_retrieval: bool = True,
         use_weather: bool = True,
+        weather_injection: str = "concat",
         use_calendar: bool = True,
         use_branch_attention: bool = True,
         loss_type: str = "combined",
@@ -91,6 +92,13 @@ class UnifiedDemandModel(nn.Module):
         self.use_weekly = use_weekly
         self.use_retrieval = use_retrieval
         self.use_weather = use_weather
+        # 'concat': 정규화 3값을 세 LSTM 입력에 그대로 붙인다(기본).
+        # 'cls_add': ir-weather 방식 — d_model로 투영해 history의 CLS 토큰에 더한다.
+        #   이 경우 주기 브랜치에는 날씨가 들어가지 않는다(CLS가 거기엔 없다). 즉 주입 지점과
+        #   커버리지가 함께 바뀌는 변형이며, 그건 ir-weather 설계의 본질적 성질이다.
+        if weather_injection not in ("concat", "cls_add"):
+            raise ValueError(f"weather_injection은 'concat'|'cls_add' (받음: {weather_injection!r})")
+        self.weather_injection = weather_injection
         self.use_calendar = use_calendar
         self.use_branch_attention = use_branch_attention
 
@@ -105,7 +113,9 @@ class UnifiedDemandModel(nn.Module):
         else:
             self.weekday_embedding = None
             self.hour_embedding = None
-        self.extra_dim = (NUM_WEATHER_FEATURES if use_weather else 0) + (
+        weather_in_extra = use_weather and weather_injection == "concat"
+        self.weather_cls_dim = NUM_WEATHER_FEATURES if (use_weather and weather_injection == "cls_add") else 0
+        self.extra_dim = (NUM_WEATHER_FEATURES if weather_in_extra else 0) + (
             (weekday_dim + hour_dim) if use_calendar else 0
         )
 
@@ -133,6 +143,7 @@ class UnifiedDemandModel(nn.Module):
             history_hidden=history_hidden,
             dropout=dropout,
             extra_dim=self.extra_dim,
+            weather_cls_dim=self.weather_cls_dim,
         )
         self.periodic_hidden = periodic_hidden
         # 끈 브랜치는 만들지 않는다 — 만들어두면 gradient가 흐르지 않는 죽은 파라미터가
@@ -188,7 +199,7 @@ class UnifiedDemandModel(nn.Module):
         """
 
         parts: list[Tensor] = []
-        if self.use_weather:
+        if self.use_weather and self.weather_injection == "concat":
             parts.append((weather - self.weather_mean) / self.weather_std)
         if self.use_calendar:
             parts.append(self.weekday_embedding(day_of_week))
@@ -228,7 +239,10 @@ class UnifiedDemandModel(nn.Module):
         daily_extra = self._temporal_extra(daily_weather, daily_hour, daily_day_of_week)
         weekly_extra = self._temporal_extra(weekly_weather, weekly_hour, weekly_day_of_week)
 
-        local_crop, h_neural = self.local_history(demand_history, recent_extra)
+        weather_cls = (
+            (weather - self.weather_mean) / self.weather_std if self.weather_cls_dim else None
+        )
+        local_crop, h_neural = self.local_history(demand_history, recent_extra, weather_cls)
         # 끈 주기 브랜치는 "전 lag 무효"와 같게 취급한다 — BranchAttention의 null-option 마스킹이
         # 이미 그 경우를 처리하므로(검증됨) 어텐션 쪽에 별도 분기를 두지 않는다.
         if self.use_daily:

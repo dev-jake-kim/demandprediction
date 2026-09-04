@@ -28,10 +28,19 @@ class LocalHistoryEncoder(nn.Module):
         history_hidden: int,
         dropout: float,
         extra_dim: int = 0,
+        weather_cls_dim: int = 0,
     ) -> None:
         super().__init__()
         if extra_dim < 0:
             raise ValueError("extra_dim must be non-negative")
+        if weather_cls_dim < 0:
+            raise ValueError("weather_cls_dim must be non-negative")
+        # >0이면 ir-weather 방식 — 정규화 날씨를 d_model로 투영해 CLS 토큰에 더한다.
+        # LSTM 입력 concat과 배타적으로 쓴다(둘 다 켜면 같은 정보가 두 경로로 들어간다).
+        self.weather_cls_dim = weather_cls_dim
+        self.weather_projection = (
+            nn.Linear(weather_cls_dim, d_model) if weather_cls_dim > 0 else None
+        )
         self.height = height
         self.width = width
         self.num_nodes = height * width
@@ -91,7 +100,12 @@ class LocalHistoryEncoder(nn.Module):
         patches = F.unfold(padded, kernel_size=self.window_size)
         return patches.transpose(1, 2).reshape(batch, steps, self.num_nodes, self.num_neighbors)
 
-    def forward(self, demands: Tensor, extra: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        demands: Tensor,
+        extra: Tensor | None = None,
+        weather_cls: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         local_crop = self.crop(demands)
         batch, steps, nodes, neighbors = local_crop.shape
         if steps != self.time_step or nodes != self.num_nodes or neighbors != self.num_neighbors:
@@ -112,7 +126,13 @@ class LocalHistoryEncoder(nn.Module):
 
         cls_token = self.special_embedding.weight[0].view(1, 1, 1, 1, -1)
         cls_token = cls_token + self.node_embedding.view(1, 1, nodes, 1, -1)
-        tokens = torch.cat([cls_token.expand(batch, steps, -1, -1, -1), value_tokens], dim=3)
+        cls_token = cls_token.expand(batch, steps, -1, -1, -1)
+        if self.weather_projection is not None:
+            if weather_cls is None:
+                raise ValueError("weather_cls_dim>0인데 weather_cls가 None임")
+            # 날씨는 노드에 무관하므로 [B,k,d]를 노드/이웃 축으로 브로드캐스트해 CLS에만 더한다.
+            cls_token = cls_token + self.weather_projection(weather_cls)[:, :, None, None, :]
+        tokens = torch.cat([cls_token, value_tokens], dim=3)
         tokens = tokens + self.position_embedding.view(1, 1, 1, 1 + neighbors, -1)
         encoded = self.transformer(tokens.reshape(batch * steps * nodes, 1 + neighbors, -1))
         cls = encoded[:, 0].reshape(batch, steps, nodes, -1)

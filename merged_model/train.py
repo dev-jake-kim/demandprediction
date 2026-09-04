@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 
 # 이름 붙인 ablation 조합. 값은 UnifiedDemandModel의 use_* 플래그를 덮어쓴다.
 # "full"은 아무것도 끄지 않은 기본 모델 — 기존 *_mae_seed*.json 런과 동일한 설정이다.
-ABLATIONS: dict[str, dict[str, bool]] = {
+ABLATIONS: dict[str, dict[str, object]] = {
     "full": {},
     "no-ir": {"use_retrieval": False},
     "no-periodic": {"use_daily": False, "use_weekly": False},
@@ -33,6 +33,8 @@ ABLATIONS: dict[str, dict[str, bool]] = {
     "no-calendar": {"use_calendar": False},
     "no-extra": {"use_weather": False, "use_calendar": False},
     "no-branch-attn": {"use_branch_attention": False},
+    # 임베딩 방식 변형: 날씨를 LSTM concat 대신 ir-weather식으로 CLS에 더한다.
+    "weather-cls-add": {"weather_injection": "cls_add"},
 }
 
 if __package__ in {None, ""}:  # Allow both ``python train.py`` and ``python -m ...``.
