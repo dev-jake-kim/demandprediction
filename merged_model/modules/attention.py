@@ -11,8 +11,17 @@ from torch import Tensor, nn
 class BranchAttention(nn.Module):
     """Node-wise attention over branch tokens ``[daily, weekly, h_neural]``."""
 
-    def __init__(self, history_hidden: int, periodic_hidden: int, fusion_dim: int) -> None:
+    def __init__(
+        self,
+        history_hidden: int,
+        periodic_hidden: int,
+        fusion_dim: int,
+        use_attention: bool = True,
+    ) -> None:
         super().__init__()
+        # use_attention=False는 ablation용 — 학습된 query/key 대신 유효 브랜치를 균등 평균한다.
+        # 브랜치 자체는 그대로 두고 "선택 메커니즘"만 제거해야 기여도가 분리된다.
+        self.use_attention = use_attention
         self.neural_projection = nn.Linear(history_hidden, fusion_dim)
         self.daily_projection = nn.Linear(periodic_hidden, fusion_dim)
         self.weekly_projection = nn.Linear(periodic_hidden, fusion_dim)
@@ -48,8 +57,12 @@ class BranchAttention(nn.Module):
             ],
             dim=-1,
         )
-        scores = scores.masked_fill(~candidate_valid, torch.finfo(scores.dtype).min)
-        weights = torch.softmax(scores, dim=-1)
+        if self.use_attention:
+            scores = scores.masked_fill(~candidate_valid, torch.finfo(scores.dtype).min)
+            weights = torch.softmax(scores, dim=-1)
+        else:
+            uniform = candidate_valid.to(scores.dtype)
+            weights = uniform / uniform.sum(dim=-1, keepdim=True).clamp(min=1.0)
         fused = (weights.unsqueeze(-1) * values).sum(dim=2)
         return self.norm(z_neural + self.output_projection(fused)), weights
 

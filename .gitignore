@@ -22,3 +22,6 @@ docs/PROJECT_SUMMARY.md
 # merged_model 체크포인트(시드당 ~1MB). 결과 JSON은 provenance로 추적하되 가중치는
 # 로컬에만 둔다 — 시드/도시가 늘어날수록 저장소가 바이너리로 불어난다.
 merged_model/runs/*.pt
+
+# ablation 큐 러너의 런타임 상태 파일
+merged_model/.ablation_queue*

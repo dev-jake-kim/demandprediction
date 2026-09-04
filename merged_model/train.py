@@ -21,6 +21,20 @@ from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 
+# 이름 붙인 ablation 조합. 값은 UnifiedDemandModel의 use_* 플래그를 덮어쓴다.
+# "full"은 아무것도 끄지 않은 기본 모델 — 기존 *_mae_seed*.json 런과 동일한 설정이다.
+ABLATIONS: dict[str, dict[str, bool]] = {
+    "full": {},
+    "no-ir": {"use_retrieval": False},
+    "no-periodic": {"use_daily": False, "use_weekly": False},
+    "no-daily": {"use_daily": False},
+    "no-weekly": {"use_weekly": False},
+    "no-weather": {"use_weather": False},
+    "no-calendar": {"use_calendar": False},
+    "no-extra": {"use_weather": False, "use_calendar": False},
+    "no-branch-attn": {"use_branch_attention": False},
+}
+
 if __package__ in {None, ""}:  # Allow both ``python train.py`` and ``python -m ...``.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from comparison_models.merged_model.data import UnifiedDemandDataset, resolve_dataset_path
@@ -55,6 +69,12 @@ def parse_args() -> argparse.Namespace:
         choices=("combined", "mae"),
         default=None,
         help="combined: 저장소 공용 CombinedLoss(다른 모델과 동일) | mae: 원래의 raw 스케일 L1",
+    )
+    parser.add_argument(
+        "--ablation",
+        choices=tuple(ABLATIONS),
+        default="full",
+        help="끌 모듈 조합의 이름. full은 아무것도 끄지 않은 기본 모델",
     )
     parser.add_argument("--retrieval-scope", choices=("observed_past", "train_prefix"), default=None)
     parser.add_argument("--train-ratio", type=float, default=None)
@@ -182,6 +202,7 @@ def build_model(
     weather_mean: Sequence[float],
     weather_std: Sequence[float],
     loss_type: str,
+    ablation: str = "full",
 ) -> UnifiedDemandModel:
     model_cfg = cfg.get("model", {})
     data_kwargs = build_dataset_kwargs(cfg)
@@ -211,6 +232,7 @@ def build_model(
         loss_type=loss_type,
         loss_gamma=float(cfg.get("training", {}).get("loss_gamma", 1.0)),
         loss_eps=float(cfg.get("training", {}).get("loss_eps", 0.5)),
+        **ABLATIONS[ablation],
     )
 
 
@@ -273,6 +295,7 @@ def main() -> None:
         weather_mean=weather_mean.tolist(),
         weather_std=weather_std.tolist(),
         loss_type=loss_type,
+        ablation=args.ablation,
     ).to(device)
     lr = float(args.lr if args.lr is not None else train_cfg.get("lr", 1e-3))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=float(train_cfg.get("weight_decay", 1e-4)))
@@ -289,6 +312,7 @@ def main() -> None:
                 "device": str(device),
                 "retrieval_scope": retrieval_scope,
                 "objective": loss_type,
+                "ablation": args.ablation,
                 "seed": seed,
                 "weather_path": str(weather_path),
                 "weather_mean": weather_mean.tolist(),
@@ -340,6 +364,8 @@ def main() -> None:
         "device": str(device),
         "retrieval_scope": retrieval_scope,
         "objective": loss_type,
+        "ablation": args.ablation,
+        "ablation_flags": ABLATIONS[args.ablation],
         "seed": seed,
         "best_epoch": best_epoch,
         "best_val_loss": best_val,
@@ -374,6 +400,7 @@ def main() -> None:
             },
             "retrieval_scope": retrieval_scope,
             "loss_type": loss_type,
+            "ablation": args.ablation,
             "seed": seed,
             "best_epoch": best_epoch,
         },
