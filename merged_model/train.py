@@ -39,6 +39,9 @@ ABLATIONS: dict[str, dict[str, object]] = {
     "no-calendar": {"use_calendar": False},
     "no-extra": {"use_weather": False, "use_calendar": False},
     "no-branch-attn": {"use_branch_attention": False},
+    # (2a+1)^2 로컬 창에서 중앙(자기 노드)만 남기고 이웃 공간 정보를 끈다.
+    # 검색기 질의는 원래 크롭을 그대로 쓴다 — 인코더의 공간 정보만 분리해서 재려는 것이다.
+    "no-neighbors": {"use_neighbors": False},
     # 임베딩 방식 변형: 날씨를 LSTM concat 대신 ir-weather식으로 CLS에 더한다.
     "weather-cls-add": {"weather_injection": "cls_add"},
 }

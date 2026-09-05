@@ -13,12 +13,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 QUEUE="merged_model/.ablation_queue"
 LOCK="merged_model/.ablation_queue.lock"
-# 1시드 운영: 시드당 셀 하나가 6런 -> 2런으로 줄어 8개 셀 전부를 시간 안에 끝낼 수 있다.
-# 대신 셀 내부 표준오차를 못 재므로, 효과 크기는 full 5시드에서 측정한 시드 표준편차로 판정한다.
-SEEDS=(245)
+# 3시드 운영: 셀 내부에서 평균과 표준오차를 직접 낼 수 있다. 기준선 full은 기존 5시드 런을
+# 그대로 쓴다(0-치환 리팩터 후에도 소수점 16자리까지 재현됨을 확인).
+SEEDS=(245 6835 851)
 # 우선순위 순. 앞쪽 셀부터 완성되므로 중단 시점에 완결된 셀이 최대가 된다.
-ABLATIONS=(no-ir no-periodic no-weather no-calendar no-weekly no-daily no-extra no-branch-attn)
-# 상위 4개는 (a)1시드x8셀, (b)3시드x4셀 어느 계획에서도 필요하므로 먼저 돈다.
+ABLATIONS=(no-ir no-periodic no-extra no-branch-attn no-neighbors)
 
 case "${1:-}" in
   build)

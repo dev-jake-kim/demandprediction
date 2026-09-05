@@ -29,6 +29,7 @@ class LocalHistoryEncoder(nn.Module):
         dropout: float,
         extra_dim: int = 0,
         weather_cls_dim: int = 0,
+        use_neighbors: bool = True,
     ) -> None:
         super().__init__()
         if extra_dim < 0:
@@ -37,6 +38,9 @@ class LocalHistoryEncoder(nn.Module):
             raise ValueError("weather_cls_dim must be non-negative")
         # >0이면 ir-weather 방식 — 정규화 날씨를 d_model로 투영해 CLS 토큰에 더한다.
         # LSTM 입력 concat과 배타적으로 쓴다(둘 다 켜면 같은 정보가 두 경로로 들어간다).
+        # False면 (2a+1)^2 창에서 중앙(자기 노드)만 남기고 나머지 이웃 토큰을 0으로 바꾼다.
+        # 토큰 개수와 파라미터는 그대로라 '공간 이웃 정보'만 제거된다.
+        self.use_neighbors = use_neighbors
         self.weather_cls_dim = weather_cls_dim
         self.weather_projection = (
             nn.Linear(weather_cls_dim, d_model) if weather_cls_dim > 0 else None
@@ -123,6 +127,14 @@ class LocalHistoryEncoder(nn.Module):
         value_tokens = self.scalar_embedding(log_values)
         edge_token = self.special_embedding.weight[1].view(1, 1, 1, 1, -1)
         value_tokens = torch.where(valid.view(1, 1, nodes, neighbors, 1), value_tokens, edge_token)
+
+        if not self.use_neighbors:
+            # EDGE 치환까지 끝난 뒤에 0으로 만든다 — 격자 밖 이웃도 함께 0이 되어야
+            # "중앙 외 공간 정보 없음"이 균일하게 적용된다. unfold는 행 우선이라 홀수 창의
+            # 중앙은 항상 neighbors // 2다(a=2면 25개 중 12번).
+            keep = torch.zeros(neighbors, dtype=value_tokens.dtype, device=value_tokens.device)
+            keep[neighbors // 2] = 1.0
+            value_tokens = value_tokens * keep.view(1, 1, 1, neighbors, 1)
 
         cls_token = self.special_embedding.weight[0].view(1, 1, 1, 1, -1)
         cls_token = cls_token + self.node_embedding.view(1, 1, nodes, 1, -1)

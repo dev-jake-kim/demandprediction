@@ -58,6 +58,7 @@ class UnifiedDemandModel(nn.Module):
         weather_injection: str = "concat",
         use_calendar: bool = True,
         use_branch_attention: bool = True,
+        use_neighbors: bool = True,
         loss_type: str = "combined",
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
@@ -101,6 +102,7 @@ class UnifiedDemandModel(nn.Module):
         self.weather_injection = weather_injection
         self.use_calendar = use_calendar
         self.use_branch_attention = use_branch_attention
+        self.use_neighbors = use_neighbors
 
         # 날씨는 임베딩하지 않고 정규화한 3값을 그대로 LSTM 입력에 concat한다. 요일/시간대만
         # 임베딩 테이블을 쓰며, 세 브랜치가 같은 테이블을 공유한다(요일 3은 어느 브랜치에서나 요일 3).
@@ -140,6 +142,7 @@ class UnifiedDemandModel(nn.Module):
             dropout=dropout,
             extra_dim=self.extra_dim,
             weather_cls_dim=self.weather_cls_dim,
+            use_neighbors=use_neighbors,
         )
         self.periodic_hidden = periodic_hidden
         # ablation은 "0-치환" 방식이다 — 모듈을 없애지 않고 항상 생성·실행한 뒤, 그 모듈이
