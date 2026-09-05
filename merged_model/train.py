@@ -21,6 +21,12 @@ from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 
+# ablation 방식: 모듈을 지우지 않고, 그 모듈이 결과로 이어지는 텐서만 0으로 바꾼다.
+# 구조/파라미터 수/텐서 shape가 전부 보존되므로 측정된 차이가 "그 모듈의 정보" 때문임이
+# 분리된다. 예외는 no-branch-attn — 어텐션은 출력 텐서가 아니라 선택 메커니즘이라
+# 0-치환이 성립하지 않아(0으로 만들면 세 브랜치가 통째로 사라짐) 균등 가중으로 대체한다.
+ABLATION_MODE = "zero"
+
 # 이름 붙인 ablation 조합. 값은 UnifiedDemandModel의 use_* 플래그를 덮어쓴다.
 # "full"은 아무것도 끄지 않은 기본 모델 — 기존 *_mae_seed*.json 런과 동일한 설정이다.
 ABLATIONS: dict[str, dict[str, object]] = {
@@ -367,6 +373,7 @@ def main() -> None:
         "retrieval_scope": retrieval_scope,
         "objective": loss_type,
         "ablation": args.ablation,
+        "ablation_mode": ABLATION_MODE,
         "ablation_flags": ABLATIONS[args.ablation],
         "seed": seed,
         "best_epoch": best_epoch,

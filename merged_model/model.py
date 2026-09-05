@@ -104,19 +104,15 @@ class UnifiedDemandModel(nn.Module):
 
         # 날씨는 임베딩하지 않고 정규화한 3값을 그대로 LSTM 입력에 concat한다. 요일/시간대만
         # 임베딩 테이블을 쓰며, 세 브랜치가 같은 테이블을 공유한다(요일 3은 어느 브랜치에서나 요일 3).
-        # 끈 요소의 임베딩은 아예 만들지 않는다 — 죽은 파라미터가 state_dict에 남지 않게.
-        if use_calendar:
-            self.weekday_embedding = nn.Embedding(7, weekday_dim)
-            # ir-weather는 nn.Embedding(1440, d_model)에 hour*60 인덱스를 넣지만 실제로 학습되는 행은
-            # 24개뿐인 분(minute) 해상도 잔재다 — 동일 효과의 24행으로 단순화한다.
-            self.hour_embedding = nn.Embedding(24, hour_dim)
-        else:
-            self.weekday_embedding = None
-            self.hour_embedding = None
-        weather_in_extra = use_weather and weather_injection == "concat"
-        self.weather_cls_dim = NUM_WEATHER_FEATURES if (use_weather and weather_injection == "cls_add") else 0
-        self.extra_dim = (NUM_WEATHER_FEATURES if weather_in_extra else 0) + (
-            (weekday_dim + hour_dim) if use_calendar else 0
+        self.weekday_embedding = nn.Embedding(7, weekday_dim)
+        # ir-weather는 nn.Embedding(1440, d_model)에 hour*60 인덱스를 넣지만 실제로 학습되는 행은
+        # 24개뿐인 분(minute) 해상도 잔재다 — 동일 효과의 24행으로 단순화한다.
+        self.hour_embedding = nn.Embedding(24, hour_dim)
+        # 폭은 끄든 켜든 15로 고정 — 값만 0이 된다. 폭이 바뀌면 LSTM 파라미터 수가 달라져
+        # 정보 제거 효과와 용량 감소 효과가 섞인다.
+        self.weather_cls_dim = NUM_WEATHER_FEATURES if weather_injection == "cls_add" else 0
+        self.extra_dim = (
+            (NUM_WEATHER_FEATURES if weather_injection == "concat" else 0) + weekday_dim + hour_dim
         )
 
         weather_mean_tensor = torch.tensor(weather_mean, dtype=torch.float32)
@@ -146,35 +142,30 @@ class UnifiedDemandModel(nn.Module):
             weather_cls_dim=self.weather_cls_dim,
         )
         self.periodic_hidden = periodic_hidden
-        # 끈 브랜치는 만들지 않는다 — 만들어두면 gradient가 흐르지 않는 죽은 파라미터가
-        # state_dict에 남아 "껐다"는 사실이 체크포인트에서 드러나지 않는다.
-        self.daily_branch = (
-            PeriodicLSTMEncoder(periodic_hidden, extra_dim=self.extra_dim) if use_daily else None
-        )
-        self.weekly_branch = (
-            PeriodicLSTMEncoder(periodic_hidden, extra_dim=self.extra_dim) if use_weekly else None
-        )
+        # ablation은 "0-치환" 방식이다 — 모듈을 없애지 않고 항상 생성·실행한 뒤, 그 모듈이
+        # 결과로 이어지는 텐서만 0으로 바꾼다. 모듈을 지우면 텐서 shape·파라미터 수·attention
+        # 후보 개수까지 함께 바뀌어, 측정된 차이가 "그 모듈의 정보" 때문인지 "구조 변화" 때문인지
+        # 분리되지 않는다. 0-치환은 그 교란을 없앤다.
+        self.daily_branch = PeriodicLSTMEncoder(periodic_hidden, extra_dim=self.extra_dim)
+        self.weekly_branch = PeriodicLSTMEncoder(periodic_hidden, extra_dim=self.extra_dim)
         self.branch_attention = BranchAttention(
             history_hidden, periodic_hidden, fusion_dim, use_attention=use_branch_attention
         )
-        # 검색기를 끄면 CausalRetrieval을 만들지 않는다 — 격자 전체와 크롭 캐시를 메모리에
-        # 올리는 비용이 커서, 만들어두고 안 쓰는 것과 실제로 끄는 것의 자원 차이가 크다.
-        self.retrieval = (
-            CausalRetrieval(
-                height=height,
-                width=width,
-                time_step=time_step,
-                local_radius=local_radius,
-                retrieval_grid_path=retrieval_grid_path,
-                retrieval_k=retrieval_k,
-                retrieval_chunk_size=retrieval_chunk_size,
-                retrieval_scope=retrieval_scope,
-                retrieval_train_end=retrieval_train_end,
-            )
-            if use_retrieval
-            else None
+        # 검색기도 끄든 켜든 항상 만들고 항상 계산한다(느리지만 경로가 동일해진다).
+        # use_retrieval=False면 ir_out만 0이 되고, 게이트는 그대로 남아 lambda를 학습한다
+        # — 처음부터 재학습하므로 모델이 lambda->1을 배워 보정할 수 있다.
+        self.retrieval = CausalRetrieval(
+            height=height,
+            width=width,
+            time_step=time_step,
+            local_radius=local_radius,
+            retrieval_grid_path=retrieval_grid_path,
+            retrieval_k=retrieval_k,
+            retrieval_chunk_size=retrieval_chunk_size,
+            retrieval_scope=retrieval_scope,
+            retrieval_train_end=retrieval_train_end,
         )
-        self.output_gate = NeuralRetrievalGate(fusion_dim, use_retrieval=use_retrieval)
+        self.output_gate = NeuralRetrievalGate(fusion_dim)
         # 이 저장소의 다른 모델들과 목적함수를 맞추려면 'combined'(CombinedLoss)를 쓴다.
         # 'mae'는 merged_model이 원래 쓰던 raw 스케일 L1이며, 두 경우 모두 reduction='none'
         # 이라 아래 forward에서 mean/sum을 각각 뽑는다.
@@ -191,7 +182,7 @@ class UnifiedDemandModel(nn.Module):
 
     def _temporal_extra(
         self, weather: Tensor, hour: Tensor, day_of_week: Tensor
-    ) -> Tensor | None:
+    ) -> Tensor:
         """(정규화 날씨 3) ⊕ (요일 임베딩) ⊕ (시간대 임베딩) -> ``[B, L, extra_dim]``.
 
         세 브랜치가 같은 방식으로 만든다 — recent는 L=time_step, daily/weekly는 L=lag 개수.
@@ -199,21 +190,17 @@ class UnifiedDemandModel(nn.Module):
         """
 
         parts: list[Tensor] = []
-        if self.use_weather and self.weather_injection == "concat":
-            parts.append((weather - self.weather_mean) / self.weather_std)
-        if self.use_calendar:
-            parts.append(self.weekday_embedding(day_of_week))
-            parts.append(self.hour_embedding(hour))
-        if not parts:
-            return None
+        if self.weather_injection == "concat":
+            weather_norm = (weather - self.weather_mean) / self.weather_std
+            # 정규화 후의 0은 train split 평균에 해당한다 — "정보 없음"의 자연스러운 대체값.
+            parts.append(weather_norm if self.use_weather else torch.zeros_like(weather_norm))
+        weekday = self.weekday_embedding(day_of_week)
+        hour_vec = self.hour_embedding(hour)
+        if not self.use_calendar:
+            weekday = torch.zeros_like(weekday)
+            hour_vec = torch.zeros_like(hour_vec)
+        parts.extend([weekday, hour_vec])
         return torch.cat(parts, dim=-1)
-
-    def _disabled_branch(self, h_neural: Tensor) -> tuple[Tensor, Tensor]:
-        """꺼진 주기 브랜치의 자리표시자 — 값은 0, valid는 전부 False."""
-        batch, nodes = h_neural.shape[:2]
-        hidden = h_neural.new_zeros(batch, nodes, self.periodic_hidden)
-        valid = torch.zeros(batch, dtype=torch.bool, device=h_neural.device)
-        return hidden, valid
 
     def forward(
         self,
@@ -239,25 +226,27 @@ class UnifiedDemandModel(nn.Module):
         daily_extra = self._temporal_extra(daily_weather, daily_hour, daily_day_of_week)
         weekly_extra = self._temporal_extra(weekly_weather, weekly_hour, weekly_day_of_week)
 
-        weather_cls = (
-            (weather - self.weather_mean) / self.weather_std if self.weather_cls_dim else None
-        )
+        weather_cls = None
+        if self.weather_cls_dim:
+            weather_cls = (weather - self.weather_mean) / self.weather_std
+            if not self.use_weather:
+                weather_cls = torch.zeros_like(weather_cls)
         local_crop, h_neural = self.local_history(demand_history, recent_extra, weather_cls)
-        # 끈 주기 브랜치는 "전 lag 무효"와 같게 취급한다 — BranchAttention의 null-option 마스킹이
-        # 이미 그 경우를 처리하므로(검증됨) 어텐션 쪽에 별도 분기를 두지 않는다.
-        if self.use_daily:
-            h_daily, daily_valid = self.daily_branch(daily_demand, daily_mask, daily_extra)
-        else:
-            h_daily, daily_valid = self._disabled_branch(h_neural)
-        if self.use_weekly:
-            h_weekly, weekly_valid = self.weekly_branch(weekly_demand, weekly_mask, weekly_extra)
-        else:
-            h_weekly, weekly_valid = self._disabled_branch(h_neural)
+        # 브랜치는 항상 실행하고, 끈 경우 출력 텐서만 0으로 바꾼다. valid 마스크는 원래 값을
+        # 그대로 둬서 attention 후보 개수가 변하지 않게 한다(구조 교란 제거).
+        h_daily, daily_valid = self.daily_branch(daily_demand, daily_mask, daily_extra)
+        if not self.use_daily:
+            h_daily = torch.zeros_like(h_daily)
+        h_weekly, weekly_valid = self.weekly_branch(weekly_demand, weekly_mask, weekly_extra)
+        if not self.use_weekly:
+            h_weekly = torch.zeros_like(h_weekly)
         h_attn, attention_weights = self.branch_attention(
             h_neural, h_daily, h_weekly, daily_valid, weekly_valid
         )
 
-        ir_out = self.retrieval(local_crop, sample_idx) if self.use_retrieval else None
+        ir_out = self.retrieval(local_crop, sample_idx)
+        if not self.use_retrieval:
+            ir_out = torch.zeros_like(ir_out)
         neural_pred, lambda_weight, prediction = self.output_gate(h_attn, ir_out)
         prediction_grid = prediction.reshape(-1, self.height, self.width)
 

@@ -18,6 +18,7 @@ LOCK="merged_model/.ablation_queue.lock"
 SEEDS=(245)
 # 우선순위 순. 앞쪽 셀부터 완성되므로 중단 시점에 완결된 셀이 최대가 된다.
 ABLATIONS=(no-ir no-periodic no-weather no-calendar no-weekly no-daily no-extra no-branch-attn)
+# 상위 4개는 (a)1시드x8셀, (b)3시드x4셀 어느 계획에서도 필요하므로 먼저 돈다.
 
 case "${1:-}" in
   build)
@@ -25,7 +26,7 @@ case "${1:-}" in
     for ab in "${ABLATIONS[@]}"; do
       for city in ulsan porto; do
         for seed in "${SEEDS[@]}"; do
-          out="merged_model/runs/${city}_mae_${ab}_seed${seed}.json"
+          out="merged_model/runs/${city}_mae_${ab}_zero_seed${seed}.json"
           [ -f "$out" ] && continue
           echo "$ab $city $seed" >> "$QUEUE"
         done
@@ -41,8 +42,8 @@ case "${1:-}" in
       task=$(flock "$LOCK" bash -c "head -1 '$QUEUE' 2>/dev/null; sed -i '1d' '$QUEUE' 2>/dev/null")
       [ -z "$task" ] && { echo "[w$GPU-$SLOT] 큐 비어 종료 $(date +%H:%M:%S)"; break; }
       read -r ab city seed <<< "$task"
-      out="merged_model/runs/${city}_mae_${ab}_seed${seed}.json"
-      log="merged_model/logs/${city}_mae_${ab}_seed${seed}.log"
+      out="merged_model/runs/${city}_mae_${ab}_zero_seed${seed}.json"
+      log="merged_model/logs/${city}_mae_${ab}_zero_seed${seed}.log"
       echo "[w$GPU-$SLOT] $(date +%H:%M:%S) 시작 $ab/$city/$seed"
       PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="$GPU" conda run --no-capture-output -n DA \
         python -m merged_model.train --dataset "$city" --device cuda:0 --seed "$seed" \
