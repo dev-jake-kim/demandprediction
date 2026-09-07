@@ -33,6 +33,12 @@ train:
   seed: ${seed}
   full_determinism: false
 
+# 2-stage 학습의 stage 2(offset 제한 해제 후 finetuning) 전용 설정.
+# 나머지는 train 블록을 그대로 재사용한다. model.node_adaptive=false면 쓰이지 않는다.
+stage2:
+  # stage 1의 1/5. 수렴한 공유 가중치에서 크게 이탈하지 않으면서 offset이 움직일 여지는 준다.
+  learning_rate: 1e-4
+
 callbacks:
   early_stopping:
     min_epochs: 20

@@ -192,12 +192,14 @@ weight/bias를 노드마다 다르게** 준다.
 | `node_delta_weight_hh` | (N, 4·lstm_hidden, lstm_hidden) | 2,752,512 | 3,276,800 |
 | `node_delta_bias` | (N, 4·lstm_hidden) | 43,008 | 51,200 |
 | `node_delta_out_weight` | (N, lstm_hidden) | 10,752 | 12,800 |
-| `node_delta_out_bias` | (N,) | 168 | 200 |
-| **합계** | | **5,558,952** | **6,617,800** |
+| **합계** | | **5,558,784** | **6,617,600** |
 
 기존 모델이 205,729(ulsan) / 207,777(porto) 파라미터이므로 **27~32배 증가**한다. 노드당 학습
-샘플이 ulsan 약 3,000개인데 노드별 파라미터가 32,832개라 **과적합 위험이 크다** — 학습 곡선의
-train/val 격차를 반드시 함께 본다.
+샘플이 ulsan 약 3,000개인데 노드별 파라미터가 33,088개라 **과적합 위험이 크다**.
+
+**출력 헤드의 bias에는 노드별 offset을 두지 않는다.** 노드마다 상수를 더하는 자리라 "이 셀의
+평균 수요"를 외우는 지름길이 되기 쉽고, 그러면 weight offset이 무엇을 배웠는지 해석이 흐려진다.
+공유 `output_proj.bias`만 쓴다.
 
 **LSTM bias delta는 하나만 둔다.** PyTorch LSTM은 `bias_ih_l0`/`bias_hh_l0` 두 개를 갖지만 계산에는
 둘의 합만 들어간다(cuDNN 호환용 중복). 노드별로 둘을 따로 두면 파라미터만 2배가 되고 표현력은
@@ -239,9 +241,41 @@ delta를 여기서 명시적으로 0으로 만드는 이유는 transformers 5.0�
 `W ← W+C`, `ΔW[n] ← ΔW[n]−C`가 같은 함수를 주므로(비식별성) **delta의 절대 크기는 의미가 없다.**
 "노드별 특화가 실제로 일어났는지"는 노드 평균으로 중심화한 delta의 norm(노드 간 편차)으로 본다.
 
-또 `node_delta_out_bias`는 노드마다 상수 오프셋을 주는 것이라, 모델이 "이 셀의 평균 수요"를 거기
-외워버리고 weight delta는 놀 수 있다. 셀별 오차가 수요와 거의 선형인 것(수요~MAE 상관 울산 0.976)을
-감안하면 실제로 그럴 소지가 있으므로, 학습 후 다섯 delta 각각의 중심화 norm을 함께 기록한다.
+`train.py`는 stage 2 종료 후 4종 delta 각각의 raw norm과 중심화 norm을 로그에 남긴다.
+
+### 9-5. 2-stage 학습
+
+1-stage(공유 가중치와 offset을 처음부터 함께 학습)는 실패했다. seed 245 기준 ulsan RMSE는
+노이즈 안쪽이고 porto는 RMSE +2.4% / MAPE(+1) +11.2%로 악화됐다. 셀 단위로 보면 **고수요 셀은
+개선되고 저수요 셀이 무너진다** — porto는 노드 200개 중 132개가 개선됐는데도 수요 1.30짜리 셀
+하나가 ΔRMSE +1.17로 터져 전체가 나빠졌다. offset이 공유 가중치와 동시에 움직이며 학습 샘플이
+적은 저수요 셀에서 과적합한 것으로 보인다.
+
+그래서 학습을 두 단계로 나눈다.
+
+- **stage 1**: `model.node_adaptive`를 런타임에 `False`로 두고 delta를 `requires_grad=False`로
+  얼린다. forward가 `nn.LSTM`(cuDNN 융합) 경로를 타므로 `baseline-weather`와 같은 계산이고
+  수동 LSTM 루프를 건너뛰어 더 빠르다. delta는 optimizer에 들어가지도 않는다.
+- **stage 2**: `node_adaptive`를 `True`로 돌리고 delta를 해제해 이어서 finetuning한다.
+  공유 가중치도 함께 학습하며, learning rate만 `stage2.learning_rate`(기본 1e-4, stage 1의 1/5)로
+  낮춘다.
+
+`config.node_adaptive`는 내내 `True`라 체크포인트에는 정확히 기록된다. stage마다 `Trainer`를 새로
+만들어야 한다 — optimizer/LR 스케줄러/early stopping 상태가 stage 경계에서 초기화돼야 하고,
+stage 1의 optimizer에는 얼린 delta가 없기 때문이다. `output_dir`도 `<run>/stage1`, `<run>/stage2`로
+나눈다(같은 디렉터리면 `save_total_limit`이 앞 stage 체크포인트를 지운다).
+`node_adaptive=false`면 stage 2를 통째로 건너뛰고 `output_dir`도 예전 그대로 쓴다.
+
+### 9-6. 재현성 — `set_seed`는 모델 생성 **앞**에 있어야 한다
+
+`Trainer.__init__`이 seed를 설정하지만 그건 모델이 만들어진 뒤다. 그대로 두면 같은 `seed`로도
+초기 가중치가 프로세스마다 달라진다(torch 기본 seed는 OS 엔트로피에서 온다 — 실제로 두 실행의
+`torch.initial_seed()`와 `node_embed` 값이 달랐다). `train.py`는 모델 생성 전에
+`set_seed(cfg.train.seed)`를 호출한다.
+
+**이건 이 브랜치만의 문제가 아니라 저장소 전체에 있던 결함이다.** 이 수정 이전에 기록된 실행값과는
+초기 가중치가 애초에 달라서 비트 단위 대조가 불가능하다. `full_determinism: false`라 학습 후
+결과도 GPU 비결정성으로 ~1e-4 수준의 차이가 남는다(시드 표준편차 0.0091의 1/90).
 
 ## 10. 아직 정해지지 않은 것 / 기본값으로 진행할 것
 

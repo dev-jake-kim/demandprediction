@@ -70,7 +70,6 @@ class GridDemandModel(PreTrainedModel):
             # 그대로이므로 합에 더하는 하나만 둔다.
             self.node_delta_bias = nn.Parameter(torch.zeros(n_nodes, n_gates))
             self.node_delta_out_weight = nn.Parameter(torch.zeros(n_nodes, config.lstm_hidden))
-            self.node_delta_out_bias = nn.Parameter(torch.zeros(n_nodes))
 
         # 날씨(Linear 투영, Lambda-F 스타일) + 캘린더(ADFormer의 DataEmbedding과 동일한 임베딩
         # 테이블 방식) — 둘 다 CLS 토큰에 더해져서 주입된다(forward 참고).
@@ -132,7 +131,6 @@ class GridDemandModel(PreTrainedModel):
             self.node_delta_weight_hh,
             self.node_delta_bias,
             self.node_delta_out_weight,
-            self.node_delta_out_bias,
         )
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -259,9 +257,10 @@ class GridDemandModel(PreTrainedModel):
             last = self._node_adaptive_lstm(cls_out)  # (B,N,lstm_hidden)
             # 출력 헤드도 노드마다 다른 weight/bias를 쓴다. weight가 (1,lstm_hidden)이라
             # squeeze 후 노드 축으로 브로드캐스트하면 노드별 내적이 된다.
+            # bias는 노드별로 두지 않는다 — 노드마다 상수를 더하는 자리라 "이 셀의 평균 수요"를
+            # 외우는 지름길이 되기 쉽고, 그러면 weight offset이 무엇을 배웠는지 해석이 흐려진다.
             out_weight = self.output_proj.weight.squeeze(0) + self.node_delta_out_weight  # (N,h)
-            out_bias = self.output_proj.bias + self.node_delta_out_bias  # (N,)
-            pred = F.softplus((last * out_weight).sum(-1) + out_bias)  # (B,N)
+            pred = F.softplus((last * out_weight).sum(-1) + self.output_proj.bias)  # (B,N)
         else:
             lstm_out, _ = self.lstm(cls_out.reshape(B * N, k, d_model))  # (B*N,k,lstm_hidden)
             last = lstm_out[:, -1, :].reshape(B, N, -1)  # (B,N,lstm_hidden)

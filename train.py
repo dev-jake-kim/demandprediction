@@ -6,7 +6,13 @@ from pathlib import Path
 import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
-from transformers import EarlyStoppingCallback, Trainer, TrainerCallback, TrainingArguments
+from transformers import (
+    EarlyStoppingCallback,
+    Trainer,
+    TrainerCallback,
+    TrainingArguments,
+    set_seed,
+)
 
 from dataset_frame import GridDemandDataset
 from models import GridDemandConfig, GridDemandModel, compute_regression_metrics
@@ -107,34 +113,99 @@ def main(cfg: DictConfig) -> None:
         weather_std=weather_std.tolist(),
         **model_kwargs,
     )
+    # Trainer는 __init__에서 seed를 설정하는데 그건 모델이 만들어진 뒤다 — 그대로 두면
+    # 초기 가중치가 프로세스마다 달라져(torch 기본 seed가 OS 엔트로피) 같은 seed로도
+    # 재현되지 않는다. 실제로 두 프로세스의 node_embed 값이 달랐다. 여기서 먼저 고정한다.
+    set_seed(cfg.train.seed)
     model = GridDemandModel(model_config)
 
     output_dir = HydraConfig.get().runtime.output_dir
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        **OmegaConf.to_container(cfg.train, resolve=True),
-    )
-
+    train_cfg = OmegaConf.to_container(cfg.train, resolve=True)
     early_stopping_cfg = cfg.callbacks.early_stopping
-    callbacks = [
-        LoggingCallback(),
-        MinEpochEarlyStoppingCallback(
-            min_epochs=early_stopping_cfg.min_epochs,
-            early_stopping_patience=early_stopping_cfg.early_stopping_patience,
-        ),
-    ]
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        compute_metrics=compute_metrics,
-        callbacks=callbacks,
-    )
-    trainer.train()
+    def build_trainer(stage_dir: str | None, learning_rate: float) -> Trainer:
+        """stage마다 Trainer를 새로 만든다.
+
+        optimizer / LR 스케줄러 / early stopping 상태가 stage 경계에서 초기화돼야 하고,
+        stage 1의 optimizer에는 얼어 있는 delta가 들어있지 않기 때문이다. output_dir도
+        분리해야 한다 — 같은 디렉터리를 쓰면 save_total_limit이 앞 stage의 체크포인트를 지운다.
+        """
+        # stage_dir=None은 2-stage를 쓰지 않는 경우 — 체크포인트 경로가 이 변경 이전과
+        # 같아야 외부 스크립트(test.py 등)의 탐색이 깨지지 않는다.
+        args = TrainingArguments(
+            output_dir=output_dir if stage_dir is None else str(Path(output_dir) / stage_dir),
+            **{**train_cfg, 'learning_rate': learning_rate},
+        )
+        return Trainer(
+            model=model,
+            args=args,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            compute_metrics=compute_metrics,
+            callbacks=[
+                LoggingCallback(),
+                MinEpochEarlyStoppingCallback(
+                    min_epochs=early_stopping_cfg.min_epochs,
+                    early_stopping_patience=early_stopping_cfg.early_stopping_patience,
+                ),
+            ],
+        )
+
+    def trainable_count(trainer: Trainer) -> int:
+        return sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
+
+    # node_adaptive가 켜져 있을 때만 2-stage로 나눈다. 꺼져 있으면 예전과 동일한 단일 stage다.
+    deltas = model._node_delta_parameters() if model.node_adaptive else ()
+
+    if deltas:
+        # --- stage 1: offset을 0으로 고정 -> baseline-weather와 동일한 학습 ---
+        # node_adaptive를 끄면 forward가 nn.LSTM(cuDNN 융합) 경로를 타서 baseline-weather와
+        # 비트 단위로 같아지고, 수동 LSTM 루프를 건너뛰어 더 빠르다. delta는 0인 채로 남는다.
+        # config.node_adaptive는 True 그대로라 체크포인트에는 정확히 기록된다.
+        model.node_adaptive = False
+        for param in deltas:
+            param.requires_grad_(False)
+
+        stage1 = build_trainer('stage1', train_cfg['learning_rate'])
+        logger.info(f"[stage1] offset 고정(baseline-weather 동일), 학습 파라미터 {trainable_count(stage1):,}개")
+        stage1.train()
+        stage1_metrics = stage1.evaluate(eval_dataset=test_ds, metric_key_prefix="stage1_test")
+        logger.info(f"[stage1] Test metrics: {stage1_metrics}")
+        # stage 1 Trainer가 optimizer와 모델 wrapper를 계속 붙들고 있지 않게 놓아준다.
+        del stage1
+
+        # --- stage 2: offset 제한 해제 후 finetuning ---
+        # load_best_model_at_end=true라 model에는 stage 1의 best 가중치가 들어있다.
+        model.node_adaptive = True
+        for param in deltas:
+            param.requires_grad_(True)
+
+        trainer = build_trainer('stage2', float(cfg.stage2.learning_rate))
+        logger.info(
+            f"[stage2] offset 해제, lr={cfg.stage2.learning_rate}, "
+            f"학습 파라미터 {trainable_count(trainer):,}개"
+        )
+        trainer.train()
+    else:
+        trainer = build_trainer(None, train_cfg['learning_rate'])
+        trainer.train()
+
     trainer.save_model(output_dir)
     logger.info(f"Model saved to: {output_dir}")
+
+    if deltas:
+        # 최종(best) 모델에서 offset이 실제로 학습됐는지. 비식별성 때문에 절대 norm은
+        # 의미가 없어서 노드 평균을 뺀 중심화 norm을 함께 남긴다 — 그게 "노드마다 다른
+        # 값을 배웠는가"를 말해준다.
+        for name, param in zip(
+            ('weight_ih', 'weight_hh', 'bias', 'out_weight'), trainer.model._node_delta_parameters()
+        ):
+            value = param.detach()
+            centered = value - value.mean(dim=0, keepdim=True)
+            logger.info(
+                f"[stage2] node_delta_{name}: norm={value.norm():.4f} "
+                f"centered_norm={centered.norm():.4f}"
+            )
 
     test_metrics = trainer.evaluate(eval_dataset=test_ds, metric_key_prefix="test")
     logger.info(f"Test metrics: {test_metrics}")
