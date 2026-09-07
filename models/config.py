@@ -24,6 +24,8 @@ class GridDemandConfig(PretrainedConfig):
         weather_std: list[float] | None = None,
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
+        loss_type: str = 'combined',
+        rmse_weight: float = 10.0,
         **kwargs,
     ) -> None:
         self.H = H
@@ -47,4 +49,8 @@ class GridDemandConfig(PretrainedConfig):
         self.weather_std = weather_std
         self.loss_gamma = loss_gamma
         self.loss_eps = loss_eps
+        # 학습 stage가 선택한 loss도 체크포인트에 저장한다. 그래야 from_pretrained()로
+        # stage 2/final 모델을 복원했을 때 학습 당시의 loss 정의가 유지된다.
+        self.loss_type = loss_type
+        self.rmse_weight = rmse_weight
         super().__init__(**kwargs)

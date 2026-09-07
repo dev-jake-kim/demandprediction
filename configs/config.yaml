@@ -38,6 +38,15 @@ train:
 stage2:
   # stage 1의 1/5. 수렴한 공유 가중치에서 크게 이탈하지 않으면서 offset이 움직일 여지는 준다.
   learning_rate: 1e-4
+  # 'combined'(stage 1과 동일한 CombinedLoss) 또는 'rmse_mape'(rmse_weight*RMSE + MAPE(+1)).
+  # rmse_mape의 두 항은 models/metrics.py의 보고 지표와 같은 식이라 최적화 대상과 평가가 일치한다.
+  loss: rmse_mape
+  rmse_weight: 10.0
+  # stage 1을 새로 학습하지 않고 이 체크포인트의 가중치에서 새 stage 2를 시작한다.
+  # optimizer/scheduler/global step을 복구하는 중단 재개(resume)가 아니다.
+  # checkpoint의 node delta는 모두 0이어야 한다(null이면 stage 1부터 학습).
+  # 도시마다 체크포인트가 다르므로 -m 멀티런 대신 도시별로 따로 지정해야 한다.
+  init_from: null
 
 callbacks:
   early_stopping:

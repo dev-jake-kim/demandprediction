@@ -7,7 +7,7 @@ from transformers import PreTrainedModel
 
 from .config import GridDemandConfig
 from .embeddings import FourierScalarEmbedding
-from .losses import CombinedLoss
+from .losses import CombinedLoss, RmseMapeLoss
 
 CLS_TOKEN_ID = 0
 EDGE_TOKEN_ID = 1
@@ -77,7 +77,11 @@ class GridDemandModel(PreTrainedModel):
         self.daytime_embedding = nn.Embedding(1440, config.d_model)
         self.weekday_embedding = nn.Embedding(7, config.d_model)
 
-        self.loss_fn = CombinedLoss(gamma=config.loss_gamma, eps=config.loss_eps)
+        self.loss_fn: nn.Module
+        self.configure_loss(
+            config.loss_type,
+            rmse_weight=config.rmse_weight,
+        )
 
         if config.weather_mean is None or config.weather_std is None:
             raise ValueError("weather_mean/weather_std(3개씩, train split 통계)가 필요함")
@@ -100,6 +104,29 @@ class GridDemandModel(PreTrainedModel):
         self.register_buffer('mask_table', mask_table, persistent=True)  # (H*W, n_neighbors)
 
         self.post_init()
+
+    def configure_loss(
+        self,
+        loss_type: str,
+        *,
+        rmse_weight: float | None = None,
+    ) -> None:
+        """학습 loss를 교체하고 선택값을 HF config에도 동기화한다.
+
+        config를 함께 갱신해야 stage 2 체크포인트를 ``from_pretrained``로 다시 열었을 때
+        런타임에 선택했던 loss가 CombinedLoss로 조용히 되돌아가지 않는다.
+        """
+        if loss_type == 'combined':
+            self.loss_fn = CombinedLoss(gamma=self.config.loss_gamma, eps=self.config.loss_eps)
+        elif loss_type == 'rmse_mape':
+            resolved_rmse_weight = self.config.rmse_weight if rmse_weight is None else rmse_weight
+            self.loss_fn = RmseMapeLoss(
+                rmse_weight=float(resolved_rmse_weight),
+            )
+            self.config.rmse_weight = float(resolved_rmse_weight)
+        else:
+            raise ValueError(f"loss_type은 'combined'|'rmse_mape' (받음: {loss_type!r})")
+        self.config.loss_type = loss_type
 
     def _build_neighbor_tables(self) -> tuple[torch.Tensor, torch.Tensor]:
         H, W, a = self.H, self.W, self.a

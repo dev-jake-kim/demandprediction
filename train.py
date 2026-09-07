@@ -6,6 +6,7 @@ from pathlib import Path
 import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
+import torch
 from transformers import (
     EarlyStoppingCallback,
     Trainer,
@@ -15,7 +16,11 @@ from transformers import (
 )
 
 from dataset_frame import GridDemandDataset
-from models import GridDemandConfig, GridDemandModel, compute_regression_metrics
+from models import (
+    GridDemandConfig,
+    GridDemandModel,
+    compute_regression_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,13 +122,27 @@ def main(cfg: DictConfig) -> None:
     # 초기 가중치가 프로세스마다 달라져(torch 기본 seed가 OS 엔트로피) 같은 seed로도
     # 재현되지 않는다. 실제로 두 프로세스의 node_embed 값이 달랐다. 여기서 먼저 고정한다.
     set_seed(cfg.train.seed)
-    model = GridDemandModel(model_config)
+    # stage2.init_from이 있으면 그 체크포인트에서 이어받고 stage 1을 건너뛴다.
+    # 명시한 model_config를 그대로 쓰므로 아키텍처는 이번 실행 설정이 기준이고,
+    # 체크포인트에 없는 키(예: baseline-weather에는 delta가 없다)는 _init_weights가 0으로 채운다.
+    init_from = cfg.stage2.get('init_from')
+    if init_from:
+        model = GridDemandModel.from_pretrained(init_from, config=model_config)
+        logger.info(f'[stage2] stage1 체크포인트에서 이어받음: {init_from}')
+    else:
+        model = GridDemandModel(model_config)
 
     output_dir = HydraConfig.get().runtime.output_dir
     train_cfg = OmegaConf.to_container(cfg.train, resolve=True)
     early_stopping_cfg = cfg.callbacks.early_stopping
 
-    def build_trainer(stage_dir: str | None, learning_rate: float) -> Trainer:
+    def build_trainer(
+        stage_dir: str | None,
+        learning_rate: float,
+        *,
+        metrics_fn=compute_metrics,
+        metric_for_best_model: str | None = None,
+    ) -> Trainer:
         """stage마다 Trainer를 새로 만든다.
 
         optimizer / LR 스케줄러 / early stopping 상태가 stage 경계에서 초기화돼야 하고,
@@ -132,16 +151,19 @@ def main(cfg: DictConfig) -> None:
         """
         # stage_dir=None은 2-stage를 쓰지 않는 경우 — 체크포인트 경로가 이 변경 이전과
         # 같아야 외부 스크립트(test.py 등)의 탐색이 깨지지 않는다.
+        args_overrides = {'learning_rate': learning_rate}
+        if metric_for_best_model is not None:
+            args_overrides['metric_for_best_model'] = metric_for_best_model
         args = TrainingArguments(
             output_dir=output_dir if stage_dir is None else str(Path(output_dir) / stage_dir),
-            **{**train_cfg, 'learning_rate': learning_rate},
+            **{**train_cfg, **args_overrides},
         )
         return Trainer(
             model=model,
             args=args,
             train_dataset=train_ds,
             eval_dataset=val_ds,
-            compute_metrics=compute_metrics,
+            compute_metrics=metrics_fn,
             callbacks=[
                 LoggingCallback(),
                 MinEpochEarlyStoppingCallback(
@@ -157,12 +179,34 @@ def main(cfg: DictConfig) -> None:
     # node_adaptive가 켜져 있을 때만 2-stage로 나눈다. 꺼져 있으면 예전과 동일한 단일 stage다.
     deltas = model._node_delta_parameters() if model.node_adaptive else ()
 
-    if deltas:
+    if deltas and init_from:
+        # stage 1은 이미 끝난 것을 불러왔다. 그 시점의 성능을 같은 기준으로 남겨둔다.
+        # 이 옵션은 weights-only warm start다. 학습된 stage2/final 체크포인트를 실수로
+        # stage1 시작점으로 넣지 않도록 delta가 정확히 0인지 확인한다.
+        nonzero_deltas = [
+            name
+            for name, param in zip(('weight_ih', 'weight_hh', 'bias', 'out_weight'), deltas)
+            if torch.count_nonzero(param.detach()).item() != 0
+        ]
+        if nonzero_deltas:
+            raise ValueError(
+                'stage2.init_from은 delta=0인 stage1 체크포인트여야 함 — '
+                f'0이 아닌 delta: {nonzero_deltas}'
+            )
+        model.node_adaptive = False
+        model.configure_loss('combined')
+        for param in deltas:
+            param.requires_grad_(False)
+        probe = build_trainer('stage1_eval', train_cfg['learning_rate'])
+        logger.info(f"[stage1] Test metrics: {probe.evaluate(eval_dataset=test_ds, metric_key_prefix='stage1_test')}")
+        del probe
+    elif deltas:
         # --- stage 1: offset을 0으로 고정 -> baseline-weather와 동일한 학습 ---
         # node_adaptive를 끄면 forward가 nn.LSTM(cuDNN 융합) 경로를 타서 baseline-weather와
         # 비트 단위로 같아지고, 수동 LSTM 루프를 건너뛰어 더 빠르다. delta는 0인 채로 남는다.
         # config.node_adaptive는 True 그대로라 체크포인트에는 정확히 기록된다.
         model.node_adaptive = False
+        model.configure_loss('combined')
         for param in deltas:
             param.requires_grad_(False)
 
@@ -174,13 +218,42 @@ def main(cfg: DictConfig) -> None:
         # stage 1 Trainer가 optimizer와 모델 wrapper를 계속 붙들고 있지 않게 놓아준다.
         del stage1
 
+    if deltas:
         # --- stage 2: offset 제한 해제 후 finetuning ---
         # load_best_model_at_end=true라 model에는 stage 1의 best 가중치가 들어있다.
         model.node_adaptive = True
         for param in deltas:
             param.requires_grad_(True)
+        # stage 2는 손실을 바꿀 수 있다. rmse_mape면 전체 validation 예측으로 계산한
+        # rmse_mape_objective를, combined면 eval_loss를 early stopping/best 선택에 쓴다.
+        model.configure_loss(
+            str(cfg.stage2.loss),
+            rmse_weight=float(cfg.stage2.rmse_weight),
+        )
+        if cfg.stage2.loss == 'rmse_mape':
+            rmse_weight = float(cfg.stage2.rmse_weight)
 
-        trainer = build_trainer('stage2', float(cfg.stage2.learning_rate))
+            def compute_stage2_metrics(eval_pred) -> dict[str, float]:
+                metrics = compute_metrics(eval_pred)
+                metrics['rmse_mape_objective'] = (
+                    rmse_weight * metrics['rmse'] + metrics['mape_plus1']
+                )
+                return metrics
+
+            stage2_metrics_fn = compute_stage2_metrics
+            stage2_best_metric = 'rmse_mape_objective'
+            logger.info(f'[stage2] loss = {rmse_weight} * RMSE + MAPE(+1)')
+        else:
+            stage2_metrics_fn = compute_metrics
+            stage2_best_metric = 'loss'
+            logger.info('[stage2] loss = CombinedLoss')
+
+        trainer = build_trainer(
+            'stage2',
+            float(cfg.stage2.learning_rate),
+            metrics_fn=stage2_metrics_fn,
+            metric_for_best_model=stage2_best_metric,
+        )
         logger.info(
             f"[stage2] offset 해제, lr={cfg.stage2.learning_rate}, "
             f"학습 파라미터 {trainable_count(trainer):,}개"

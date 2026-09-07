@@ -258,13 +258,18 @@ delta를 여기서 명시적으로 0으로 만드는 이유는 transformers 5.0�
   수동 LSTM 루프를 건너뛰어 더 빠르다. delta는 optimizer에 들어가지도 않는다.
 - **stage 2**: `node_adaptive`를 `True`로 돌리고 delta를 해제해 이어서 finetuning한다.
   공유 가중치도 함께 학습하며, learning rate만 `stage2.learning_rate`(기본 1e-4, stage 1의 1/5)로
-  낮춘다.
+  낮춘다. 기본 loss는 `10 * RMSE + MAPE(+1)`이며 `stage2.loss=combined`로 stage 1과 같은
+  `CombinedLoss`를 유지할 수도 있다. 학습 RMSE는 미니배치 기준 surrogate라 batch size의 영향을
+  받지만, best-checkpoint 선택은 전체 validation 예측에서 계산한 `10 * RMSE + MAPE(+1)`을 사용한다.
 
 `config.node_adaptive`는 내내 `True`라 체크포인트에는 정확히 기록된다. stage마다 `Trainer`를 새로
 만들어야 한다 — optimizer/LR 스케줄러/early stopping 상태가 stage 경계에서 초기화돼야 하고,
 stage 1의 optimizer에는 얼린 delta가 없기 때문이다. `output_dir`도 `<run>/stage1`, `<run>/stage2`로
 나눈다(같은 디렉터리면 `save_total_limit`이 앞 stage 체크포인트를 지운다).
 `node_adaptive=false`면 stage 2를 통째로 건너뛰고 `output_dir`도 예전 그대로 쓴다.
+
+stage 전환 시 선택한 `loss_type`, `rmse_weight`는 `GridDemandConfig`에도 동기화한다.
+따라서 stage 2 및 최종 체크포인트를 `from_pretrained()`로 복원해도 학습 당시 loss가 유지된다.
 
 ### 9-6. 재현성 — `set_seed`는 모델 생성 **앞**에 있어야 한다
 
