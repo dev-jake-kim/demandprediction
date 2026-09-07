@@ -16,8 +16,3 @@ preprocessing/**/output/
 *.csv
 .claude/
 docs/PROJECT_SUMMARY.md
-
-# 다른 브랜치(tmp)의 산출물이 워킹트리에 남아 있는 것들 — 이 브랜치의 코드가 아니다.
-# merged_model/runs/*.pt는 ablation 체크포인트(약 180MB)라 지우지 않고 무시만 한다.
-merged_model/
-mm_data/
