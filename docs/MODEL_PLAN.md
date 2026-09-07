@@ -77,6 +77,7 @@ x: (B, k, N, (2a+1)^2+1, d_model) → reshape (B*k*N, (2a+1)^2+1, d_model)
 | `dropout` | 0.1 | transformer/lstm dropout |
 | `lstm_hidden` | 64 (=`d_model`) | LSTM hidden size |
 | `lstm_layers` | 1 | LSTM layer 수 |
+| `node_adaptive` | `false` (클래스) / `true` (`lora` 브랜치 yaml) | LSTM·`output_proj`의 weight/bias를 노드마다 다르게 쓴다 — §9 |
 
 ## 2. 배치 크롭 구현 방식 (`GridDemandModel._crop_all_nodes`)
 
@@ -170,7 +171,79 @@ configs/
   이후 자동 복원된다(`idx_table`/`mask_table`과 같은 범주 — transformers 5.0 meta-device fast-init
   이슈 회피, §1-2-1 참고 패턴과 동일 이유).
 
-## 9. 아직 정해지지 않은 것 / 기본값으로 진행할 것
+## 9. 노드별 weight offset (`lora` 브랜치)
+
+`baseline-weather`까지의 모든 모델은 **모든 노드가 LSTM 하나와 출력 헤드 하나를 공유**한다.
+공간 인코딩은 Transformer가 노드별로 하지만 시간 취합과 최종 사상은 전 노드 공통이고, 노드
+정체성은 `node_embed`가 CLS에 더해지는 형태로만 들어간다. 이 브랜치는 **`lstm`과 `output_proj`의
+weight/bias를 노드마다 다르게** 준다.
+
+`config.node_adaptive`로 켠다(클래스 기본값 `False`, `configs/model/baseline.yaml`에서 `true`).
+`False`면 `baseline-weather`와 완전히 동일하게 동작한다.
+
+### 9-1. 조합 방식
+
+공유 파라미터 `W`에 노드별 offset `ΔW[node_id]`를 더해 쓴다. **저랭크 분해·양자화·해싱을 쓰지
+않는다** — 노드마다 전체 텐서를 하나씩 갖는다.
+
+| 파라미터 | shape | ulsan(N=168) | porto(N=200) |
+|---|---|---|---|
+| `node_delta_weight_ih` | (N, 4·lstm_hidden, d_model) | 2,752,512 | 3,276,800 |
+| `node_delta_weight_hh` | (N, 4·lstm_hidden, lstm_hidden) | 2,752,512 | 3,276,800 |
+| `node_delta_bias` | (N, 4·lstm_hidden) | 43,008 | 51,200 |
+| `node_delta_out_weight` | (N, lstm_hidden) | 10,752 | 12,800 |
+| `node_delta_out_bias` | (N,) | 168 | 200 |
+| **합계** | | **5,558,952** | **6,617,800** |
+
+기존 모델이 205,729(ulsan) / 207,777(porto) 파라미터이므로 **27~32배 증가**한다. 노드당 학습
+샘플이 ulsan 약 3,000개인데 노드별 파라미터가 32,832개라 **과적합 위험이 크다** — 학습 곡선의
+train/val 격차를 반드시 함께 본다.
+
+**LSTM bias delta는 하나만 둔다.** PyTorch LSTM은 `bias_ih_l0`/`bias_hh_l0` 두 개를 갖지만 계산에는
+둘의 합만 들어간다(cuDNN 호환용 중복). 노드별로 둘을 따로 두면 파라미터만 2배가 되고 표현력은
+그대로다.
+
+### 9-2. `nn.LSTM`을 호출하지 않고 셀을 직접 돈다
+
+`nn.LSTM`은 샘플(노드)별 가중치를 받을 수 없다. `_node_adaptive_lstm`이 셀을 직접 돌되,
+**파라미터는 `self.lstm`이 그대로 들고 있고** 거기서 읽어 delta만 더한다. 그래서 (a) 체크포인트
+키가 `baseline-weather`와 호환되고, (b) 초기화가 PyTorch LSTM 기본값과 정확히 같다.
+
+입력 투영은 `h`에 의존하지 않으므로 `k`개 시점을 한 번에 계산해 순차 구간을 절반으로 줄인다.
+노드 인덱싱에 gather가 필요 없다 — 매 forward마다 N개 노드를 전부 예측하므로 delta의 노드 축이
+einsum에서 그대로 맞물린다. `lstm_layers > 1`은 지원하지 않고 `ValueError`를 낸다.
+
+**delta=0이면 이 경로는 `nn.LSTM`과 수치적으로 동일해야 한다**(실측 max|diff| 5.96e-08). 이게
+깨지면 측정된 차이가 delta 때문인지 LSTM 재구현 오류 때문인지 구분되지 않는다.
+
+속도는 ulsan 1에폭 기준 38.7초 → 45.5초(약 1.2배)다.
+
+### 9-3. delta는 0으로 초기화한다
+
+학습 시작 시점의 모델이 `baseline-weather`와 완전히 동일해야 이 실험이 "baseline에 노드별
+offset만 추가"가 된다. 실제로 같은 시드로 만든 두 모델의 공유 파라미터 38개가 비트 단위로 일치한다.
+
+**`_init_weights`를 재정의할 때 `super()._init_weights(module)`를 빼면 안 된다.** 이 저장소는
+원래 이 메서드를 재정의하지 않아 `PreTrainedModel._init_weights`(Linear/Embedding을 std=0.02로
+초기화)를 상속해 쓰고 있었다. 조기 반환하면 모델 전체의 초기 분포가 바뀐다(`node_embed` std가
+0.02 → 1.06으로 관측됨).
+
+delta를 여기서 명시적으로 0으로 만드는 이유는 transformers 5.0의 meta-device fast-init 때문이다 —
+체크포인트에 없는 키를 `torch.empty`로 실체화하므로 생성자의 `torch.zeros(...)`가 delta 키가 없는
+체크포인트(`baseline-weather`)를 로드할 때는 적용되지 않는다(실제로 NaN이 들어왔다).
+`_is_hf_initialized`가 붙은 파라미터는 건너뛰어 학습된 delta를 0으로 덮어쓰지 않는다.
+**이 버그는 `load_state_dict`로는 재현되지 않는다** — 검증은 반드시 `from_pretrained` 경로로 한다.
+
+### 9-4. 결과 해석 시 주의
+
+`W ← W+C`, `ΔW[n] ← ΔW[n]−C`가 같은 함수를 주므로(비식별성) **delta의 절대 크기는 의미가 없다.**
+"노드별 특화가 실제로 일어났는지"는 노드 평균으로 중심화한 delta의 norm(노드 간 편차)으로 본다.
+
+또 `node_delta_out_bias`는 노드마다 상수 오프셋을 주는 것이라, 모델이 "이 셀의 평균 수요"를 거기
+외워버리고 weight delta는 놀 수 있다. 셀별 오차가 수요와 거의 선형인 것(수요~MAE 상관 울산 0.976)을
+감안하면 실제로 그럴 소지가 있으므로, 학습 후 다섯 delta 각각의 중심화 norm을 함께 기록한다.
+
+## 10. 아직 정해지지 않은 것 / 기본값으로 진행할 것
 
 - `a`, `d_model`, `n_freqs` 등 정확한 하이퍼파라미터 값 — 위 표를 기본값으로 두고 `configs/model/baseline.yaml`에서 조정.
 - train/val/test 시간 분할 비율 — 별도 지시 없으면 시간순 70/15/15로 가정.

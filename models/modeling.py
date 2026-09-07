@@ -49,6 +49,29 @@ class GridDemandModel(PreTrainedModel):
         )
         self.output_proj = nn.Linear(config.lstm_hidden, 1)
 
+        # 노드별 weight offset. self.lstm / self.output_proj는 모듈 그대로 두고(체크포인트 키
+        # 호환 + PyTorch 기본 초기화 유지) 여기의 delta만 더해서 쓴다. forward는 호출 대신
+        # 파라미터를 직접 읽는다(_node_adaptive_lstm 참고).
+        # delta는 0으로 시작한다 — 학습 시작 시점의 모델이 baseline-weather와 완전히 동일해야
+        # "baseline에 노드별 offset만 추가"라는 이 실험의 전제가 성립한다.
+        self.node_adaptive = config.node_adaptive
+        if self.node_adaptive:
+            if config.lstm_layers != 1:
+                raise ValueError(
+                    f'node_adaptive는 lstm_layers=1만 지원함 (받음: {config.lstm_layers}) — '
+                    '다층 노드별 LSTM은 이번 실험 범위 밖이다'
+                )
+            n_nodes = self.H * self.W
+            n_gates = 4 * config.lstm_hidden
+            self.node_delta_weight_ih = nn.Parameter(torch.zeros(n_nodes, n_gates, config.d_model))
+            self.node_delta_weight_hh = nn.Parameter(torch.zeros(n_nodes, n_gates, config.lstm_hidden))
+            # PyTorch LSTM은 bias_ih/bias_hh 두 개를 갖지만 계산에는 둘의 합만 들어간다
+            # (cuDNN 호환용 중복). 노드별로 둘을 따로 두면 파라미터만 2배가 되고 표현력은
+            # 그대로이므로 합에 더하는 하나만 둔다.
+            self.node_delta_bias = nn.Parameter(torch.zeros(n_nodes, n_gates))
+            self.node_delta_out_weight = nn.Parameter(torch.zeros(n_nodes, config.lstm_hidden))
+            self.node_delta_out_bias = nn.Parameter(torch.zeros(n_nodes))
+
         # 날씨(Linear 투영, Lambda-F 스타일) + 캘린더(ADFormer의 DataEmbedding과 동일한 임베딩
         # 테이블 방식) — 둘 다 CLS 토큰에 더해져서 주입된다(forward 참고).
         self.weather_proj = nn.Linear(3, config.d_model)
@@ -102,10 +125,63 @@ class GridDemandModel(PreTrainedModel):
 
         return idx, mask
 
-    # NOTE: _init_weights를 오버라이드하지 않음 — transformers 5.0의 from_pretrained에서
-    # 커스텀 _init_weights가 건드리는 nn.Linear/nn.Embedding 모듈만 체크포인트 로드 후에
-    # 다시 랜덤 초기화되는 버그가 확인됨 (models/modeling.py 개발 중 재현/검증함).
-    # PyTorch 기본 초기화(Linear: kaiming_uniform, Embedding: normal)를 그대로 사용한다.
+    def _node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
+        """노드별 weight offset 파라미터 전부. 초기화/검증에서 한 곳으로 모아 쓴다."""
+        return (
+            self.node_delta_weight_ih,
+            self.node_delta_weight_hh,
+            self.node_delta_bias,
+            self.node_delta_out_weight,
+            self.node_delta_out_bias,
+        )
+
+    def _init_weights(self, module: nn.Module) -> None:
+        """상속받은 초기화를 그대로 유지한 채, 노드별 delta만 추가로 0으로 만든다.
+
+        **`super()._init_weights(module)` 호출을 빼면 안 된다.** 이 저장소는 원래 이 메서드를
+        재정의하지 않아 `PreTrainedModel._init_weights`(Linear/Embedding을 std=0.02로 초기화)를
+        상속해 쓰고 있었다. 여기서 조기 반환하면 모델 전체의 초기 분포가 바뀌어(node_embed의
+        std가 0.02 -> 1.06으로 관측됨) baseline-weather와 같은 출발점이 아니게 된다.
+
+        delta는 여기서 명시적으로 0을 넣어야 한다. transformers 5.0은 meta device에서 모델을
+        만든 뒤 체크포인트에 없는 키를 torch.empty로 실체화하므로, 생성자의 torch.zeros(...)가
+        delta 키가 없는 체크포인트(baseline-weather)를 로드할 때는 적용되지 않는다 — 실제로
+        NaN이 들어오는 것을 확인했다. 체크포인트에서 값을 받은 파라미터는 _is_hf_initialized가
+        붙으므로 건너뛴다(학습된 adaptive delta를 0으로 덮어쓰면 안 된다).
+        """
+        super()._init_weights(module)
+        if module is not self or not self.node_adaptive:
+            return
+        for param in self._node_delta_parameters():
+            if not getattr(param, '_is_hf_initialized', False):
+                param.data.zero_()
+
+    def _node_adaptive_lstm(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B,N,k,d_model) -> 마지막 시점의 hidden (B,N,lstm_hidden).
+
+        nn.LSTM은 샘플(노드)별 가중치를 받을 수 없어서 셀을 직접 돈다. 가중치는 self.lstm이
+        그대로 들고 있고 여기서는 노드별 delta만 더해 쓴다. delta가 전부 0이면 이 경로의 출력은
+        nn.LSTM과 수치적으로 동일하다(그래야 측정된 차이가 delta 때문임이 분리된다).
+
+        노드 인덱싱에 gather가 필요 없다 — 이 모델은 매 forward마다 N개 노드를 전부 예측하므로
+        delta의 노드 축이 einsum에서 그대로 맞물린다.
+        """
+        B, N, k, _ = x.shape
+        weight_ih = self.lstm.weight_ih_l0 + self.node_delta_weight_ih  # (N, 4h, d_model)
+        weight_hh = self.lstm.weight_hh_l0 + self.node_delta_weight_hh  # (N, 4h, lstm_hidden)
+        bias = self.lstm.bias_ih_l0 + self.lstm.bias_hh_l0 + self.node_delta_bias  # (N, 4h)
+
+        # 입력 투영은 h에 의존하지 않으므로 k개 시점을 한 번에 계산해 순차 구간을 절반으로 줄인다.
+        gates_x = torch.einsum('bnkd,nfd->bnkf', x, weight_ih) + bias.unsqueeze(1)  # (B,N,k,4h)
+
+        h = x.new_zeros(B, N, self.config.lstm_hidden)
+        c = x.new_zeros(B, N, self.config.lstm_hidden)
+        for t in range(k):
+            gates = gates_x[:, :, t] + torch.einsum('bnh,nfh->bnf', h, weight_hh)
+            i, f, g, o = gates.chunk(4, dim=-1)  # PyTorch LSTM 게이트 순서: i, f, g, o
+            c = f.sigmoid() * c + i.sigmoid() * g.tanh()
+            h = o.sigmoid() * c.tanh()
+        return h
 
     def _crop_all_nodes(self, demands: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """demands: (B, k, H, W) -> values (B,k,N,n_neighbors), mask (N,n_neighbors).
@@ -176,12 +252,20 @@ class GridDemandModel(PreTrainedModel):
         encoded = self.encoder(seq)  # (B*k*N, seq_len, d_model)
         cls_out = encoded[:, 0, :].reshape(B, k, N, d_model)
 
-        # 노드별로 독립적인 시계열이므로 (B,N)을 LSTM 배치로 합치고 k를 시퀀스 축으로 둔다.
-        cls_out = cls_out.permute(0, 2, 1, 3).reshape(B * N, k, d_model)
-        lstm_out, _ = self.lstm(cls_out)  # (B*N,k,lstm_hidden)
-        last = lstm_out[:, -1, :].reshape(B, N, -1)  # (B,N,lstm_hidden)
+        # 노드별로 독립적인 시계열이므로 노드 축을 배치로 돌리고 k를 시퀀스 축으로 둔다.
+        cls_out = cls_out.permute(0, 2, 1, 3)  # (B,N,k,d_model)
 
-        pred = F.softplus(self.output_proj(last)).squeeze(-1)  # (B,N)
+        if self.node_adaptive:
+            last = self._node_adaptive_lstm(cls_out)  # (B,N,lstm_hidden)
+            # 출력 헤드도 노드마다 다른 weight/bias를 쓴다. weight가 (1,lstm_hidden)이라
+            # squeeze 후 노드 축으로 브로드캐스트하면 노드별 내적이 된다.
+            out_weight = self.output_proj.weight.squeeze(0) + self.node_delta_out_weight  # (N,h)
+            out_bias = self.output_proj.bias + self.node_delta_out_bias  # (N,)
+            pred = F.softplus((last * out_weight).sum(-1) + out_bias)  # (B,N)
+        else:
+            lstm_out, _ = self.lstm(cls_out.reshape(B * N, k, d_model))  # (B*N,k,lstm_hidden)
+            last = lstm_out[:, -1, :].reshape(B, N, -1)  # (B,N,lstm_hidden)
+            pred = F.softplus(self.output_proj(last)).squeeze(-1)  # (B,N)
         logits = pred.reshape(B, H, W)  # labels(B,H,W)와 동일 shape, node_id=row*W+col 순서와 일치
 
         loss = None

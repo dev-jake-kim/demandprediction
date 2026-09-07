@@ -7,5 +7,8 @@ dim_feedforward: 128
 dropout: 0.1
 lstm_hidden: 64
 lstm_layers: 1
+# LSTM과 output_proj의 weight/bias를 노드마다 다르게 쓴다(공유 W + node id별 ΔW, 0으로 초기화).
+# 이 브랜치(lora)의 실험 대상. false면 baseline-weather와 완전히 동일하게 동작한다.
+node_adaptive: true
 loss_gamma: 1.0
 loss_eps: 0.5
