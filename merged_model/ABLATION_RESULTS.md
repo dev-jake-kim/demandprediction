@@ -91,7 +91,8 @@ ablation이 없는 `full` 모델을 loss(`mae`/`combined`)와 초기 탐색 런(
 
 ---
 
-- 원자료: `merged_model/runs/*.json` (git 추적됨)
+- 원자료: `output/merged_model/runs/*.json` (git 추적됨; 체크포인트 `.pt`·로그는 `output/`가
+  저장소 전체에서 gitignore 대상이라 로컬에만 남는다)
 
 - MAPE(+1) = `mean(|오차| / (|실측|+1)) * 100`
 

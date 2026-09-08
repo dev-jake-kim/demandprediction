@@ -388,7 +388,9 @@ def main() -> None:
 
     output_path = args.output
     if output_path is None:
-        output_path = Path(__file__).with_name("runs") / f"{args.dataset}_result.json"
+        # runs/ 자체가 output/ 아래로 옮겨졌다 — output/은 저장소 전체가 이미 gitignore하는
+        # 경로라 checkpoint(.pt)처럼 무거운 산출물을 소스 트리 밖에 둘 수 있다.
+        output_path = Path(__file__).parents[1] / "output" / "merged_model" / "runs" / f"{args.dataset}_result.json"
     output_path = output_path.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

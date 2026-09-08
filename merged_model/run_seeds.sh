@@ -21,8 +21,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 for seed in "${SEEDS[@]}"; do
-  out="merged_model/runs/${DATASET}_${LOSS_TYPE}_seed${seed}.json"
-  log="merged_model/logs/${DATASET}_${LOSS_TYPE}_seed${seed}.log"
+  out="output/merged_model/runs/${DATASET}_${LOSS_TYPE}_seed${seed}.json"
+  log="output/merged_model/logs/${DATASET}_${LOSS_TYPE}_seed${seed}.log"
   if [ -f "$out" ]; then
     echo "[skip] $out 이미 있음"
     continue

@@ -11,8 +11,8 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-QUEUE="merged_model/.ablation_queue"
-LOCK="merged_model/.ablation_queue.lock"
+QUEUE="output/merged_model/.ablation_queue"
+LOCK="output/merged_model/.ablation_queue.lock"
 # 3시드 운영: 셀 내부에서 평균과 표준오차를 직접 낼 수 있다. 기준선 full은 기존 5시드 런을
 # 그대로 쓴다(0-치환 리팩터 후에도 소수점 16자리까지 재현됨을 확인).
 SEEDS=(245 6835 851)
@@ -21,11 +21,12 @@ ABLATIONS=(no-ir no-periodic no-extra no-branch-attn no-neighbors)
 
 case "${1:-}" in
   build)
+    mkdir -p output/merged_model
     : > "$QUEUE"
     for ab in "${ABLATIONS[@]}"; do
       for city in ulsan porto; do
         for seed in "${SEEDS[@]}"; do
-          out="merged_model/runs/${city}_mae_${ab}_zero_seed${seed}.json"
+          out="output/merged_model/runs/${city}_mae_${ab}_zero_seed${seed}.json"
           [ -f "$out" ] && continue
           echo "$ab $city $seed" >> "$QUEUE"
         done
@@ -35,14 +36,14 @@ case "${1:-}" in
     ;;
   worker)
     GPU="${2:?gpu 번호 필요}"; SLOT="${3:?slot 번호 필요}"
-    mkdir -p merged_model/logs
+    mkdir -p output/merged_model/runs output/merged_model/logs
     while true; do
       # 큐에서 첫 줄을 원자적으로 꺼낸다.
       task=$(flock "$LOCK" bash -c "head -1 '$QUEUE' 2>/dev/null; sed -i '1d' '$QUEUE' 2>/dev/null")
       [ -z "$task" ] && { echo "[w$GPU-$SLOT] 큐 비어 종료 $(date +%H:%M:%S)"; break; }
       read -r ab city seed <<< "$task"
-      out="merged_model/runs/${city}_mae_${ab}_zero_seed${seed}.json"
-      log="merged_model/logs/${city}_mae_${ab}_zero_seed${seed}.log"
+      out="output/merged_model/runs/${city}_mae_${ab}_zero_seed${seed}.json"
+      log="output/merged_model/logs/${city}_mae_${ab}_zero_seed${seed}.log"
       echo "[w$GPU-$SLOT] $(date +%H:%M:%S) 시작 $ab/$city/$seed"
       PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="$GPU" conda run --no-capture-output -n DA \
         python -m merged_model.train --dataset "$city" --device cuda:0 --seed "$seed" \
