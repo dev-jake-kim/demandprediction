@@ -16,3 +16,4 @@ preprocessing/**/output/
 *.csv
 .claude/
 docs/PROJECT_SUMMARY.md
+docs/node_metric_comparison/
