@@ -1,4 +1,8 @@
-# merged_model 모듈 ablation 결과
+# merged 모델 모듈 ablation 결과
+
+> 이 표의 수치는 전부 포팅 **이전**의 `merged_model/` 구현(tmp 브랜치, 자체 학습 루프)에서
+> 나온 것이다. HuggingFace `Trainer` 구조로 옮긴 뒤 재학습한 값이 아니다.
+> 원자료 경로도 당시의 `output/merged_model/runs/*.json`이다.
 
 baseline은 `full`(ablation 없는 원본) — 각 표 상단에 볼드로 표기. `Δ`는 `(ablation − full) / full × 100`(%p)이고, 양수면 그 지표가 full보다 나빠졌다는 뜻이다(RMSE·MAPE(+1) 모두 낮을수록 좋음).
 
@@ -91,7 +95,7 @@ ablation이 없는 `full` 모델을 loss(`mae`/`combined`)와 초기 탐색 런(
 
 ---
 
-- 원자료: `output/merged_model/runs/*.json` (git 추적됨; 체크포인트 `.pt`·로그는 `output/`가 저장소 전체에서 gitignore 대상이라 로컬에만 남는다)
+- 원자료: `output/merged_model/runs/*.json` (포팅 이후 새 런은 `output/merged/runs/*.json`) (git 추적됨; 체크포인트 `.pt`·로그는 `output/`가 저장소 전체에서 gitignore 대상이라 로컬에만 남는다)
 
 - MAPE(+1) = `mean(|오차| / (|실측|+1)) * 100`
 

@@ -1,0 +1,85 @@
+# merged 모델(train_merged.py) 전용 루트 설정.
+# configs/config.yaml(baseline/node_adaptive)은 건드리지 않는다 — 이미 검증된 파이프라인이다.
+#
+# train: 블록의 값은 전부 원본 merged_model/train.py + merged_model/config.yaml의
+# training: 블록에서 그대로 가져온 것이다. TrainingArguments의 기본값과 다른 항목
+# (max_grad_norm, lr_scheduler_type, warmup_ratio, batch_size, num_workers, torch_compile,
+# metric_for_best_model)은 원본 수동 학습 루프와 정확히 일치시키기 위해 명시한다.
+defaults:
+  - dataset: ulsan
+  - model: merged
+  - _self_
+
+project_name: merged
+seed: 2026
+device: cuda
+
+# merged_model은 다른 브랜치와 다른 분할 비율(0.80/0.10/0.10)을 쓴다.
+# configs/dataset/*.yaml은 baseline과 공유하므로 여기서 로컬 오버라이드한다.
+dataset:
+  train_ratio: 0.80
+  val_ratio: 0.10
+
+# UnifiedDemandDataset의 daily/weekly lag 구성. 원본 merged_model/config.yaml의 data: 블록.
+# time_step은 configs/dataset/*.yaml의 것을 쓴다.
+data:
+  daily_period: 24
+  daily_lags: 6
+  weekly_period: 168
+  weekly_lags: 4
+  lag_radius: 0
+
+train:
+  # 원본: batch_size 8, num_workers 0
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  dataloader_num_workers: 0
+  # 원본은 torch.compile을 쓰지 않는다.
+  torch_compile: false
+  disable_tqdm: true
+  # 원본: epochs 2000 / patience 20 (min_epochs 없음 -> callbacks.early_stopping.min_epochs: 0)
+  num_train_epochs: 2000
+  remove_unused_columns: false
+  save_strategy: epoch
+  save_total_limit: 1
+  # 원본: torch.optim.AdamW(lr, weight_decay). betas/eps는 TrainingArguments 기본값과 동일.
+  optim: adamw_torch
+  learning_rate: 1e-3
+  weight_decay: 1e-4
+  # 원본에는 LR 스케줄러도 warmup도 없다(고정 lr). TrainingArguments 기본값은 linear+warmup이라
+  # 반드시 덮어써야 한다.
+  lr_scheduler_type: constant
+  warmup_ratio: 0.0
+  # 원본: clip_grad_norm_(max_norm=5.0). TrainingArguments 기본값은 1.0.
+  max_grad_norm: 5.0
+  # 원본은 epoch마다 train/val 지표를 한 줄씩 남겼다. 결과 JSON의 history를 같은 모양으로
+  # 유지하려면 step 단위가 아니라 epoch 단위로 로깅해야 한다.
+  logging_strategy: epoch
+  eval_strategy: epoch
+  load_best_model_at_end: true
+  # 원본: val loss(학습에 쓴 손실 자체) 최솟값으로 best 선택.
+  metric_for_best_model: loss
+  greater_is_better: false
+  seed: ${seed}
+  full_determinism: false
+
+callbacks:
+  early_stopping:
+    # 원본은 무조건 patience를 센다(최소 epoch 제한 없음).
+    min_epochs: 0
+    early_stopping_patience: 20
+
+# 기존 도구(run_ablation.sh / run_seeds.sh / ABLATION_RESULTS.md) 호환용 요약 JSON.
+# ablation은 파일 이름과 JSON 메타데이터에만 쓰이는 라벨이다 — 실제 스위치는 model.use_* 이다.
+ablation: full
+# smoke 테스트용: 각 split의 앞 N개 샘플만 쓴다(원본 --max-batches에 대응). null이면 전체.
+limit_samples: null
+# null이면 output/${project_name}/runs/<city>_<loss_type>_<ablation>_seed<seed>.json 에 쓴다.
+run_json: null
+
+hydra:
+  run:
+    dir: output/${project_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: output/${project_name}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}

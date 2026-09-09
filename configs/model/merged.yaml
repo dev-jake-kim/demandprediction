@@ -1,0 +1,44 @@
+# MergedDemandConfig 하이퍼파라미터. 값은 원본 merged_model/config.yaml의 model: 블록과 동일.
+# height/width/time_step/retrieval_grid_path/retrieval_train_end/weather_mean/weather_std는
+# 데이터에서 파생되므로 train_merged.py가 채운다.
+local_radius: 2
+d_model: 64
+num_fourier_bands: 8
+transformer_layers: 2
+transformer_heads: 4
+transformer_ffn: 128
+history_hidden: 64
+periodic_hidden: 64
+fusion_dim: 128
+dropout: 0.10
+retrieval_k: 20
+retrieval_chunk_size: 256
+# 검색 후보 범위. observed_past = tau < target_time(원본 기본값), train_prefix = train split까지만.
+retrieval_scope: observed_past
+# 요일/시간대 임베딩 차원. 날씨는 임베딩하지 않고 정규화한 3값을 그대로 concat하므로,
+# 세 LSTM에 붙는 보조 텐서는 3 + weekday_dim + hour_dim = 15차원이 된다.
+weekday_dim: 7
+hour_dim: 5
+
+# --- ablation 스위치 (기본값 = full, 아무것도 끄지 않은 모델) ---
+# ablation은 "0-치환" 방식이다 — 모듈을 없애지 않고 항상 생성·실행한 뒤 결과 텐서만 0으로
+# 바꾼다. 예외는 use_branch_attention으로, 어텐션은 출력이 아니라 선택 메커니즘이라
+# 0-치환이 성립하지 않아 균등 가중으로 대체한다.
+# CLI 오버라이드 예: python train_merged.py model.use_retrieval=false
+use_daily: true
+use_weekly: true
+use_retrieval: true
+use_weather: true
+# 'concat'(기본, 정규화 3값을 세 LSTM 입력에 붙임) | 'cls_add'(ir-weather 방식, CLS에 더함)
+weather_injection: concat
+use_calendar: true
+use_branch_attention: true
+use_neighbors: true
+use_softplus: true
+
+# 'combined'(저장소 공용 CombinedLoss, 다른 모든 브랜치와 동일한 목적함수) |
+# 'mae'(merged_model이 원래 쓰던 raw 스케일 L1). loss_gamma/loss_eps는 combined 전용이며
+# 값도 저장소 공용 설정(configs/model/baseline.yaml)과 같다.
+loss_type: combined
+loss_gamma: 1.0
+loss_eps: 0.5

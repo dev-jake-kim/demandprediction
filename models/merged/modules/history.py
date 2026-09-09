@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -54,7 +53,10 @@ class LocalHistoryEncoder(nn.Module):
         self.num_neighbors = self.window_size * self.window_size
         self.extra_dim = extra_dim
 
-        self.register_buffer("neighbor_valid", self._make_neighbor_valid(), persistent=False)
+        # persistent=True로 저장해야 한다: transformers 5.0의 from_pretrained는 모델을 meta
+        # device에서 만든 뒤 체크포인트에 있는 키만 실체화하므로, persistent=False 버퍼는
+        # 값이 복원되지 않고 깨진다(models/modeling.py의 idx_table/mask_table과 같은 이유).
+        self.register_buffer("neighbor_valid", self._make_neighbor_valid(), persistent=True)
         self.scalar_embedding = FourierScalarEmbedding(d_model, num_fourier_bands)
         self.special_embedding = nn.Embedding(2, d_model)  # 0: CLS, 1: EDGE
         self.node_embedding = nn.Parameter(torch.randn(self.num_nodes, d_model) * 0.02)
@@ -77,17 +79,18 @@ class LocalHistoryEncoder(nn.Module):
         self.history_lstm = nn.LSTM(d_model + extra_dim, history_hidden, batch_first=True)
 
     def _make_neighbor_valid(self) -> Tensor:
-        valid = np.zeros((self.num_nodes, self.num_neighbors), dtype=bool)
-        column = 0
-        for dy in range(-self.local_radius, self.local_radius + 1):
-            for dx in range(-self.local_radius, self.local_radius + 1):
-                for node in range(self.num_nodes):
-                    y, x = divmod(node, self.width)
-                    valid[node, column] = (
-                        0 <= y + dy < self.height and 0 <= x + dx < self.width
-                    )
-                column += 1
-        return torch.from_numpy(valid)
+        # 원본은 numpy 이중 루프였다. 값은 동일하되 torch 팩토리만 쓰도록 바꾼 이유는
+        # from_pretrained가 meta device 컨텍스트에서 __init__을 도는데, torch.from_numpy는
+        # 그 컨텍스트를 무시하고 CPU 텐서를 만들어 device가 섞이기 때문이다.
+        # 열 순서는 원본과 같다: column c -> dy = c // window - r, dx = c % window - r.
+        radius, window = self.local_radius, self.window_size
+        offsets = torch.arange(-radius, radius + 1)
+        dy = offsets.repeat_interleave(window)  # [neighbors]
+        dx = offsets.repeat(window)  # [neighbors]
+        node = torch.arange(self.num_nodes)
+        y = torch.div(node, self.width, rounding_mode="floor").unsqueeze(1) + dy.unsqueeze(0)
+        x = (node % self.width).unsqueeze(1) + dx.unsqueeze(0)
+        return (y >= 0) & (y < self.height) & (x >= 0) & (x < self.width)
 
     def crop(self, demands: Tensor) -> Tensor:
         """Return raw local windows as ``[B, k, N, neighbors]``."""
