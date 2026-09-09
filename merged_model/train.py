@@ -44,6 +44,9 @@ ABLATIONS: dict[str, dict[str, object]] = {
     "no-neighbors": {"use_neighbors": False},
     # 임베딩 방식 변형: 날씨를 LSTM concat 대신 ir-weather식으로 CLS에 더한다.
     "weather-cls-add": {"weather_injection": "cls_add"},
+    # 최종 예측의 softplus(x)=log(1+exp(x)) 양수 보정을 없애고 raw 선형 출력을 그대로 쓴다.
+    # 음수 예측이 나올 수 있다 — loss/지표 계산 자체는 부호에 무관해 문제없이 돈다.
+    "no-softplus": {"use_softplus": False},
 }
 
 if __package__ in {None, ""}:  # Allow both ``python train.py`` and ``python -m ...``.

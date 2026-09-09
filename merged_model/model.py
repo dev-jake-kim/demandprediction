@@ -59,6 +59,7 @@ class UnifiedDemandModel(nn.Module):
         use_calendar: bool = True,
         use_branch_attention: bool = True,
         use_neighbors: bool = True,
+        use_softplus: bool = True,
         loss_type: str = "combined",
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
@@ -103,6 +104,7 @@ class UnifiedDemandModel(nn.Module):
         self.use_calendar = use_calendar
         self.use_branch_attention = use_branch_attention
         self.use_neighbors = use_neighbors
+        self.use_softplus = use_softplus
 
         # 날씨는 임베딩하지 않고 정규화한 3값을 그대로 LSTM 입력에 concat한다. 요일/시간대만
         # 임베딩 테이블을 쓰며, 세 브랜치가 같은 테이블을 공유한다(요일 3은 어느 브랜치에서나 요일 3).
@@ -168,7 +170,7 @@ class UnifiedDemandModel(nn.Module):
             retrieval_scope=retrieval_scope,
             retrieval_train_end=retrieval_train_end,
         )
-        self.output_gate = NeuralRetrievalGate(fusion_dim)
+        self.output_gate = NeuralRetrievalGate(fusion_dim, use_softplus=use_softplus)
         # 이 저장소의 다른 모델들과 목적함수를 맞추려면 'combined'(CombinedLoss)를 쓴다.
         # 'mae'는 merged_model이 원래 쓰던 raw 스케일 L1이며, 두 경우 모두 reduction='none'
         # 이라 아래 forward에서 mean/sum을 각각 뽑는다.
@@ -247,10 +249,17 @@ class UnifiedDemandModel(nn.Module):
             h_neural, h_daily, h_weekly, daily_valid, weekly_valid
         )
 
-        ir_out = self.retrieval(local_crop, sample_idx)
-        if not self.use_retrieval:
-            ir_out = torch.zeros_like(ir_out)
-        neural_pred, lambda_weight, prediction = self.output_gate(h_attn, ir_out)
+        if self.use_retrieval:
+            ir_out = self.retrieval(local_crop, sample_idx)
+            neural_pred, lambda_weight, prediction = self.output_gate(h_attn, ir_out)
+        else:
+            # 검색기를 아예 호출하지 않는다 — 0으로 치환한 ir_out을 게이트에 흘려보내면
+            # lambda가 0으로 무너지는 죽음의 함정이 생긴다(modules/fusion.py 참고).
+            # bypass_gate=True로 게이트 자체를 건너뛰어 그 함정을 구조적으로 없앤다.
+            ir_out = None
+            neural_pred, lambda_weight, prediction = self.output_gate(
+                h_attn, None, bypass_gate=True
+            )
         prediction_grid = prediction.reshape(-1, self.height, self.width)
 
         output = {
