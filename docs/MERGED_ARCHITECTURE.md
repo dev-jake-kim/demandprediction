@@ -28,10 +28,10 @@ dataset or training loop.
 | `models/merged/modules/attention.py` | node-wise daily/weekly/neural attention | branch selection/fusion |
 | `models/merged/modules/retrieval.py` | raw causal cosine retrieval and cache | retrieval scope/top-k/chunking |
 | `models/merged/modules/fusion.py` | neural/retrieval output gate | final prediction fusion |
-| `train_merged.py` | Hydra + `Trainer` 학습 진입점, early stopping, 결과 JSON | training schedule or CLI |
-| `test_merged.py` | 체크포인트 단독 평가 | 평가 지표/스플릿 |
+| `train.py` | Hydra + `Trainer` 학습 진입점, early stopping, 결과 JSON | training schedule or CLI |
+| `test.py` | 체크포인트 단독 평가 | 평가 지표/스플릿 |
 | `validate_merged.py` | structural, gradient, mask, and causal checks | regression checks |
-| `configs/config_merged.yaml` | 학습 하이퍼파라미터(원본 `training:` 블록과 1:1) | 학습 스케줄 |
+| `configs/config.yaml` | 학습 하이퍼파라미터(원본 `training:` 블록과 1:1) | 학습 스케줄 |
 | `configs/model/merged.yaml` | 모델 하이퍼파라미터 + ablation 스위치 기본값 | dimensions, lags, retrieval policy, `weekday_dim`, `hour_dim` |
 | `run_ablation.sh` / `run_seeds.sh` | 큐/다중 시드 러너 (ablation 이름 → Hydra 오버라이드) | 실행 조합 |
 
@@ -52,12 +52,12 @@ models/merged/
     ├── retrieval.py
     ├── fusion.py
     └── __init__.py
-configs/config_merged.yaml  # Hydra 루트 설정(학습 하이퍼파라미터)
-configs/model/merged.yaml   # 모델 하이퍼파라미터 + ablation 스위치
-train_merged.py             # Hydra + Trainer 학습 진입점
-test_merged.py              # 체크포인트 단독 평가
-validate_merged.py          # fast pre-training checks
-run_ablation.sh             # ablation 큐 러너
+configs/config.yaml        # Hydra 루트 설정(학습 하이퍼파라미터)
+configs/model/merged.yaml  # 모델 하이퍼파라미터 + ablation 스위치
+train.py                   # Hydra + Trainer 학습 진입점
+test.py                    # 체크포인트 단독 평가
+validate_merged.py         # fast pre-training checks
+run_ablation.sh            # ablation 큐 러너
 run_seeds.sh                # 다중 시드 러너
 ```
 
@@ -100,7 +100,7 @@ reconstructed from the temporal grid when a model is created.
   `forward_debug()` returns the full tensor dict (`neural_pred`, `ir_out`,
   `lambda_weight`, `attention_weights`, ...) for validation scripts only.
 - Add branch-specific code under `models/merged/modules/`; do not put new
-  architecture into `train_merged.py` or `dataset_frame/`.
+  architecture into `train.py` or `dataset_frame/`.
 - Preserve output keys consumed by training and validation unless the contract
   and documentation are updated together.
 - Run `python validate_merged.py --device cpu` after changes to data flow,

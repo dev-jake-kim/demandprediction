@@ -1,6 +1,6 @@
 # MergedDemandConfig 하이퍼파라미터. 값은 원본 merged_model/config.yaml의 model: 블록과 동일.
 # height/width/time_step/retrieval_grid_path/retrieval_train_end/weather_mean/weather_std는
-# 데이터에서 파생되므로 train_merged.py가 채운다.
+# 데이터에서 파생되므로 train.py가 채운다.
 local_radius: 2
 d_model: 64
 num_fourier_bands: 8
@@ -24,7 +24,7 @@ hour_dim: 5
 # ablation은 "0-치환" 방식이다 — 모듈을 없애지 않고 항상 생성·실행한 뒤 결과 텐서만 0으로
 # 바꾼다. 예외는 use_branch_attention으로, 어텐션은 출력이 아니라 선택 메커니즘이라
 # 0-치환이 성립하지 않아 균등 가중으로 대체한다.
-# CLI 오버라이드 예: python train_merged.py model.use_retrieval=false
+# CLI 오버라이드 예: python train.py model.use_retrieval=false
 use_daily: true
 use_weekly: true
 use_retrieval: true

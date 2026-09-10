@@ -145,7 +145,7 @@ class UnifiedDemandDataset(Dataset):
     index.
 
     반환 dict의 키는 ``MergedDemandModel.forward``의 인자명과 1:1로 맞춰져 있다
-    (``configs/config_merged.yaml``의 ``remove_unused_columns: false``와 짝).
+    (``configs/config.yaml``의 ``remove_unused_columns: false``와 짝).
     """
 
     def __init__(

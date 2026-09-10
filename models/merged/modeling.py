@@ -59,7 +59,7 @@ class MergedDemandModel(PreTrainedModel):
         if config.weather_mean is None or config.weather_std is None:
             raise ValueError(
                 'weather_mean/weather_std(각 3개, train split 통계)가 필요함 — '
-                '시간 리크를 막으려면 train_merged.py가 train 구간에서만 계산해 넘겨야 한다'
+                '시간 리크를 막으려면 train.py가 train 구간에서만 계산해 넘겨야 한다'
             )
         # 값 검사는 파이썬 리스트에서 한다. from_pretrained가 meta device에서 __init__을
         # 돌기 때문에, 텐서로 만든 뒤 검사하면 meta 텐서에 bool()을 부르게 되어 깨진다.

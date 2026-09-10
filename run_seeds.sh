@@ -28,7 +28,7 @@ for seed in "${SEEDS[@]}"; do
   mkdir -p output/merged/runs output/merged/logs
   echo "[run ] dataset=$DATASET loss=$LOSS_TYPE seed=$seed -> $out"
   PYTHONUNBUFFERED=1 conda run --no-capture-output -n DA \
-    python train_merged.py \
+    python train.py \
       dataset="$DATASET" train.seed="$seed" model.loss_type="$LOSS_TYPE" \
       ablation=full run_json="$out" > "$log" 2>&1
   echo "[done] seed=$seed $(python3 -c "

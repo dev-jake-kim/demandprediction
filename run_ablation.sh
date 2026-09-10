@@ -71,7 +71,7 @@ case "${1:-}" in
       echo "[w$GPU-$SLOT] $(date +%H:%M:%S) 시작 $ab/$city/$seed"
       # shellcheck disable=SC2086
       PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="$GPU" conda run --no-capture-output -n DA \
-        python train_merged.py dataset="$city" train.seed="$seed" \
+        python train.py dataset="$city" train.seed="$seed" \
           model.loss_type=mae ablation="$ab" run_json="$out" $overrides > "$log" 2>&1
       if [ -f "$out" ]; then
         echo "[w$GPU-$SLOT] $(date +%H:%M:%S) 완료 $ab/$city/$seed $(python3 -c "

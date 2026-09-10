@@ -8,7 +8,7 @@ class MergedDemandConfig(PretrainedConfig):
 
     ``GridDemandConfig``와 같은 패턴이다 — 파일 경로/데이터 파생값(``height``, ``width``,
     ``retrieval_grid_path``, ``retrieval_train_end``, ``weather_mean``, ``weather_std``)은
-    학습 스크립트(``train_merged.py``)가 계산해서 주입하고, 나머지 하이퍼파라미터는
+    학습 스크립트(``train.py``)가 계산해서 주입하고, 나머지 하이퍼파라미터는
     ``configs/model/merged.yaml``에서 온다.
 
     9개 ablation 스위치(``use_daily``/``use_weekly``/``use_retrieval``/``use_weather``/
@@ -69,14 +69,14 @@ class MergedDemandConfig(PretrainedConfig):
         self.periodic_hidden = periodic_hidden
         self.fusion_dim = fusion_dim
         self.dropout = dropout
-        # 검색 브랜치가 읽는 temporal grid(.npy)의 절대경로. train_merged.py가 주입한다.
+        # 검색 브랜치가 읽는 temporal grid(.npy)의 절대경로. train.py가 주입한다.
         self.retrieval_grid_path = retrieval_grid_path
         self.retrieval_k = retrieval_k
         self.retrieval_chunk_size = retrieval_chunk_size
         self.retrieval_scope = retrieval_scope
         # 'train_prefix' 검색에서만 쓰이는 경계값. train split의 끝(절대 시간 인덱스).
         self.retrieval_train_end = retrieval_train_end
-        # train split 통계(3개씩, leakage 방지 위해 train_merged.py가 계산해 주입).
+        # train split 통계(3개씩, leakage 방지 위해 train.py가 계산해 주입).
         self.weather_mean = weather_mean
         self.weather_std = weather_std
         self.weekday_dim = weekday_dim

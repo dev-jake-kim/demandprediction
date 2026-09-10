@@ -1,7 +1,5 @@
 city: porto
 npy_path: data/raw/porto_temporal_grid.npy
-# 이 브랜치의 baseline train.py/models/는 날씨를 안 쓴다 - train_merged.py 전용 키
-# (README.md "merged 모델" 절 참고).
 weather_csv_path: data/raw/porto_meteorological_data.csv
 time_step: 24
 # 시간순 분할 (셔플 X) - train_ratio + val_ratio < 1, 나머지는 test

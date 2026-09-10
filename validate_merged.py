@@ -24,14 +24,14 @@ from torch.utils.data import DataLoader
 from dataset_frame import UnifiedDemandDataset, resolve_dataset_path
 from models.merged import MergedDemandConfig, MergedDemandModel
 from models.merged.modules import BranchAttention, CausalRetrieval, PeriodicLSTMEncoder
-from train_merged import build_dataset_kwargs
+from train import build_dataset_kwargs
 
 ROOT = Path(__file__).resolve().parent
 
 
 def _compose(city: str):
     with initialize_config_dir(config_dir=str(ROOT / 'configs'), version_base=None):
-        return compose(config_name='config_merged', overrides=[f'dataset={city}'])
+        return compose(config_name='config', overrides=[f'dataset={city}'])
 
 
 def _check_dataset(city: str, device: torch.device) -> dict:
