@@ -7,8 +7,10 @@
 3. 짧은 smoke 학습 A/B — 동일 seed, 동일 배치 순서(sequential)로 몇 스텝만 돌려 두 구현의
    loss 궤적이 일치하는지.
 
-구 구현은 저장소에 없다(tmp 브랜치 이력에만 있음). ``git show tmp:merged_model/<file>``로
-임시 디렉터리에 복원해 import한다.
+구 구현은 워킹 트리에 없다(포팅 직전 커밋에만 있음). ``git show <LEGACY_REF>:merged_model/<file>``로
+임시 디렉터리에 복원해 import한다. ``tmp`` 브랜치 이름 자체를 쓰지 않는 이유: 이 테스트가 옮겨간
+바로 그 브랜치(tmp)에서, 이 포팅 커밋 이후로 ``tmp``가 계속 전진하면 ``tmp:merged_model/...``가
+더 이상 legacy 코드를 가리키지 않게 된다 — 그래서 포팅 직전 커밋 해시를 고정해서 쓴다.
 
     conda run -n DA python tests/test_merged_parity.py --device cuda
 """
@@ -86,14 +88,19 @@ DATA_KWARGS = dict(
 )
 
 
+# 포팅 커밋(models/merged로 이관 + merged_model/ 삭제) 바로 이전, legacy merged_model/이
+# 마지막으로 존재했던 커밋. tmp 브랜치가 그 뒤로 전진해도 이 해시는 그 시점의 파일을 그대로 가리킨다.
+LEGACY_REF = '81472a5'
+
+
 def restore_legacy_package(destination: Path) -> None:
-    """tmp 브랜치의 merged_model/를 ``merged_legacy`` 패키지로 복원한다."""
+    """포팅 이전 커밋의 merged_model/을 ``merged_legacy`` 패키지로 복원한다."""
 
     package = destination / 'merged_legacy'
     (package / 'modules').mkdir(parents=True, exist_ok=True)
     for relative in LEGACY_FILES:
         blob = subprocess.run(
-            ['git', 'show', f'tmp:merged_model/{relative}'],
+            ['git', 'show', f'{LEGACY_REF}:merged_model/{relative}'],
             cwd=REPO_ROOT,
             check=True,
             capture_output=True,
