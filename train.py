@@ -1,13 +1,15 @@
 """merged 모델(로컬 히스토리 + daily/weekly 주기 + 인과적 검색 + 브랜치 어텐션) 학습 스크립트.
 
 원본 ``merged_model/train.py``의 수동 학습 루프를 이 저장소 공용 관례(Hydra + HF ``Trainer``)로
-옮긴 것이다. 학습 하이퍼파라미터는 ``configs/config.yaml``에 원본과 1:1로 맞춰 두었다
-(gradient clipping 5.0, 고정 LR, batch 8, epochs 2000, patience 20, num_workers 0,
-best = val loss 최소, torch_compile 없음).
+옮긴 것이다. 학습 하이퍼파라미터(gradient clipping 5.0, 고정 LR, epochs 2000, patience 20,
+num_workers 0, best = val loss 최소, torch_compile 없음)는 원본과 1:1로 맞춰 두었다.
 
-ablation은 Hydra CLI 오버라이드로 켜고 끈다::
+도시마다 최적 하이퍼파라미터가 달라 루트 config를 도시별로 분리했다 — 기본값은
+``configs/config_ulsan.yaml``, porto는 ``--config-name config_porto``로 명시한다::
 
-    python train.py model.use_retrieval=false ablation=no-ir
+    python train.py                                    # ulsan
+    python train.py --config-name config_porto          # porto
+    python train.py model.use_retrieval=false ablation=no-ir   # ablation (ulsan)
 
 이 브랜치(tmp)에는 다른 모델 구현이 없다(models/config.py, models/modeling.py 부재 —
 models/__init__.py 참고) — train.py는 이 모델 하나만 학습하는 단일 진입점이다.
@@ -29,6 +31,17 @@ from dataset_frame import UnifiedDemandDataset, resolve_dataset_path
 from models.merged import MergedDemandConfig, MergedDemandModel, compute_merged_metrics
 
 logger = logging.getLogger(__name__)
+
+# PyTorch의 memory-efficient SDPA 백엔드는 dropout용 seed/offset을 (배치*시퀀스들을 펼친) 유효
+# batch 하나당 인덱스 하나로 추적하는데, 그 인덱스가 65535(uint16)를 넘으면
+# "Efficient attention cannot produce valid seed and offset outputs"로 죽는다.
+# models/merged/modules/history.py의 LocalHistoryEncoder는 (batch, time_step, H*W) 전체를
+# (batch*time_step*H*W, 1+neighbors, d_model)로 펼쳐 넣으므로, 노드 수가 많은 도시(예: porto
+# 19*20=380)는 batch_size=8만 돼도 8*24*380=72,960으로 한계를 넘는다(ulsan 14*12=168은
+# 32,256이라 안 넘음). 이 백엔드를 끄면 우회는 되지만 fallback(math) 백엔드가 어텐션 행렬을
+# 그대로 만들어 메모리를 훨씬 더 써서 d_model이 크면 오히려 OOM이 난다 — 그래서 백엔드를
+# 건드리지 않고, 이 한계를 넘지 않도록 배치 크기를 낮추는 쪽을 택한다(아래 main() 참고).
+SDPA_BATCH_LIMIT = 65535
 
 # ablation 방식: 모듈을 지우지 않고, 그 모듈이 결과로 이어지는 텐서만 0으로 바꾼다.
 # 구조/파라미터 수/텐서 shape가 전부 보존되므로 측정된 차이가 "그 모듈의 정보" 때문임이
@@ -151,7 +164,7 @@ def _summarize_history(log_history: list[dict]) -> tuple[list[dict], int, float]
     return history, best_epoch, best_val
 
 
-@hydra.main(config_path='configs', config_name='config', version_base=None)
+@hydra.main(config_path='configs', config_name='config_ulsan', version_base=None)
 def main(cfg: DictConfig) -> None:
     data_path, dataset_kwargs, train_ds, val_ds, test_ds = build_datasets(cfg)
 
@@ -191,6 +204,20 @@ def main(cfg: DictConfig) -> None:
     output_dir = HydraConfig.get().runtime.output_dir
     train_cfg = OmegaConf.to_container(cfg.train, resolve=True)
     early_stopping_cfg = cfg.callbacks.early_stopping
+
+    # SDPA_BATCH_LIMIT 주석 참고 — 노드 수가 많은 도시에서 batch_size를 자동으로 낮춘다.
+    # train/eval 배치 크기를 같이 낮춰야 train 중간의 eval도 안전하다.
+    nodes = train_ds.height * train_ds.width
+    per_sample = train_ds.time_step * nodes
+    max_batch = max(1, SDPA_BATCH_LIMIT // per_sample)
+    for key in ('per_device_train_batch_size', 'per_device_eval_batch_size'):
+        if train_cfg[key] > max_batch:
+            logger.warning(
+                f'{key}={train_cfg[key]}는 time_step({train_ds.time_step}) * nodes({nodes})'
+                f'={per_sample}와 곱하면 SDPA_BATCH_LIMIT({SDPA_BATCH_LIMIT})을 넘어'
+                f'memory-efficient attention이 죽는다 -> {max_batch}로 낮춘다'
+            )
+            train_cfg[key] = max_batch
 
     args = TrainingArguments(output_dir=output_dir, **train_cfg)
     trainer = Trainer(

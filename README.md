@@ -21,16 +21,19 @@ conda activate DA
 
 ## 학습 (train.py)
 
-Hydra로 설정을 관리한다 (`configs/config.yaml` + `configs/dataset/*.yaml` + `configs/model/merged.yaml`).
+Hydra로 설정을 관리한다. **도시마다 최적 하이퍼파라미터가 달라 루트 config가 도시별로 분리돼
+있다** (`configs/config_ulsan.yaml` + `configs/model/merged_ulsan.yaml`, `configs/config_porto.yaml`
++ `configs/model/merged_porto.yaml`, 둘 다 `configs/dataset/*.yaml` 공유). 근거는
+`docs/MERGED_TUNING_RESULTS.md`.
 
 ```bash
-python train.py                                   # dataset=ulsan (full)
-python train.py dataset=porto model.loss_type=mae
-python train.py model.use_retrieval=false ablation=no-ir   # ablation
-python validate_merged.py --device cpu            # 학습 전 빠른 구조/인과 검사
+python train.py                                            # ulsan (기본값, full)
+python train.py --config-name config_porto model.loss_type=mae   # porto
+python train.py model.use_retrieval=false ablation=no-ir   # ablation (ulsan)
+python validate_merged.py --device cpu                     # 학습 전 빠른 구조/인과 검사
 ```
 
-- 결과(로그, 체크포인트)는 `output/${project_name}/{날짜}/{시간}/`에 저장된다 (`configs/config.yaml`의 `hydra.run.dir`).
+- 결과(로그, 체크포인트)는 `output/${project_name}/{날짜}/{시간}/`에 저장된다 (`hydra.run.dir`).
 - 결과 요약 JSON은 `output/merged/runs/<city>_<loss_type>_<ablation>_seed<seed>.json`에도 남는다
   (`run_ablation.sh`/`run_seeds.sh` 등 기존 도구가 존재 여부로 진행 상황을 판단하는 파일).
 - 학습이 끝나면 `trainer.save_model(output_dir)`로 `config.json`+가중치가 저장되어, test.py가

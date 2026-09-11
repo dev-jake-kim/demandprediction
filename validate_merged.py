@@ -30,8 +30,11 @@ ROOT = Path(__file__).resolve().parent
 
 
 def _compose(city: str):
+    # 도시마다 최적 하이퍼파라미터가 달라 루트 config가 도시별로 나뉘어 있다
+    # (configs/config_ulsan.yaml / configs/config_porto.yaml) — dataset= 오버라이드만으로는
+    # model: 그룹(따라서 하이퍼파라미터)이 안 바뀌므로 config_name 자체를 골라야 한다.
     with initialize_config_dir(config_dir=str(ROOT / 'configs'), version_base=None):
-        return compose(config_name='config', overrides=[f'dataset={city}'])
+        return compose(config_name=f'config_{city}')
 
 
 def _check_dataset(city: str, device: torch.device) -> dict:

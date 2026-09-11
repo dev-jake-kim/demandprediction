@@ -27,9 +27,11 @@ for seed in "${SEEDS[@]}"; do
   fi
   mkdir -p output/merged/runs output/merged/logs
   echo "[run ] dataset=$DATASET loss=$LOSS_TYPE seed=$seed -> $out"
+  # 도시마다 최적 하이퍼파라미터가 달라 루트 config가 나뉘어 있다(config_ulsan/config_porto)
+  # — dataset="$DATASET" 오버라이드만으로는 model: 그룹이 안 바뀌므로 --config-name을 쓴다.
   PYTHONUNBUFFERED=1 conda run --no-capture-output -n DA \
-    python train.py \
-      dataset="$DATASET" train.seed="$seed" model.loss_type="$LOSS_TYPE" \
+    python train.py --config-name "config_${DATASET}" \
+      train.seed="$seed" model.loss_type="$LOSS_TYPE" \
       ablation=full run_json="$out" > "$log" 2>&1
   echo "[done] seed=$seed $(python3 -c "
 import json;d=json.load(open('$out'));t=d['test']

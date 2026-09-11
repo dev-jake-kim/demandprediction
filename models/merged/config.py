@@ -8,8 +8,8 @@ class MergedDemandConfig(PretrainedConfig):
 
     ``GridDemandConfig``와 같은 패턴이다 — 파일 경로/데이터 파생값(``height``, ``width``,
     ``retrieval_grid_path``, ``retrieval_train_end``, ``weather_mean``, ``weather_std``)은
-    학습 스크립트(``train.py``)가 계산해서 주입하고, 나머지 하이퍼파라미터는
-    ``configs/model/merged.yaml``에서 온다.
+    학습 스크립트(``train.py``)가 계산해서 주입하고, 나머지 하이퍼파라미터는 도시별
+    ``configs/model/merged_ulsan.yaml`` / ``configs/model/merged_porto.yaml``에서 온다.
 
     9개 ablation 스위치(``use_daily``/``use_weekly``/``use_retrieval``/``use_weather``/
     ``weather_injection``/``use_calendar``/``use_branch_attention``/``use_neighbors``/

@@ -31,8 +31,8 @@ dataset or training loop.
 | `train.py` | Hydra + `Trainer` 학습 진입점, early stopping, 결과 JSON | training schedule or CLI |
 | `test.py` | 체크포인트 단독 평가 | 평가 지표/스플릿 |
 | `validate_merged.py` | structural, gradient, mask, and causal checks | regression checks |
-| `configs/config.yaml` | 학습 하이퍼파라미터(원본 `training:` 블록과 1:1) | 학습 스케줄 |
-| `configs/model/merged.yaml` | 모델 하이퍼파라미터 + ablation 스위치 기본값 | dimensions, lags, retrieval policy, `weekday_dim`, `hour_dim` |
+| `configs/config_ulsan.yaml` / `configs/config_porto.yaml` | 학습 하이퍼파라미터(원본 `training:` 블록과 1:1) — 도시별 루트 config | 학습 스케줄, `--config-name` 선택 |
+| `configs/model/merged_ulsan.yaml` / `configs/model/merged_porto.yaml` | 모델 하이퍼파라미터 + ablation 스위치 기본값 — 도시별 최적값(`docs/MERGED_TUNING_RESULTS.md`) | dimensions, lags, retrieval policy, `weekday_dim`, `hour_dim` |
 | `run_ablation.sh` / `run_seeds.sh` | 큐/다중 시드 러너 (ablation 이름 → Hydra 오버라이드) | 실행 조합 |
 
 ## Directory layout
@@ -52,8 +52,10 @@ models/merged/
     ├── retrieval.py
     ├── fusion.py
     └── __init__.py
-configs/config.yaml        # Hydra 루트 설정(학습 하이퍼파라미터)
-configs/model/merged.yaml  # 모델 하이퍼파라미터 + ablation 스위치
+configs/config_ulsan.yaml        # Hydra 루트 설정(학습 하이퍼파라미터) — ulsan, 기본값
+configs/config_porto.yaml        # Hydra 루트 설정 — porto, --config-name config_porto
+configs/model/merged_ulsan.yaml  # 모델 하이퍼파라미터 + ablation 스위치 — ulsan 최적값
+configs/model/merged_porto.yaml  # 모델 하이퍼파라미터 + ablation 스위치 — porto 최적값
 train.py                   # Hydra + Trainer 학습 진입점
 test.py                    # 체크포인트 단독 평가
 validate_merged.py         # fast pre-training checks

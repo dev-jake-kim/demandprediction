@@ -70,8 +70,10 @@ case "${1:-}" in
       overrides="${ABLATION_OVERRIDES[$ab]:-}"
       echo "[w$GPU-$SLOT] $(date +%H:%M:%S) 시작 $ab/$city/$seed"
       # shellcheck disable=SC2086
+      # 도시마다 최적 하이퍼파라미터가 달라 루트 config가 나뉘어 있다(config_ulsan/config_porto)
+      # — dataset="$city" 오버라이드만으로는 model: 그룹이 안 바뀌므로 --config-name을 쓴다.
       PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="$GPU" conda run --no-capture-output -n DA \
-        python train.py dataset="$city" train.seed="$seed" \
+        python train.py --config-name "config_${city}" train.seed="$seed" \
           model.loss_type=mae ablation="$ab" run_json="$out" $overrides > "$log" 2>&1
       if [ -f "$out" ]; then
         echo "[w$GPU-$SLOT] $(date +%H:%M:%S) 완료 $ab/$city/$seed $(python3 -c "
