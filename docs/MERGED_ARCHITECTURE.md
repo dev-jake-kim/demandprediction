@@ -20,10 +20,10 @@ dataset or training loop.
 | `dataset_frame/unified_demand_dataset.py` | temporal-grid loading, split, lag tables, invalid masks, weather/calendar tables | time split, lag count, `lag_radius`, weather source |
 | `models/merged/modeling.py` | branch wiring, weather/calendar context assembly, raw-scale loss contract | tensor flow or output keys |
 | `models/merged/config.py` | `MergedDemandConfig` — 생성자 인자 전부와 9개 ablation 스위치 | 새 하이퍼파라미터 |
-| `models/merged/losses.py` | the two selectable objectives (`combined`, `mae`); `combined`은 공용 `models/losses.py`를 재사용 | the objective itself |
+| `models/merged/losses.py` | selectable objectives (`combined`, `mae`, `rmse_mape`); `combined`/`rmse_mape`은 공용 `models/losses.py`를 재사용 | the objective itself |
 | `models/merged/metrics.py` | RMSE/MAE/MAPE(+1)/MAPE(0제외) | 보고 지표 |
 | `models/merged/modules/embeddings.py` | scalar/Fourier token embedding | scalar feature encoding |
-| `models/merged/modules/history.py` | local crop, EDGE/CLS tokens, Transformer, history LSTM (context concatenated) | another neural branch |
+| `models/merged/modules/history.py` | local crop, EDGE/CLS tokens, Transformer, history LSTM (context concatenated), 노드별 ΔW | another neural branch |
 | `models/merged/modules/periodic.py` | daily/weekly LSTM, invalid-lag compaction, context concatenation | periodic encoders |
 | `models/merged/modules/attention.py` | node-wise daily/weekly/neural attention | branch selection/fusion |
 | `models/merged/modules/retrieval.py` | raw causal cosine retrieval and cache | retrieval scope/top-k/chunking |
@@ -31,7 +31,7 @@ dataset or training loop.
 | `train.py` | Hydra + `Trainer` 학습 진입점, early stopping, 결과 JSON | training schedule or CLI |
 | `test.py` | 체크포인트 단독 평가 | 평가 지표/스플릿 |
 | `validate_merged.py` | structural, gradient, mask, and causal checks | regression checks |
-| `configs/config_ulsan.yaml` / `configs/config_porto.yaml` | 학습 하이퍼파라미터(원본 `training:` 블록과 1:1) — 도시별 루트 config | 학습 스케줄, `--config-name` 선택 |
+| `configs/config_ulsan.yaml` / `configs/config_porto.yaml` | 학습 하이퍼파라미터(원본 `training:` 블록과 1:1) + `stage2:` 블록 — 도시별 루트 config | 학습 스케줄, `--config-name` 선택, 2-stage 설정 |
 | `configs/model/merged_ulsan.yaml` / `configs/model/merged_porto.yaml` | 모델 하이퍼파라미터 + ablation 스위치 기본값 — 도시별 최적값(`docs/MERGED_TUNING_RESULTS.md`) | dimensions, lags, retrieval policy, `weekday_dim`, `hour_dim` |
 | `run_ablation.sh` / `run_seeds.sh` | 큐/다중 시드 러너 (ablation 이름 → Hydra 오버라이드) | 실행 조합 |
 
@@ -77,7 +77,7 @@ h_neural → query
 [h_daily, h_weekly, h_neural] → key/value candidates → branch attention → h_attn
 
 raw local crop + absolute sample_idx → CausalRetrieval → ir_out
-h_attn + ir_out → NeuralRetrievalGate → prediction → loss(labels)   # combined | mae
+h_attn + ir_out → NeuralRetrievalGate → prediction → loss(labels)   # combined | mae | rmse_mape
 ```
 
 The daily/weekly masks are applied twice: valid lags are compacted before the
@@ -94,6 +94,72 @@ reference-implementation comparison.
 The retrieval module uses raw values and only candidate times
 `[time_step, target_time)`. Its CPU cache is not part of the checkpoint; it is
 reconstructed from the temporal grid when a model is created.
+
+## 노드별 LSTM weight offset (`node_adaptive`)
+
+lora 브랜치의 node_adaptive(W + ΔW)를 이 모델의 **history LSTM 하나에만** 옮긴 것이다.
+`model.node_adaptive=true`일 때만 켜지며, 기본값은 `false`다 — 꺼져 있으면 delta 파라미터가
+아예 만들어지지 않아 `state_dict`가 이 기능 추가 이전과 정확히 같고, 기존 체크포인트와
+`tests/test_merged_parity.py`가 그대로 유지된다.
+
+```text
+weight_ih = history_lstm.weight_ih_l0 + node_delta_weight_ih   # (A, 4h, d_model+extra_dim)
+weight_hh = history_lstm.weight_hh_l0 + node_delta_weight_hh   # (A, 4h, history_hidden)
+bias      = bias_ih_l0 + bias_hh_l0   + node_delta_bias        # (A, 4h)
+```
+
+`A`는 전체 노드가 아니라 **train 구간 평균 수요가 `node_adaptive_min_demand`(기본 0.8)를
+넘는 노드** 수다 — ulsan 44/168(26.2%), porto 49/380(12.9%). 수요가 거의 0인 노드(porto는
+노드 중앙값이 0.009)에 노드당 36,864개 파라미터를 주면 노이즈를 외울 용량만 늘어나고,
+파라미터가 base의 25~53배로 불어난다. 선택 기준은 시간 리크를 막기 위해 train 구간에서만
+계산하며(`train.py: select_node_adaptive_indices`), 결과 노드 목록은 `config.node_adaptive_indices`에
+저장돼 `from_pretrained`가 같은 마스크를 복원한다.
+
+설계상 지켜야 할 것들:
+
+- **선택되지 않은 노드는 `nn.LSTM`(cuDNN fused) 결과를 그대로 쓴다.** 선택된 노드만 수동 셀
+  루프로 다시 계산해 `index_copy`로 덮어쓴다. 그래서 대다수 노드는 속도 손해가 없다.
+- **ΔW는 0으로 시작한다.** 그래야 학습 시작 시점이 `node_adaptive=false`와 동일해서
+  측정된 차이가 ΔW 때문임이 분리된다. `validate_merged.py`의
+  `_check_node_adaptive_identity`가 ΔW=0 ≡ `nn.LSTM`을 대조로 고정한다.
+- **노드 목록을 버퍼로 저장하면 안 된다.** transformers 5.0의 `from_pretrained`는 meta device에서
+  모델을 만든 뒤 체크포인트에 있는 키만 실체화한다. stage 2가 이어받는 stage 1 체크포인트에는
+  그 키가 없어서, 버퍼로 두면 `torch.empty`(쓰레기값)로 남아 엉뚱한 노드를 고른다.
+  config의 파이썬 리스트에서 forward 시점에 텐서를 만들어 device별로 캐시한다.
+- **`_init_weights`에서 `super()._init_weights(module)`를 부르면 안 된다.** lora 브랜치의 같은
+  이름 메서드는 정반대 규칙이라 그쪽 코드를 복사해 오면 모델 전체의 초기 분포가 바뀌어
+  기존 ablation/튜닝 결과와 출발점이 달라진다. delta만 0으로 채우고 나머지는 건드리지 않는다.
+- daily/weekly 주기 브랜치는 대상이 아니다 — `pack_padded_sequence`가 노드 축을 흐트러뜨려
+  노드별 가중치를 붙이려면 packing 자체를 걷어내야 한다.
+
+### 2-stage 학습
+
+`node_adaptive=true`면 `train.py`가 자동으로 2-stage로 나눈다(꺼져 있으면 지금까지와 동일한
+단일 stage다).
+
+| | stage 1 | stage 2 |
+|---|---|---|
+| ΔW | `requires_grad_(False)` (0 고정) | `requires_grad_(True)` |
+| loss | `model.loss_type` (기본 `combined`) | `stage2.loss` (기본 `rmse_mape`) |
+| lr | `train.learning_rate` | `stage2.learning_rate` (기본 1e-4) |
+| best 기준 | `eval_loss` | `rmse_mape_objective` |
+| output_dir | `<run>/stage1` | `<run>/stage2` |
+
+- stage마다 `Trainer`를 새로 만든다 — optimizer / LR 스케줄러 / early stopping 상태가 경계에서
+  초기화돼야 하고, `save_total_limit=1`이라 같은 디렉터리를 쓰면 stage 2가 stage 1 체크포인트를
+  지운다.
+- `rmse_mape`는 `rmse_weight * RMSE + MAPE(+1)`이고 **요소별로 분해되지 않는 스칼라**다
+  (RMSE가 전체 원소에 걸친 하나의 `sqrt(mean(...))`). `modeling.py`의 `_compute`가
+  `SCALAR_LOSS_TYPES`로 분기해 `loss_sum` 집계를 건너뛴다. best checkpoint 선택은 학습 중의
+  미니배치 surrogate가 아니라 `train.py`가 전체 validation 예측으로 다시 계산한
+  `rmse_mape_objective`를 쓴다.
+- `stage2.init_from`에 체크포인트 경로를 주면 stage 1을 건너뛰고 그 가중치에서 시작한다.
+  optimizer/step을 복구하는 resume이 아니라 weights-only warm start이며, `node_adaptive`를 끄고
+  학습한 단일 stage 체크포인트를 그대로 쓸 수 있다(ΔW 키가 없으면 `_init_weights`가 0으로 채움).
+  학습된 stage 2 체크포인트를 실수로 넣지 않도록 `train.py`가 ΔW=0인지 검사한다.
+- 결과 JSON은 `node_adaptive`/`node_adaptive_nodes`/`node_delta_params`/`stages`/`stage1`/
+  `stage1_test`/`best_metric` 필드를 추가로 남기고, 파일 이름에 `_nodeadaptive`가 붙어
+  기존 단일 stage 결과를 덮어쓰지 않는다.
 
 ## Maintenance rules
 

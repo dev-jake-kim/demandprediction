@@ -23,7 +23,12 @@ from torch.utils.data import DataLoader
 
 from dataset_frame import UnifiedDemandDataset, resolve_dataset_path
 from models.merged import MergedDemandConfig, MergedDemandModel
-from models.merged.modules import BranchAttention, CausalRetrieval, PeriodicLSTMEncoder
+from models.merged.modules import (
+    BranchAttention,
+    CausalRetrieval,
+    LocalHistoryEncoder,
+    PeriodicLSTMEncoder,
+)
 from train import build_dataset_kwargs
 
 ROOT = Path(__file__).resolve().parent
@@ -210,6 +215,76 @@ def _check_periodic_extra_channels() -> dict:
     }
 
 
+def _check_node_adaptive_identity() -> dict:
+    """ΔW=0인 노드별 LSTM 경로가 nn.LSTM(cuDNN fused)과 같은 값을 내는지 확인한다.
+
+    이게 깨지면 "baseline에 노드별 offset만 추가"라는 node_adaptive 실험의 전제가 무너진다 —
+    stage 1(ΔW 고정)의 결과가 node_adaptive를 끈 학습과 달라져서, 측정된 차이가 ΔW 때문인지
+    수동 셀 루프 때문인지 분리되지 않는다. 게이트 순서(i,f,g,o)나 bias_ih+bias_hh 합산을
+    틀리면 여기서 잡힌다.
+
+    선택되지 않은 노드는 nn.LSTM 결과를 그대로 써야 하므로 그쪽도 함께 확인한다.
+    """
+
+    torch.manual_seed(0)
+    height, width, time_step = 4, 3, 6
+    num_nodes = height * width
+    adaptive = [1, 4, 7]
+    encoder = LocalHistoryEncoder(
+        height=height,
+        width=width,
+        time_step=time_step,
+        local_radius=1,
+        d_model=8,
+        num_fourier_bands=2,
+        transformer_layers=1,
+        transformer_heads=2,
+        transformer_ffn=16,
+        history_hidden=5,
+        dropout=0.0,
+        node_adaptive_indices=adaptive,
+    )
+    encoder.eval()
+    # delta는 0으로 시작해야 한다 — LocalHistoryEncoder 생성자의 계약.
+    if any(float(param.detach().abs().sum()) != 0.0 for param in encoder.node_delta_parameters()):
+        raise AssertionError('node_delta 파라미터가 0으로 초기화되지 않음')
+
+    demands = torch.rand(2, time_step, height, width) * 5
+    with torch.no_grad():
+        _, adaptive_hidden = encoder(demands)
+        encoder.node_adaptive = False  # 같은 가중치로 nn.LSTM 경로만 태운다
+        _, reference_hidden = encoder(demands)
+        encoder.node_adaptive = True
+
+    gap = float((adaptive_hidden - reference_hidden).abs().max())
+    if gap > 1e-5:
+        raise AssertionError(f'ΔW=0인데 nn.LSTM과 결과가 다름: max|diff|={gap:.3e}')
+
+    # 선택되지 않은 노드는 정확히 동일해야 한다(수동 루프를 아예 타지 않으므로).
+    others = [node for node in range(num_nodes) if node not in adaptive]
+    untouched = float(
+        (adaptive_hidden[:, others] - reference_hidden[:, others]).abs().max()
+    )
+    if untouched != 0.0:
+        raise AssertionError(
+            f'ΔW 대상이 아닌 노드의 값이 바뀜: max|diff|={untouched:.3e}'
+        )
+
+    n_gates = 4 * 5
+    expected = len(adaptive) * (n_gates * (8 + 5) + n_gates)
+    actual = sum(param.numel() for param in encoder.node_delta_parameters())
+    if actual != expected:
+        raise AssertionError(f'node_delta 파라미터 수가 예상과 다름: {actual} != {expected}')
+
+    return {
+        'node_adaptive_zero_delta_matches_nn_lstm': True,
+        'max_abs_diff': gap,
+        'non_adaptive_nodes_bit_identical': untouched == 0.0,
+        'adaptive_nodes': len(adaptive),
+        'node_delta_params': actual,
+    }
+
+
 def _check_retrieval_boundary() -> dict:
     with tempfile.TemporaryDirectory(prefix='merged_retrieval_') as temp_dir:
         path = Path(temp_dir) / 'grid.npy'
@@ -249,6 +324,7 @@ def main() -> None:
     results = [_check_dataset(city, device) for city in ('ulsan', 'porto')]
     results.append(_check_invalid_mask())
     results.append(_check_periodic_extra_channels())
+    results.append(_check_node_adaptive_identity())
     results.append(_check_retrieval_boundary())
     report = {'device': str(device), 'all_pass': True, 'checks': results}
     print(json.dumps(report, ensure_ascii=False, indent=2))

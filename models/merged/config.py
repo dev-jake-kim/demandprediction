@@ -51,9 +51,13 @@ class MergedDemandConfig(PretrainedConfig):
         use_branch_attention: bool = True,
         use_neighbors: bool = True,
         use_softplus: bool = True,
+        node_adaptive: bool = False,
+        node_adaptive_min_demand: float = 0.8,
+        node_adaptive_indices: list[int] | None = None,
         loss_type: str = 'combined',
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
+        rmse_weight: float = 10.0,
         **kwargs,
     ) -> None:
         self.height = height
@@ -91,11 +95,29 @@ class MergedDemandConfig(PretrainedConfig):
         self.use_branch_attention = use_branch_attention
         self.use_neighbors = use_neighbors
         self.use_softplus = use_softplus
+        # --- 노드별 LSTM weight offset (lora 브랜치의 node_adaptive와 같은 구조) ---
+        # history LSTM의 weight/bias를 노드마다 다르게 쓴다(공유 W + node id별 ΔW, 0으로 초기화).
+        # False면 이 필드가 없던 시절과 완전히 동일하게 동작한다 — 기본값을 False로 두어야
+        # tests/test_merged_parity.py(포팅 직전 구현과 대조)와 기존 run JSON 비교가 유지된다.
+        # daily/weekly 주기 브랜치는 대상이 아니다(pack_padded_sequence가 노드 축을 흐트러뜨림).
+        self.node_adaptive = node_adaptive
+        # ΔW를 받을 노드를 고르는 기준: train 구간 평균 수요가 이 값을 넘는 노드만.
+        # 수요가 거의 0인 노드(porto는 노드 중앙값이 0.009다)에 노드당 수만 개의 파라미터를
+        # 주면 신호가 아니라 노이즈를 외울 용량만 늘어난다. 나머지 노드는 공유 W만 쓰며
+        # cuDNN fused LSTM 경로를 그대로 타서 속도 손해도 없다.
+        self.node_adaptive_min_demand = node_adaptive_min_demand
+        # 위 기준으로 실제 선택된 노드 id(0..H*W-1) 목록. 시간 리크를 막으려면 train 구간에서만
+        # 계산해야 하므로 weather_mean/std와 같이 train.py가 계산해 주입한다. 체크포인트에
+        # 남겨야 from_pretrained가 같은 마스크를 복원한다.
+        self.node_adaptive_indices = node_adaptive_indices
         # 학습에 쓴 목적함수도 체크포인트에 남긴다 — from_pretrained로 되살렸을 때
-        # loss 정의가 조용히 바뀌지 않도록.
+        # loss 정의가 조용히 바뀌지 않도록. 2-stage 학습은 stage마다 loss를 갈아끼우므로
+        # configure_loss()가 이 필드를 함께 갱신한다.
         self.loss_type = loss_type
         self.loss_gamma = loss_gamma
         self.loss_eps = loss_eps
+        # loss_type='rmse_mape'에서만 쓰인다: rmse_weight * RMSE + MAPE(+1).
+        self.rmse_weight = rmse_weight
         super().__init__(**kwargs)
 
 

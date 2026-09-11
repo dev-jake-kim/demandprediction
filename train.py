@@ -11,6 +11,16 @@ num_workers 0, best = val loss 최소, torch_compile 없음)는 원본과 1:1로
     python train.py --config-name config_porto          # porto
     python train.py model.use_retrieval=false ablation=no-ir   # ablation (ulsan)
 
+``model.node_adaptive=true``면 history LSTM에 노드별 weight offset(ΔW)을 붙이고 학습을
+2-stage로 나눈다(stage 1: ΔW 고정 = 지금까지와 동일한 학습 / stage 2: ΔW 해제 + ``stage2.loss``).
+꺼져 있으면(기본값) 단일 stage이며 이 기능 추가 이전과 완전히 동일하게 동작한다::
+
+    python train.py model.node_adaptive=true
+    # stage 1을 새로 학습하지 않고 기존 단일 stage 체크포인트에서 이어받기
+    python train.py model.node_adaptive=true stage2.init_from=output/merged/<날짜>/<시각>
+
+자세한 설계/제약은 ``docs/MERGED_ARCHITECTURE.md``의 "노드별 LSTM weight offset" 절 참고.
+
 이 브랜치(tmp)에는 다른 모델 구현이 없다(models/config.py, models/modeling.py 부재 —
 models/__init__.py 참고) — train.py는 이 모델 하나만 학습하는 단일 진입점이다.
 """
@@ -133,7 +143,44 @@ def compute_metrics(eval_pred) -> dict[str, float]:
     return compute_merged_metrics(eval_pred.predictions, eval_pred.label_ids)
 
 
-def _summarize_history(log_history: list[dict]) -> tuple[list[dict], int, float]:
+def make_rmse_mape_metrics(rmse_weight: float):
+    """``rmse_weight * RMSE + MAPE(+1)``을 지표로 추가한 compute_metrics를 만든다.
+
+    stage 2가 쓰는 ``RmseMapeLoss``의 학습 중 RMSE는 미니배치 단위 surrogate라 batch size에
+    영향을 받는다. best checkpoint 선택은 이 함수가 **전체 validation 예측**으로 다시 계산한
+    같은 목적함수를 쓴다(lora 브랜치와 같은 관례).
+    """
+
+    def compute_stage2_metrics(eval_pred) -> dict[str, float]:
+        metrics = compute_merged_metrics(eval_pred.predictions, eval_pred.label_ids)
+        metrics['rmse_mape_objective'] = rmse_weight * metrics['rmse'] + metrics['mape_plus1']
+        return metrics
+
+    return compute_stage2_metrics
+
+
+def select_node_adaptive_indices(train_ds: UnifiedDemandDataset, min_demand: float) -> list[int]:
+    """train 구간 평균 수요가 ``min_demand``를 넘는 노드 id 목록.
+
+    **train 구간에서만 계산해야 한다** — 전체 기간으로 고르면 어떤 노드가 ΔW를 받을지가
+    test 구간 정보에 의존하게 되어 시간 리크가 된다. 날씨 정규화 통계와 같은 이유로 같은
+    구간(``[time_step, train_end)``)을 쓴다.
+    """
+
+    window = train_ds.grid[train_ds.time_step : train_ds.train_end]
+    node_mean = window.reshape(len(window), -1).mean(axis=0)
+    indices = [int(node) for node in (node_mean > min_demand).nonzero()[0]]
+    if not indices:
+        raise ValueError(
+            f'node_adaptive_min_demand={min_demand}를 넘는 노드가 없다 — 임계값을 낮춰야 한다 '
+            f'(노드 평균 수요 최댓값 {float(node_mean.max()):.3f})'
+        )
+    return indices
+
+
+def _summarize_history(
+    log_history: list[dict], best_metric_key: str = 'loss'
+) -> tuple[list[dict], int, float]:
     """Trainer의 log_history를 원본 result JSON의 ``history`` 형태로 압축한다.
 
     원본은 epoch마다 {"epoch", "train": {...}, "val": {...}}를 남겼다. Trainer는 train 로그와
@@ -156,9 +203,11 @@ def _summarize_history(log_history: list[dict]) -> tuple[list[dict], int, float]
             }
     history = [per_epoch[key] for key in sorted(per_epoch)]
 
+    # best 선택 기준은 stage마다 다르다 — stage 1은 val loss, rmse_mape를 쓰는 stage 2는
+    # 전체 validation 예측으로 다시 계산한 rmse_mape_objective다.
     best_epoch, best_val = 0, float('inf')
     for record in history:
-        val = record.get('val', {}).get('loss')
+        val = record.get('val', {}).get(best_metric_key)
         if val is not None and val < best_val:
             best_val, best_epoch = float(val), record['epoch']
     return history, best_epoch, best_val
@@ -186,6 +235,23 @@ def main(cfg: DictConfig) -> None:
         logger.info(f'[smoke] limit_samples={limit} — 각 split의 앞부분만 사용한다')
 
     model_kwargs = OmegaConf.to_container(cfg.model, resolve=True)
+
+    # 노드별 ΔW를 받을 노드를 train 구간에서만 고른다(시간 리크 방지). 꺼져 있으면 None을
+    # 넘겨 모델이 delta 파라미터를 아예 만들지 않게 한다 — 그래야 state_dict가 이 기능이
+    # 없던 시절과 정확히 같아서 기존 체크포인트/parity 테스트가 유지된다.
+    node_adaptive = bool(model_kwargs.get('node_adaptive', False))
+    node_adaptive_indices = None
+    if node_adaptive:
+        node_adaptive_indices = select_node_adaptive_indices(
+            train_ds, float(model_kwargs['node_adaptive_min_demand'])
+        )
+        total_nodes = train_ds.height * train_ds.width
+        logger.info(
+            f'[node_adaptive] train 구간 평균 수요 > {model_kwargs["node_adaptive_min_demand"]}인 '
+            f'노드 {len(node_adaptive_indices)}/{total_nodes} '
+            f'({len(node_adaptive_indices) / total_nodes * 100:.1f}%)에만 ΔW를 준다'
+        )
+
     model_config = MergedDemandConfig(
         height=train_ds.height,
         width=train_ds.width,
@@ -194,12 +260,27 @@ def main(cfg: DictConfig) -> None:
         retrieval_train_end=train_ds.train_end,
         weather_mean=weather_mean.tolist(),
         weather_std=weather_std.tolist(),
+        node_adaptive_indices=node_adaptive_indices,
         **model_kwargs,
     )
     # Trainer는 __init__에서 seed를 설정하는데 그건 모델이 만들어진 뒤다 — 그대로 두면
     # 초기 가중치가 프로세스마다 달라져 같은 seed로도 재현되지 않는다. 여기서 먼저 고정한다.
     set_seed(cfg.train.seed)
-    model = MergedDemandModel(model_config)
+
+    # stage2.init_from이 있으면 그 체크포인트의 가중치에서 시작하고 stage 1을 건너뛴다.
+    configured_init_from = cfg.get('stage2', {}).get('init_from')
+    init_from = configured_init_from if node_adaptive else None
+    if configured_init_from and not node_adaptive:
+        # 조용히 무시하면 "이어받아 학습했다"고 오해한 채 처음부터 학습한 결과를 얻게 된다.
+        logger.warning(
+            f'stage2.init_from={configured_init_from}이 주어졌지만 model.node_adaptive=false라 '
+            '2-stage 학습을 하지 않는다 — 무시한다'
+        )
+    if init_from:
+        model = MergedDemandModel.from_pretrained(init_from, config=model_config)
+        logger.info(f'[stage2] stage1 체크포인트에서 이어받음: {init_from}')
+    else:
+        model = MergedDemandModel(model_config)
 
     output_dir = HydraConfig.get().runtime.output_dir
     train_cfg = OmegaConf.to_container(cfg.train, resolve=True)
@@ -219,22 +300,134 @@ def main(cfg: DictConfig) -> None:
             )
             train_cfg[key] = max_batch
 
-    args = TrainingArguments(output_dir=output_dir, **train_cfg)
-    trainer = Trainer(
-        model=model,
-        args=args,
-        train_dataset=train_set,
-        eval_dataset=val_set,
-        compute_metrics=compute_metrics,
-        callbacks=[
-            LoggingCallback(),
-            MinEpochEarlyStoppingCallback(
-                min_epochs=early_stopping_cfg.min_epochs,
-                early_stopping_patience=early_stopping_cfg.early_stopping_patience,
-            ),
-        ],
-    )
-    trainer.train()
+    def build_trainer(
+        stage_dir: str | None,
+        learning_rate: float,
+        *,
+        metrics_fn=compute_metrics,
+        metric_for_best_model: str = 'loss',
+    ) -> Trainer:
+        """stage마다 Trainer를 새로 만든다.
+
+        optimizer / LR 스케줄러 / early stopping 상태가 stage 경계에서 초기화돼야 하고,
+        stage 1의 optimizer에는 얼어 있는 ΔW가 들어있지 않기 때문이다. output_dir도 분리해야
+        한다 — 같은 디렉터리를 쓰면 ``save_total_limit``이 앞 stage의 체크포인트를 지운다.
+        ``stage_dir=None``은 2-stage를 쓰지 않는 경우로, 체크포인트 경로가 이 기능 추가
+        이전과 동일하다.
+        """
+
+        stage_cfg = dict(train_cfg)
+        stage_cfg['learning_rate'] = learning_rate
+        stage_cfg['metric_for_best_model'] = metric_for_best_model
+        stage_args = TrainingArguments(
+            output_dir=output_dir if stage_dir is None else str(Path(output_dir) / stage_dir),
+            **stage_cfg,
+        )
+        return Trainer(
+            model=model,
+            args=stage_args,
+            train_dataset=train_set,
+            eval_dataset=val_set,
+            compute_metrics=metrics_fn,
+            callbacks=[
+                LoggingCallback(),
+                MinEpochEarlyStoppingCallback(
+                    min_epochs=early_stopping_cfg.min_epochs,
+                    early_stopping_patience=early_stopping_cfg.early_stopping_patience,
+                ),
+            ],
+        )
+
+    def trainable_count(trainer: Trainer) -> int:
+        return sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
+
+    deltas = model.node_delta_parameters()
+    stage_records: dict[str, dict] = {}
+    stage1_metrics: dict[str, float] | None = None
+
+    if not deltas:
+        # --- node_adaptive를 쓰지 않는 경우: 이 기능 추가 이전과 완전히 동일한 단일 stage ---
+        trainer = build_trainer(None, train_cfg['learning_rate'])
+        trainer.train()
+        best_metric_key = 'loss'
+    else:
+        if init_from:
+            # stage 1은 이미 끝난 것을 불러왔다. 이 옵션은 weights-only warm start이므로,
+            # 학습된 stage2 체크포인트를 실수로 stage1 시작점에 넣지 않도록 ΔW가 정확히
+            # 0인지 확인한다.
+            nonzero = [
+                name
+                for name, param in model.named_parameters()
+                if 'node_delta' in name and float(param.detach().abs().sum()) != 0.0
+            ]
+            if nonzero:
+                raise ValueError(
+                    f'stage2.init_from은 ΔW=0인 stage1 체크포인트여야 함 — 0이 아닌 항목: {nonzero}'
+                )
+            # 그 시점의 성능을 stage 1 결과와 같은 기준으로 남겨둔다.
+            model.configure_loss(str(cfg.model.loss_type))
+            for param in deltas:
+                param.requires_grad_(False)
+            probe = build_trainer('stage1_eval', train_cfg['learning_rate'])
+            stage1_metrics = probe.evaluate(
+                eval_dataset=eval_test_set, metric_key_prefix='stage1_test'
+            )
+            logger.info(f'[stage1] Test metrics: {stage1_metrics}')
+            del probe
+        else:
+            # --- stage 1: ΔW를 0으로 고정 -> node_adaptive를 끈 것과 동일한 학습 ---
+            model.configure_loss(str(cfg.model.loss_type))
+            for param in deltas:
+                param.requires_grad_(False)
+            stage1 = build_trainer('stage1', train_cfg['learning_rate'])
+            logger.info(
+                f'[stage1] ΔW 고정(node_adaptive=false와 동일), '
+                f'학습 파라미터 {trainable_count(stage1):,}개'
+            )
+            stage1.train()
+            stage1_metrics = stage1.evaluate(
+                eval_dataset=eval_test_set, metric_key_prefix='stage1_test'
+            )
+            logger.info(f'[stage1] Test metrics: {stage1_metrics}')
+            history1, best_epoch1, best_val1 = _summarize_history(stage1.state.log_history)
+            stage_records['stage1'] = {
+                'history': history1,
+                'best_epoch': best_epoch1,
+                'best_val_loss': best_val1,
+                'best_metric': 'loss',
+                'checkpoint': str(Path(output_dir) / 'stage1'),
+            }
+            # stage 1 Trainer가 optimizer와 모델 wrapper를 계속 붙들고 있지 않게 놓아준다.
+            del stage1
+
+        # --- stage 2: ΔW 해제 후 finetuning ---
+        # load_best_model_at_end=true라 model에는 stage 1의 best 가중치가 들어있다.
+        for param in deltas:
+            param.requires_grad_(True)
+        stage2_loss = str(cfg.stage2.loss)
+        model.configure_loss(stage2_loss, rmse_weight=float(cfg.stage2.rmse_weight))
+        if stage2_loss == 'rmse_mape':
+            rmse_weight = float(cfg.stage2.rmse_weight)
+            metrics_fn = make_rmse_mape_metrics(rmse_weight)
+            best_metric_key = 'rmse_mape_objective'
+            logger.info(f'[stage2] loss = {rmse_weight} * RMSE + MAPE(+1)')
+        else:
+            metrics_fn = compute_metrics
+            best_metric_key = 'loss'
+            logger.info(f'[stage2] loss = {stage2_loss}')
+
+        trainer = build_trainer(
+            'stage2',
+            float(cfg.stage2.learning_rate),
+            metrics_fn=metrics_fn,
+            metric_for_best_model=best_metric_key,
+        )
+        logger.info(
+            f'[stage2] ΔW 해제, lr={cfg.stage2.learning_rate}, '
+            f'학습 파라미터 {trainable_count(trainer):,}개 '
+            f'(ΔW {sum(p.numel() for p in deltas):,}개 포함)'
+        )
+        trainer.train()
 
     trainer.save_model(output_dir)
     logger.info(f'Model saved to: {output_dir}')
@@ -242,7 +435,17 @@ def main(cfg: DictConfig) -> None:
     test_metrics = trainer.evaluate(eval_dataset=eval_test_set, metric_key_prefix='test')
     logger.info(f'Test metrics: {test_metrics}')
 
-    history, best_epoch, best_val = _summarize_history(trainer.state.log_history)
+    if deltas:
+        # ΔW가 실제로 얼마나 움직였는지 남긴다 — 전부 0에 가까우면 stage 2가 아무것도
+        # 배우지 못한 것이라 결과 해석이 달라진다.
+        for name, param in model.named_parameters():
+            if 'node_delta' in name:
+                logger.info(
+                    f'[stage2] {name}: norm={param.norm():.4f} '
+                    f'max_abs={param.abs().max():.4f}'
+                )
+
+    history, best_epoch, best_val = _summarize_history(trainer.state.log_history, best_metric_key)
     result = {
         'dataset': cfg.dataset.city,
         'data_path': str(data_path),
@@ -270,6 +473,20 @@ def main(cfg: DictConfig) -> None:
             )
         },
         'seed': int(cfg.train.seed),
+        # 노드별 ΔW 실험의 근거. node_adaptive=false면 단일 stage이고 이 기능 추가 이전과
+        # 동일한 학습이다.
+        'node_adaptive': node_adaptive,
+        'node_adaptive_min_demand': (
+            float(model_kwargs['node_adaptive_min_demand']) if node_adaptive else None
+        ),
+        'node_adaptive_nodes': len(node_adaptive_indices) if node_adaptive_indices else 0,
+        'node_adaptive_indices': node_adaptive_indices,
+        'node_delta_params': sum(p.numel() for p in deltas),
+        'stages': ['stage1', 'stage2'] if deltas else ['single'],
+        'stage2_loss': str(cfg.stage2.loss) if deltas else None,
+        'stage1': stage_records.get('stage1'),
+        'stage1_test': stage1_metrics,
+        'best_metric': best_metric_key,
         'best_epoch': best_epoch,
         'best_val_loss': best_val,
         # 원본 스키마의 "checkpoint"는 .pt 파일이었다. 이제 save_pretrained 디렉터리다.
@@ -286,11 +503,15 @@ def main(cfg: DictConfig) -> None:
 
     run_json = cfg.get('run_json')
     if run_json is None:
+        # node_adaptive 런은 파일 이름을 달리한다 — 안 그러면 같은 (city, loss, ablation, seed)의
+        # 기존 단일 stage 결과를 덮어써서 비교 기준 자체가 사라진다.
+        suffix = '_nodeadaptive' if node_adaptive else ''
         run_json = (
             Path('output')
             / cfg.project_name
             / 'runs'
-            / f'{cfg.dataset.city}_{cfg.model.loss_type}_{cfg.ablation}_seed{cfg.train.seed}.json'
+            / f'{cfg.dataset.city}_{cfg.model.loss_type}_{cfg.ablation}{suffix}'
+            f'_seed{cfg.train.seed}.json'
         )
     run_json = Path(run_json).expanduser()
     if not run_json.is_absolute():

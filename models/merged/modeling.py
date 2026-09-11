@@ -23,7 +23,7 @@ from transformers import PreTrainedModel
 from dataset_frame.unified_demand_dataset import NUM_WEATHER_FEATURES
 
 from .config import MergedDemandConfig
-from .losses import build_loss
+from .losses import SCALAR_LOSS_TYPES, build_loss
 from .modules import (
     BranchAttention,
     CausalRetrieval,
@@ -97,6 +97,21 @@ class MergedDemandModel(PreTrainedModel):
         self.use_neighbors = config.use_neighbors
         self.use_softplus = config.use_softplus
 
+        # --- 노드별 LSTM weight offset ---
+        # 켜져 있으면 train.py가 config.node_adaptive_indices에 대상 노드 id를 채워 준다
+        # (train 구간 평균 수요 > node_adaptive_min_demand). 꺼져 있으면 None을 넘겨
+        # LocalHistoryEncoder가 delta 파라미터를 아예 만들지 않는다 — 이 필드가 없던 시절과
+        # state_dict가 정확히 같아야 기존 체크포인트/parity 테스트가 유지된다.
+        self.node_adaptive = config.node_adaptive
+        node_adaptive_indices = None
+        if self.node_adaptive:
+            if config.node_adaptive_indices is None:
+                raise ValueError(
+                    'node_adaptive=True면 node_adaptive_indices(대상 노드 id 목록)가 필요함 — '
+                    '시간 리크를 막으려면 train.py가 train 구간 평균 수요로 계산해 넘겨야 한다'
+                )
+            node_adaptive_indices = [int(value) for value in config.node_adaptive_indices]
+
         # 날씨는 임베딩하지 않고 정규화한 3값을 그대로 LSTM 입력에 concat한다. 요일/시간대만
         # 임베딩 테이블을 쓰며, 세 브랜치가 같은 테이블을 공유한다(요일 3은 어느 브랜치에서나 요일 3).
         self.weekday_embedding = nn.Embedding(7, config.weekday_dim)
@@ -136,6 +151,7 @@ class MergedDemandModel(PreTrainedModel):
             extra_dim=self.extra_dim,
             weather_cls_dim=self.weather_cls_dim,
             use_neighbors=self.use_neighbors,
+            node_adaptive_indices=node_adaptive_indices,
         )
         self.periodic_hidden = config.periodic_hidden
         # ablation은 "0-치환" 방식이다 — 모듈을 없애지 않고 항상 생성·실행한 뒤, 그 모듈이
@@ -168,19 +184,60 @@ class MergedDemandModel(PreTrainedModel):
         # 이 저장소의 다른 모델들과 목적함수를 맞추려면 'combined'(CombinedLoss)를 쓴다.
         # 'mae'는 merged_model이 원래 쓰던 raw 스케일 L1이며, 두 경우 모두 reduction='none'
         # 이라 아래 forward에서 mean/sum을 각각 뽑는다.
-        self.loss_type = config.loss_type
-        self.loss_fn = build_loss(config.loss_type, gamma=config.loss_gamma, eps=config.loss_eps)
+        self.loss_fn: nn.Module
+        self.configure_loss(config.loss_type)
 
         self.post_init()
 
+    def configure_loss(self, loss_type: str, *, rmse_weight: float | None = None) -> None:
+        """학습 loss를 교체하고 선택값을 HF config에도 동기화한다.
+
+        config를 함께 갱신해야 stage 2 체크포인트를 ``from_pretrained``로 다시 열었을 때
+        런타임에 선택했던 loss가 조용히 되돌아가지 않는다(lora 브랜치와 같은 관례).
+        """
+
+        if rmse_weight is not None:
+            self.config.rmse_weight = float(rmse_weight)
+        self.loss_fn = build_loss(
+            loss_type,
+            gamma=self.config.loss_gamma,
+            eps=self.config.loss_eps,
+            rmse_weight=self.config.rmse_weight,
+        )
+        # rmse_mape처럼 요소별로 분해되지 않는 손실은 _compute가 다르게 집계해야 한다.
+        self.loss_is_scalar = loss_type in SCALAR_LOSS_TYPES
+        # ``PreTrainedModel.__init__``도 같은 이름의 속성을 쓰므로 property로 만들면 안 된다
+        # (setter가 없어 super().__init__에서 AttributeError가 난다). 평범한 속성으로 둔다.
+        self.loss_type = loss_type
+        self.config.loss_type = loss_type
+
+    def node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
+        """노드별 weight offset 파라미터 전부(node_adaptive가 꺼져 있으면 빈 튜플)."""
+
+        return self.local_history.node_delta_parameters()
+
     def _init_weights(self, module: nn.Module) -> None:
-        """PyTorch 기본 초기화를 그대로 쓴다(의도적인 no-op).
+        """PyTorch 기본 초기화를 그대로 쓰고, 노드별 delta만 0으로 만든다.
 
         ``PreTrainedModel._init_weights``는 Linear/Embedding/LayerNorm을 std=0.02 정규분포로
         다시 초기화한다. 그걸 상속하면 원본 ``UnifiedDemandModel``(순수 ``nn.Module``, 즉
         PyTorch 기본 초기화)과 출발점이 달라져 포팅 자체가 다른 실험이 된다. 이 포팅의 성공
-        기준은 "계산이 바뀌지 않았음"이므로 여기서는 아무것도 하지 않는다.
+        기준은 "계산이 바뀌지 않았음"이므로 **``super()._init_weights(module)``를 부르면 안 된다**
+        — lora 브랜치의 같은 이름 메서드는 정반대로 반드시 부르라고 돼 있으니 그쪽 코드를
+        그대로 복사해 오면 지금까지의 ablation/튜닝 결과와 출발점이 달라진다.
+
+        delta는 여기서 명시적으로 0을 넣어야 한다. transformers 5.0은 meta device에서 모델을
+        만든 뒤 체크포인트에 없는 키를 ``torch.empty``로 실체화하므로, 생성자의
+        ``torch.zeros(...)``가 delta 키 없는 체크포인트(node_adaptive를 끄고 학습한 stage 1)를
+        로드할 때는 적용되지 않는다. 체크포인트에서 값을 받은 파라미터에는
+        ``_is_hf_initialized``가 붙으므로 건너뛴다 — 학습된 delta를 0으로 덮어쓰면 안 된다.
         """
+
+        if module is not self.local_history:
+            return
+        for param in module.node_delta_parameters():
+            if not getattr(param, '_is_hf_initialized', False):
+                param.data.zero_()
 
     # Keep the old debugging entry points available while the implementation
     # is organized under named components.
@@ -279,11 +336,18 @@ class MergedDemandModel(PreTrainedModel):
             'weekly_valid': weekly_valid,
         }
         if labels is not None:
-            # reduction='none'으로 한 번만 계산하고 mean(역전파용)과 sum(에폭 집계용)을 함께 낸다.
-            # 배치 크기가 균일하지 않아(drop_last=False) 배치 평균의 평균은 원소 평균과 다르다.
-            elementwise = self.loss_fn(prediction_grid, labels)
-            output['loss'] = elementwise.mean()
-            output['loss_sum'] = elementwise.detach().sum()
+            if self.loss_is_scalar:
+                # rmse_mape는 전체 원소에 걸친 하나의 sqrt(mean(...))이라 요소별로 분해되지
+                # 않는다. loss_sum(에폭 집계용)도 정의되지 않으므로 내보내지 않는다 —
+                # 이 손실을 쓰는 stage 2의 best 선택은 train.py가 전체 validation 예측으로
+                # 다시 계산한 동일 목적함수(rmse_mape_objective)를 쓴다.
+                output['loss'] = self.loss_fn(prediction_grid, labels)
+            else:
+                # reduction='none'으로 한 번만 계산하고 mean(역전파용)과 sum(에폭 집계용)을 함께 낸다.
+                # 배치 크기가 균일하지 않아(drop_last=False) 배치 평균의 평균은 원소 평균과 다르다.
+                elementwise = self.loss_fn(prediction_grid, labels)
+                output['loss'] = elementwise.mean()
+                output['loss_sum'] = elementwise.detach().sum()
         return output
 
     def forward(

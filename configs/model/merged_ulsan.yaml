@@ -42,8 +42,24 @@ use_branch_attention: true
 use_neighbors: true
 use_softplus: true
 
+# --- 노드별 LSTM weight offset (lora 브랜치 node_adaptive와 같은 구조) ---
+# history LSTM의 weight/bias를 노드마다 다르게 쓴다(공유 W + node id별 ΔW, 0으로 초기화).
+# false면 이 필드가 없던 시절과 완전히 동일하게 동작한다 — 기존 ablation/튜닝 결과와의
+# 비교 기준이 유지되도록 기본값은 false다. 2-stage 학습(train.py)의 stage 2에서만 켠다.
+node_adaptive: false
+# ΔW를 받을 노드: train 구간 평균 수요가 이 값을 넘는 노드만. ulsan 기준 44/168 (26.2%).
+# 수요가 거의 0인 노드(ulsan 노드 중앙값 0.141)에 노드당 36,864개 파라미터를 주면
+# 신호가 아니라 노이즈를 외울 용량만 늘어난다. 선택되지 않은 노드는 공유 W만 쓰며
+# cuDNN fused LSTM 경로를 그대로 타서 속도 손해가 없다.
+# 실제 노드 id 목록(node_adaptive_indices)은 train.py가 train 구간에서 계산해 주입한다.
+node_adaptive_min_demand: 0.8
+
 # 'combined'(저장소 공용 CombinedLoss, 다른 모든 브랜치와 동일한 목적함수) |
-# 'mae'(merged_model이 원래 쓰던 raw 스케일 L1).
+# 'mae'(merged_model이 원래 쓰던 raw 스케일 L1) |
+# 'rmse_mape'(rmse_weight*RMSE + MAPE(+1), 2-stage의 stage 2용).
 loss_type: combined
 loss_gamma: 1.0
 loss_eps: 0.5
+# loss_type='rmse_mape'에서만 쓰인다. 10이면 두 항이 (RMSE 0.75 -> 7.5) vs (MAPE 15.4)로
+# 비슷한 크기가 된다.
+rmse_weight: 10.0
