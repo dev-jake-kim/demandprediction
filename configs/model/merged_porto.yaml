@@ -62,3 +62,12 @@ loss_eps: 0.5
 # loss_type='rmse_mape'에서만 쓰인다. 10이면 두 항이 (RMSE 1.12 -> 11.2) vs (MAPE 8.0)로
 # 비슷한 크기가 된다.
 rmse_weight: 10.0
+
+# loss_type='demand_split'에서만 쓰인다. 수요가 낮은 셀과 높은 셀에 서로 다른 오차를 준다:
+#   실제 수요 <= split_threshold : |오차| / (|y|+1)              <- MAPE(+1)이 보는 것
+#   실제 수요 >  split_threshold : split_high_weight * 오차^2    <- RMSE가 보는 것
+# rmse_mape(선형 결합)는 모든 셀이 두 항에 동시에 기여해서 "예측을 전반적으로 쪼그라뜨려
+# 0셀 MAPE를 벌고 고수요 셀 RMSE를 잃는" 거래가 이득이 된다. 셀을 한 항에만 넣어 그 교차
+# 압력을 없앤 것이 이 손실이다. 근거와 w 선택 기준은 models/losses.py의 DemandSplitLoss 참고.
+split_threshold: 1.0
+split_high_weight: 1.0

@@ -58,6 +58,8 @@ class MergedDemandConfig(PretrainedConfig):
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
         rmse_weight: float = 10.0,
+        split_threshold: float = 1.0,
+        split_high_weight: float = 1.0,
         **kwargs,
     ) -> None:
         self.height = height
@@ -118,6 +120,10 @@ class MergedDemandConfig(PretrainedConfig):
         self.loss_eps = loss_eps
         # loss_type='rmse_mape'에서만 쓰인다: rmse_weight * RMSE + MAPE(+1).
         self.rmse_weight = rmse_weight
+        # loss_type='demand_split'에서만 쓰인다. 실제 수요가 split_threshold 이하인 셀은
+        # MAPE(+1) 상대오차로, 초과인 셀은 split_high_weight * 제곱오차로 벌준다.
+        self.split_threshold = split_threshold
+        self.split_high_weight = split_high_weight
         super().__init__(**kwargs)
 
 

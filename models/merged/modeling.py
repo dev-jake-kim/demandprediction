@@ -203,6 +203,8 @@ class MergedDemandModel(PreTrainedModel):
             gamma=self.config.loss_gamma,
             eps=self.config.loss_eps,
             rmse_weight=self.config.rmse_weight,
+            split_threshold=self.config.split_threshold,
+            split_high_weight=self.config.split_high_weight,
         )
         # rmse_mape처럼 요소별로 분해되지 않는 손실은 _compute가 다르게 집계해야 한다.
         self.loss_is_scalar = loss_type in SCALAR_LOSS_TYPES

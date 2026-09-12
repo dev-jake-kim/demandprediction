@@ -484,7 +484,13 @@ def main(cfg: DictConfig) -> None:
         'weather_std': weather_std.tolist(),
         'device': str(trainer.args.device),
         'retrieval_scope': cfg.model.retrieval_scope,
+        # stage1(=model.loss_type)과 stage2의 목적함수를 따로 남긴다. 2-stage 런의
+        # 결과 JSON에서 'objective'만 보면 stage1 값이라 최종 학습 loss로 오해하기 쉽다.
+        # 'objective'는 기존 78건 JSON과의 스키마 호환을 위해 그대로 두고, 최종 loss는
+        # 'final_loss'를 본다.
         'objective': cfg.model.loss_type,
+        'stage1_loss': cfg.model.loss_type,
+        'final_loss': str(cfg.stage2.loss) if deltas else cfg.model.loss_type,
         'ablation': cfg.ablation,
         'ablation_mode': ABLATION_MODE,
         # 실제로 적용된 스위치. 라벨(cfg.ablation)이 아니라 이 값이 근거다.
