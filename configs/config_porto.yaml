@@ -88,6 +88,25 @@ stage2:
 callbacks:
   early_stopping:
     # 원본은 무조건 patience를 센다(최소 epoch 제한 없음).
+    #
+    # **porto는 ulsan과 달리 이 값을 낮출 실익이 없어 원본값을 유지한다.**
+    # 모듈 ablation을 제외한 porto 학습 기록 26건을 (min_epochs, patience) 격자로
+    # 시뮬레이션한 결과:
+    #
+    #   min=0  pat=20  (원본)   총 801 epoch            여유 7
+    #   min=0  pat=13           총 675 epoch (-15.7%)   여유 0
+    #   min=28 pat=1            총 655 epoch (-18.2%)   여유 0
+    #   min=20 pat=8            결과 깨짐
+    #   min=18 pat=10           결과 깨짐
+    #
+    # ulsan은 긴 정체가 epoch 12~17에 몰려 있어 min_epochs로 잘라낼 수 있지만, porto는
+    # epoch 10~28에 넓게 퍼져 있어(G=12 @ep28, G=11 @ep24/20/14) 잘라낼 지점이 없다.
+    # 최선인 min=28/pat=1도 절감은 2.5%p 더일 뿐인데 개선이 한 번만 멈추면 바로 종료라
+    # 실전에서 위험하다. 절감 15.7%를 위해 여유 7 -> 0을 내주는 건 남는 장사가 아니다.
+    #
+    # 참고로 patience=8로 낮추면 4건이 깨진다. 특히 tune_porto_periodic128은 epoch 2에서
+    # 20 epoch 가까이 정체하다 22에서 갱신되는 패턴이라 best가 ep 2로 앞당겨지고 val이
+    # +5.12% 나빠진다 — porto 튜닝에서 RMSE를 가장 크게 개선했던(-4.0%) 변종이 이것이다.
     min_epochs: 0
     early_stopping_patience: 20
 
