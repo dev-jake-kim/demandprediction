@@ -1,8 +1,11 @@
 """merged 모델(로컬 히스토리 + daily/weekly 주기 + 인과적 검색 + 브랜치 어텐션) 학습 스크립트.
 
 원본 ``merged_model/train.py``의 수동 학습 루프를 이 저장소 공용 관례(Hydra + HF ``Trainer``)로
-옮긴 것이다. 학습 하이퍼파라미터(gradient clipping 5.0, 고정 LR, epochs 2000, patience 20,
+옮긴 것이다. 학습 하이퍼파라미터(gradient clipping 5.0, 고정 LR, epochs 2000,
 num_workers 0, best = val loss 최소, torch_compile 없음)는 원본과 1:1로 맞춰 두었다.
+예외는 early stopping으로, 도시별 학습 기록을 시뮬레이션해 원본(min_epochs 0 / patience 20)과
+**같은 best_epoch를 내는 선에서** 줄였다 — ulsan은 min_epochs 13 / patience 8, porto는 줄일
+실익이 없어 원본 유지. 근거는 각 configs/config_*.yaml의 callbacks 블록 주석에 있다.
 
 도시마다 최적 하이퍼파라미터가 달라 루트 config를 도시별로 분리했다 — 기본값은
 ``configs/config_ulsan.yaml``, porto는 ``--config-name config_porto``로 명시한다::
@@ -42,15 +45,30 @@ from models.merged import MergedDemandConfig, MergedDemandModel, compute_merged_
 
 logger = logging.getLogger(__name__)
 
-# PyTorch의 memory-efficient SDPA 백엔드는 dropout용 seed/offset을 (배치*시퀀스들을 펼친) 유효
-# batch 하나당 인덱스 하나로 추적하는데, 그 인덱스가 65535(uint16)를 넘으면
-# "Efficient attention cannot produce valid seed and offset outputs"로 죽는다.
+# PyTorch의 memory-efficient SDPA 백엔드가 거는 한계다. VRAM과는 무관하다 — 실제 코드는
+# aten/src/ATen/native/transformers/cuda/attention.cu의 이 검사다:
+#
+#     constexpr int64_t MAX_BATCH_SIZE = (1LL << 16) - 1;   // = 65535
+#     if (batch_size > MAX_BATCH_SIZE) {
+#       TORCH_CHECK(dropout_p == 0.0,
+#                   "Efficient attention cannot produce valid seed and offset outputs when "
+#                   "the batch size exceeds (", MAX_BATCH_SIZE, ").");
+#     }
+#
+# 즉 **dropout>0일 때만** 걸린다. dropout의 RNG 상태(philox seed/offset)를 backward용으로
+# 배치마다 기록하는 경로의 제약이고, 근본 원인은 CUDA 그리드 차원 상한이다 — cutlass 커널의
+# getBlocksGrid()가 dim3(ceil_div(num_queries, kQueriesPerBlock), num_heads, num_batches)라
+# num_batches가 blocks.z로 들어가는데 y/z 차원 상한이 65535다(x만 2^31-1).
+#
 # models/merged/modules/history.py의 LocalHistoryEncoder는 (batch, time_step, H*W) 전체를
 # (batch*time_step*H*W, 1+neighbors, d_model)로 펼쳐 넣으므로, 노드 수가 많은 도시(예: porto
 # 19*20=380)는 batch_size=8만 돼도 8*24*380=72,960으로 한계를 넘는다(ulsan 14*12=168은
-# 32,256이라 안 넘음). 이 백엔드를 끄면 우회는 되지만 fallback(math) 백엔드가 어텐션 행렬을
-# 그대로 만들어 메모리를 훨씬 더 써서 d_model이 크면 오히려 OOM이 난다 — 그래서 백엔드를
-# 건드리지 않고, 이 한계를 넘지 않도록 배치 크기를 낮추는 쪽을 택한다(아래 main() 참고).
+# 32,256이라 안 넘음). "어텐션 하나가 크다"가 아니라 "26토큰짜리 작은 어텐션이 너무 많다"가
+# 문제다.
+#
+# 이 백엔드를 끄는 우회는 쓰지 않는다 — fallback(math) 백엔드가 어텐션 행렬을 그대로 만들어
+# 메모리를 훨씬 더 써서 d_model이 크면 오히려 OOM이 난다. 대신 아래 main()에서 dropout>0일
+# 때만 배치 크기를 낮춘다. dropout=0이면 이 한계가 없으므로 한계는 VRAM이 된다.
 SDPA_BATCH_LIMIT = 65535
 
 # ablation 방식: 모듈을 지우지 않고, 그 모듈이 결과로 이어지는 텐서만 0으로 바꾼다.
@@ -286,19 +304,31 @@ def main(cfg: DictConfig) -> None:
     train_cfg = OmegaConf.to_container(cfg.train, resolve=True)
     early_stopping_cfg = cfg.callbacks.early_stopping
 
-    # SDPA_BATCH_LIMIT 주석 참고 — 노드 수가 많은 도시에서 batch_size를 자동으로 낮춘다.
+    # SDPA_BATCH_LIMIT 주석 참고. PyTorch의 검사는 dropout이 켜져 있을 때만 건다
+    # (attention.cu: `if (batch_size > MAX_BATCH_SIZE) TORCH_CHECK(dropout_p == 0.0, ...)`),
+    # 그래서 dropout=0이면 이 한계가 아예 적용되지 않는다 — 실측으로 porto batch 8
+    # (72,960행)이 forward/backward 모두 통과하는 것을 확인했다. dropout=0인데도 배치를
+    # 깎으면 쓸 수 있는 배치를 근거 없이 버리는 셈이라, 클램프는 dropout>0일 때만 건다.
     # train/eval 배치 크기를 같이 낮춰야 train 중간의 eval도 안전하다.
     nodes = train_ds.height * train_ds.width
     per_sample = train_ds.time_step * nodes
-    max_batch = max(1, SDPA_BATCH_LIMIT // per_sample)
-    for key in ('per_device_train_batch_size', 'per_device_eval_batch_size'):
-        if train_cfg[key] > max_batch:
-            logger.warning(
-                f'{key}={train_cfg[key]}는 time_step({train_ds.time_step}) * nodes({nodes})'
-                f'={per_sample}와 곱하면 SDPA_BATCH_LIMIT({SDPA_BATCH_LIMIT})을 넘어'
-                f'memory-efficient attention이 죽는다 -> {max_batch}로 낮춘다'
-            )
-            train_cfg[key] = max_batch
+    if float(cfg.model.dropout) > 0.0:
+        max_batch = max(1, SDPA_BATCH_LIMIT // per_sample)
+        for key in ('per_device_train_batch_size', 'per_device_eval_batch_size'):
+            if train_cfg[key] > max_batch:
+                logger.warning(
+                    f'{key}={train_cfg[key]}는 time_step({train_ds.time_step}) * nodes({nodes})'
+                    f'={per_sample}와 곱하면 SDPA_BATCH_LIMIT({SDPA_BATCH_LIMIT})을 넘어'
+                    f'memory-efficient attention이 죽는다(dropout={cfg.model.dropout}>0)'
+                    f' -> {max_batch}로 낮춘다'
+                )
+                train_cfg[key] = max_batch
+    else:
+        logger.info(
+            f'[batch] dropout=0이라 SDPA_BATCH_LIMIT 클램프를 건너뛴다 '
+            f'(rows = batch * {per_sample} = '
+            f'{train_cfg["per_device_train_batch_size"] * per_sample:,}). 이제 한계는 VRAM이다.'
+        )
 
     def build_trainer(
         stage_dir: str | None,
