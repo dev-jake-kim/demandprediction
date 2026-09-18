@@ -11,7 +11,7 @@ defaults:
   - model: merged_ulsan
   - _self_
 
-project_name: merged
+project_name: test_ulsan
 seed: 2026
 device: cuda
 

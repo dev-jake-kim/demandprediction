@@ -11,7 +11,7 @@ defaults:
   - model: merged_porto
   - _self_
 
-project_name: merged
+project_name: test_porto
 seed: 2026
 device: cuda
 
