@@ -1,7 +1,7 @@
 """재설계된 수요 예측 모델 — 골격.
 
-세부 구현은 전부 비어 있다(``forward``가 ``pass``). 이 파일이 확정하는 것은 **정보의 흐름**,
-즉 각 블록이 어떤 정보를 받아 어떤 shape로 내보내는지뿐이다.
+구현이 끝난 것은 :class:`LocalViewEncoder` 하나이고 나머지는 ``forward``가 ``pass``다.
+비어 있는 블록이 확정하는 것은 **정보의 흐름**, 즉 어떤 정보를 받아 어떤 shape로 내보내는지뿐이다.
 
 거시적 구조::
 
@@ -35,7 +35,11 @@
 
 from __future__ import annotations
 
+import math
+
+import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 from transformers import PreTrainedModel
 
 from .config import MergedDemandConfig
@@ -69,14 +73,120 @@ class ContextEncoder(nn.Module):
         pass
 
 
+def crop_local_windows(demands: Tensor, radius: int) -> Tensor:
+    """``[B, k, H, W]`` -> ``[B, k, N, P]``. 노드마다 자기 주변 (2a+1)^2 창을 떼어낸다.
+
+    격자 밖은 0으로 패딩된다 — "수요가 0"과 구분되지 않으므로, 어디가 격자 밖인지는
+    :func:`make_neighbor_valid`가 따로 알려준다.
+
+    ``F.unfold``는 행 우선이라 P축의 순서는 (dy, dx)가 -a부터 +a까지 도는 순서이고,
+    따라서 **중앙(자기 노드)은 항상 ``P // 2``번**이다.
+    """
+
+    batch, steps, height, width = demands.shape
+    window = 2 * radius + 1
+    padded = F.pad(demands.reshape(batch * steps, 1, height, width), (radius,) * 4)
+    patches = F.unfold(padded, kernel_size=window)  # [B*k, P, N]
+    return patches.transpose(1, 2).reshape(batch, steps, height * width, window * window)
+
+
+def make_neighbor_valid(height: int, width: int, radius: int) -> Tensor:
+    """``[N, P]`` bool. 노드 n의 P번째 이웃이 격자 안에 실제로 존재하는가.
+
+    :func:`crop_local_windows`의 P축 순서와 정확히 같은 규약으로 만든다.
+    numpy가 아니라 torch 팩토리만 쓰는 이유는 ``from_pretrained``가 meta device
+    컨텍스트에서 ``__init__``을 돌기 때문이다(numpy 경유는 그 컨텍스트를 무시한다).
+    """
+
+    window = 2 * radius + 1
+    offsets = torch.arange(-radius, radius + 1)
+    dy = offsets.repeat_interleave(window)  # [P]
+    dx = offsets.repeat(window)  # [P]
+    node = torch.arange(height * width)
+    y = torch.div(node, width, rounding_mode='floor').unsqueeze(1) + dy.unsqueeze(0)
+    x = (node % width).unsqueeze(1) + dx.unsqueeze(0)
+    return (y >= 0) & (y < height) & (x >= 0) & (x < width)
+
+
+class FourierScalarEmbedding(nn.Module):
+    """스칼라 하나 -> ``D``차원 토큰. 학습 가능한 Fourier 특징 + 선형 투영.
+
+    수요는 0, 1, 2 같은 작은 정수가 대부분이라 선형 투영만으로는 인접한 값이 거의
+    구분되지 않는다. 주파수를 여러 개 걸어 그 차이를 벌린다.
+    """
+
+    def __init__(self, d_model: int, num_bands: int) -> None:
+        super().__init__()
+        self.log_frequencies = nn.Parameter(torch.linspace(-2.0, 2.0, num_bands))
+        self.projection = nn.Linear(1 + 2 * num_bands, d_model)
+
+    def forward(self, value: Tensor) -> Tensor:
+        """``[..., 1]`` -> ``[..., D]``."""
+
+        frequencies = self.log_frequencies.exp().view(*([1] * (value.ndim - 1)), -1)
+        phase = value * frequencies * (2.0 * math.pi)
+        return self.projection(torch.cat([value, phase.sin(), phase.cos()], dim=-1))
+
+
 class LocalViewEncoder(nn.Module):
     """관점 1 — 공간. "내 주변 (2a+1)^2 칸에서 최근 k시간 동안 무슨 일이 있었나."
 
     유일하게 이웃 노드의 수요를 보는 관점이다. 나머지 세 관점은 노드별로 독립이다.
+
+    두 단계로 접는다::
+
+        [B,k,H,W] --crop-->  [B,k,N,P]      노드별 창
+                  --embed--> [B,k,N,1+P,D]  창 안의 각 칸이 토큰 하나, 맨 앞은 CLS
+                  --transformer + CLS -->   [B,k,N,D]   (공간 축을 접음)
+                  --LSTM -->                [B,N,D]     (시간 축을 접음)
+
+    Transformer는 **창 하나**를 본다 — (배치, 시점, 노드)를 전부 batch 축으로 접으므로
+    ``B*k*N``개의 길이 ``1+P`` 시퀀스가 한 번에 들어간다. ulsan(B=8,k=24,N=168) 기준
+    32,256개다. 창 안의 공간 배치는 attention이 직접 알 수 없고 ``position_embedding``이
+    학습으로 담는다.
     """
 
     def __init__(self, config: MergedDemandConfig) -> None:
         super().__init__()
+        if config.d_model % config.transformer_heads != 0:
+            raise ValueError('d_model은 transformer_heads로 나누어떨어져야 함')
+
+        d_model = config.d_model
+        self.local_radius = config.local_radius
+        self.num_nodes = config.num_nodes
+        self.num_neighbors = config.num_neighbors
+
+        # persistent=True여야 한다: from_pretrained는 meta device에서 모델을 만든 뒤
+        # 체크포인트에 있는 키만 실체화하므로, persistent=False 버퍼는 값이 복원되지 않는다.
+        self.register_buffer(
+            'neighbor_valid',
+            make_neighbor_valid(config.height, config.width, config.local_radius),
+            persistent=True,
+        )
+        self.scalar_embedding = FourierScalarEmbedding(d_model, config.num_fourier_bands)
+        # 0 = CLS(요약을 모으는 자리), 1 = EDGE(격자 밖 = 값이 없음).
+        self.special_embedding = nn.Embedding(2, d_model)
+        # "몇 번 노드의 요약인지"를 CLS에 새겨 넣는다.
+        self.node_embedding = nn.Parameter(torch.randn(self.num_nodes, d_model) * 0.02)
+        # 창 안의 자리(CLS 1개 + 이웃 P개)를 구분하는 위치 임베딩.
+        self.position_embedding = nn.Parameter(
+            torch.randn(1 + self.num_neighbors, d_model) * 0.02
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=config.transformer_heads,
+            dim_feedforward=config.transformer_ffn,
+            dropout=config.dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=config.transformer_layers, enable_nested_tensor=False
+        )
+        # 시간 축을 접는다. 입력은 시점별 창 요약(D) + 그 시점의 보조 정보(C).
+        self.temporal_lstm = nn.LSTM(d_model + config.context_dim, d_model, batch_first=True)
 
     def forward(self, demand_history: Tensor, context: Tensor) -> Tensor:
         """
@@ -88,7 +198,38 @@ class LocalViewEncoder(nn.Module):
             ``[B, N, D]`` 노드별 공간 관점 임베딩.
         """
 
-        pass
+        local_crop = crop_local_windows(demand_history, self.local_radius)
+        batch, steps, nodes, neighbors = local_crop.shape
+
+        # 수요는 꼬리가 긴 분포라 log1p로 압축한 뒤 토큰으로 만든다.
+        values = torch.log1p(torch.clamp(local_crop, min=0.0)).unsqueeze(-1)
+        tokens = self.scalar_embedding(values)  # [B,k,N,P,D]
+        # 격자 밖은 "수요 0"이 아니라 "값이 없음"이다 — 전용 EDGE 토큰으로 갈아끼운다.
+        edge_token = self.special_embedding.weight[1].view(1, 1, 1, 1, -1)
+        tokens = torch.where(
+            self.neighbor_valid.view(1, 1, nodes, neighbors, 1), tokens, edge_token
+        )
+
+        cls_token = self.special_embedding.weight[0].view(1, 1, 1, 1, -1)
+        cls_token = cls_token + self.node_embedding.view(1, 1, nodes, 1, -1)
+        cls_token = cls_token.expand(batch, steps, -1, -1, -1)
+        tokens = torch.cat([cls_token, tokens], dim=3)
+        tokens = tokens + self.position_embedding.view(1, 1, 1, 1 + neighbors, -1)
+
+        # (배치, 시점, 노드)를 batch 축으로 접는다 — 창 하나가 시퀀스 하나다.
+        encoded = self.transformer(tokens.reshape(batch * steps * nodes, 1 + neighbors, -1))
+        summary = encoded[:, 0].reshape(batch, steps, nodes, -1)  # CLS만 꺼낸다
+
+        # 시간 축을 접는다. 보조 정보는 노드에 무관하므로 노드 축으로 브로드캐스트해 붙인다.
+        sequence = summary.permute(0, 2, 1, 3).reshape(batch * nodes, steps, -1)
+        expanded_context = (
+            context[:, None]
+            .expand(batch, nodes, steps, context.shape[-1])
+            .reshape(batch * nodes, steps, -1)
+        )
+        sequence = torch.cat([sequence, expanded_context], dim=-1)
+        _, (hidden, _) = self.temporal_lstm(sequence)
+        return hidden[-1].reshape(batch, nodes, -1)
 
 
 class PeriodicViewEncoder(nn.Module):
@@ -262,6 +403,18 @@ class MergedDemandModel(PreTrainedModel):
         self.loss_type = loss_type
         self.config.loss_type = loss_type
 
+    def _init_weights(self, module: nn.Module) -> None:
+        """PyTorch 기본 초기화를 그대로 쓴다 — 의도적으로 아무것도 하지 않는다.
+
+        ``PreTrainedModel._init_weights``는 Linear/Embedding/LayerNorm을 std=0.02
+        정규분포로 다시 초기화한다. 여기 블록들은 전부 PyTorch 기본 초기화(fan-in 기반
+        uniform)를 전제로 설계됐고, 특히 ``node_embedding``/``position_embedding``은
+        생성자에서 직접 std=0.02를 주고 있다. ``super()._init_weights(module)``를 부르면
+        그 의도가 조용히 덮인다.
+        """
+
+        return
+
     def node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
         """노드별 weight offset(ΔW). 재설계에서 빠졌으므로 항상 비어 있다.
 
@@ -331,10 +484,13 @@ class MergedDemandModel(PreTrainedModel):
 
 __all__ = [
     'ContextEncoder',
+    'FourierScalarEmbedding',
     'LocalViewEncoder',
     'MergedDemandModel',
     'PeriodicViewEncoder',
     'PredictionHead',
     'RetrievalViewEncoder',
     'ViewFusion',
+    'crop_local_windows',
+    'make_neighbor_valid',
 ]

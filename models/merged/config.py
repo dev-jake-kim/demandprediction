@@ -35,6 +35,12 @@ class MergedDemandConfig(PretrainedConfig):
         # --- local 관점 ---
         # 각 노드가 보는 이웃 창의 반지름 a. 창 크기는 (2a+1)^2.
         local_radius: int = 2,
+        # 창 안의 스칼라 수요를 토큰으로 바꿀 때 쓰는 학습 가능한 Fourier 밴드 수.
+        num_fourier_bands: int = 8,
+        # 창 하나(길이 1+(2a+1)^2 시퀀스)를 요약하는 Transformer.
+        transformer_layers: int = 2,
+        transformer_heads: int = 4,
+        transformer_ffn: int = 128,
         # --- retrieval 관점 ---
         # 최근 k시간 패턴과 비슷한 과거 시점을 몇 개 가져올지.
         num_retrieval: int = 20,
@@ -64,6 +70,10 @@ class MergedDemandConfig(PretrainedConfig):
         self.d_model = d_model
         self.dropout = dropout
         self.local_radius = local_radius
+        self.num_fourier_bands = num_fourier_bands
+        self.transformer_layers = transformer_layers
+        self.transformer_heads = transformer_heads
+        self.transformer_ffn = transformer_ffn
         self.num_retrieval = num_retrieval
         self.retrieval_scope = retrieval_scope
         self.retrieval_chunk_size = retrieval_chunk_size
@@ -88,6 +98,11 @@ class MergedDemandConfig(PretrainedConfig):
     def window_size(self) -> int:
         """2a + 1."""
         return 2 * self.local_radius + 1
+
+    @property
+    def num_neighbors(self) -> int:
+        """P = (2a+1)^2. 창 하나의 토큰 수는 CLS를 포함해 1 + P."""
+        return self.window_size * self.window_size
 
     @property
     def context_dim(self) -> int:
