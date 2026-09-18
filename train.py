@@ -61,15 +61,14 @@ logger = logging.getLogger(__name__)
 # getBlocksGrid()가 dim3(ceil_div(num_queries, kQueriesPerBlock), num_heads, num_batches)라
 # num_batches가 blocks.z로 들어가는데 y/z 차원 상한이 65535다(x만 2^31-1).
 #
-# models/merged/modules/history.py의 LocalHistoryEncoder는 (batch, time_step, H*W) 전체를
-# (batch*time_step*H*W, 1+neighbors, d_model)로 펼쳐 넣으므로, 노드 수가 많은 도시(예: porto
-# 19*20=380)는 batch_size=8만 돼도 8*24*380=72,960으로 한계를 넘는다(ulsan 14*12=168은
-# 32,256이라 안 넘음). "어텐션 하나가 크다"가 아니라 "26토큰짜리 작은 어텐션이 너무 많다"가
-# 문제다.
+# models/merged/modeling.py의 LocalViewEncoder는 (batch, time_step, H*W) 전체를
+# (batch*time_step*H*W, 1+neighbors, d_model)로 펼쳐 넣으므로 배치가 조금만 커도 한계를
+# 넘는다 — ulsan(14*12=168)은 batch 17부터, porto(10*20=200)는 batch 14부터다.
+# "어텐션 하나가 크다"가 아니라 "26토큰짜리 작은 어텐션이 너무 많다"가 문제다.
 #
 # 이 백엔드를 끄는 우회는 쓰지 않는다 — fallback(math) 백엔드가 어텐션 행렬을 그대로 만들어
-# 메모리를 훨씬 더 써서 d_model이 크면 오히려 OOM이 난다. 대신 아래 main()에서 dropout>0일
-# 때만 배치 크기를 낮춘다. dropout=0이면 이 한계가 없으므로 한계는 VRAM이 된다.
+# 메모리를 훨씬 더 써서 d_model이 크면 오히려 OOM이 난다. 대신 아래 main()에서 어텐션
+# dropout이 켜져 있을 때만 배치 크기를 낮춘다. 꺼져 있으면 이 한계가 없으므로 한계는 VRAM이다.
 SDPA_BATCH_LIMIT = 65535
 
 # ablation 방식: 모듈을 지우지 않고, 그 모듈이 결과로 이어지는 텐서만 0으로 바꾼다.
@@ -311,30 +310,35 @@ def main(cfg: DictConfig) -> None:
     train_cfg = OmegaConf.to_container(cfg.train, resolve=True)
     early_stopping_cfg = cfg.callbacks.early_stopping
 
-    # SDPA_BATCH_LIMIT 주석 참고. PyTorch의 검사는 dropout이 켜져 있을 때만 건다
-    # (attention.cu: `if (batch_size > MAX_BATCH_SIZE) TORCH_CHECK(dropout_p == 0.0, ...)`),
-    # 그래서 dropout=0이면 이 한계가 아예 적용되지 않는다 — 실측으로 porto batch 8
-    # (72,960행)이 forward/backward 모두 통과하는 것을 확인했다. dropout=0인데도 배치를
-    # 깎으면 쓸 수 있는 배치를 근거 없이 버리는 셈이라, 클램프는 dropout>0일 때만 건다.
-    # train/eval 배치 크기를 같이 낮춰야 train 중간의 eval도 안전하다.
+    # SDPA_BATCH_LIMIT 주석 참고. PyTorch의 검사가 보는 것은 **어텐션 가중치 dropout**이다
+    # (attention.cu: `if (batch_size > MAX_BATCH_SIZE) TORCH_CHECK(dropout_p == 0.0, ...)`,
+    # 여기 dropout_p는 MultiheadAttention에 넘어간 값이다). nn.TransformerEncoderLayer는
+    # dropout 인자 하나를 네 곳(어텐션 가중치 / 어텐션 출력 / FFN 은닉 / FFN 출력)에 쓰지만,
+    # 이 한계를 거는 것은 첫 번째 하나뿐이다. 그래서 config.dropout이 아니라
+    # config.attention_dropout을 본다 — 둘을 혼동하면 어텐션 dropout을 껐는데도 쓸 수 있는
+    # 배치를 근거 없이 버리게 된다(실측: attention_dropout=0이면 batch 70,000도 통과하고,
+    # 0.1이면 거부된다). train/eval 배치를 같이 낮춰야 train 중간의 eval도 안전하다.
     nodes = train_ds.height * train_ds.width
     per_sample = train_ds.time_step * nodes
-    if float(cfg.model.dropout) > 0.0:
+    attention_dropout = float(model_config.attention_dropout)
+    if attention_dropout > 0.0:
         max_batch = max(1, SDPA_BATCH_LIMIT // per_sample)
         for key in ('per_device_train_batch_size', 'per_device_eval_batch_size'):
             if train_cfg[key] > max_batch:
                 logger.warning(
                     f'{key}={train_cfg[key]}는 time_step({train_ds.time_step}) * nodes({nodes})'
                     f'={per_sample}와 곱하면 SDPA_BATCH_LIMIT({SDPA_BATCH_LIMIT})을 넘어'
-                    f'memory-efficient attention이 죽는다(dropout={cfg.model.dropout}>0)'
+                    f'memory-efficient attention이 죽는다'
+                    f'(model.attention_dropout={attention_dropout}>0)'
                     f' -> {max_batch}로 낮춘다'
                 )
                 train_cfg[key] = max_batch
     else:
         logger.info(
-            f'[batch] dropout=0이라 SDPA_BATCH_LIMIT 클램프를 건너뛴다 '
+            f'[batch] model.attention_dropout=0이라 SDPA_BATCH_LIMIT 클램프를 건너뛴다 '
             f'(rows = batch * {per_sample} = '
-            f'{train_cfg["per_device_train_batch_size"] * per_sample:,}). 이제 한계는 VRAM이다.'
+            f'{train_cfg["per_device_train_batch_size"] * per_sample:,}). 이제 한계는 VRAM이다. '
+            f'model.dropout={cfg.model.dropout}은 나머지 세 자리에 그대로 걸린다.'
         )
 
     def build_trainer(

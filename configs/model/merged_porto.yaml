@@ -17,6 +17,11 @@ history_hidden: 64
 periodic_hidden: 64
 fusion_dim: 128
 dropout: 0.10
+# 어텐션 **가중치**에 걸리는 dropout만 따로 뗀 값. 위 dropout은 어텐션 출력 / FFN 은닉 /
+# FFN 출력 세 곳에 걸리고, 이 값은 "CLS가 어떤 이웃 칸을 보는지"를 확률적으로 끊는다.
+# 격자의 74%가 0이라 정보를 가진 이웃이 몇 개 없어서 그 교란이 상대적으로 크므로 기본은 0이다.
+# 0이 아니면 PyTorch SDPA의 batch<=65535 제한이 살아나 train.py가 배치를 깎는다.
+attention_dropout: 0.0
 retrieval_k: 20
 retrieval_chunk_size: 256
 # 검색 후보 범위. observed_past = tau < target_time(원본 기본값), train_prefix = train split까지만.
