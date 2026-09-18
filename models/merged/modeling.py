@@ -56,29 +56,53 @@ class ContextEncoder(nn.Module):
     네 관점이 전부 이걸 공유한다. 관점마다 시점 축의 의미가 다를 뿐(최근 k시간 / 일 주기 lag /
     주 주기 lag) 묶는 방식은 같아서, 여기 한 곳에서만 정의한다.
 
-    날씨는 임베딩하지 않고 train split 통계로 정규화한 3값을 그대로 쓴다.
-    정규화 후의 0은 "평균 날씨" = 정보 없음의 자연스러운 대체값이다.
+    날씨는 임베딩하지 않고 train 구간 기준 min-max로 정규화한 값을 그대로 쓴다. 두 채널
+    모두 train 구간에서 [0, 1]에 들어가고, val/test가 그 범위를 넘으면 1을 넘을 수 있다
+    (clip하지 않는다 — 실제로 더 더웠거나 더 많이 온 것이므로 그 정보를 지울 이유가 없다).
+
+    **CSV의 3채널을 2채널로 합친다**: 강수량(mm)과 적설(cm)은 같은 현상(하늘에서 떨어지는
+    물)을 단위만 달리 잰 것이라, 학습 가능한 환산계수 하나로 묶는다::
+
+        총강수 = 강수량 + snow_scale * 적설
+
+    ``snow_scale``의 초깃값 1.0은 "적설 1cm ≈ 강수 1mm"라는 관례적 환산이고, 그 비율이
+    수요에 미치는 영향은 데이터가 정하도록 학습시킨다.
+
+    정규화 분모(``config.precipitation_max``)는 ``snow_scale``이 학습 중 계속 변하기 때문에
+    데이터에서 그때그때 다시 잴 수 없다. **snow_scale=1.0 기준으로 train 구간에서 한 번 재서
+    하이퍼파라미터로 고정**한다. 분모에 학습 파라미터가 없어야 gradient도 깨끗하다.
+
+    이렇게 묶는 실질적 이유는 적설을 따로 정규화할 수 없기 때문이다. ulsan train 구간에서
+    적설이 0이 아닌 시점은 0.31%뿐이라 std가 0.0115까지 떨어지고, 그러면 눈이 온 시점의
+    정규화 값이 26σ까지 튀어 나머지 입력을 압도한다. porto는 적설이 train 구간 내내 정확히
+    0이라 std가 0이고(train.py가 1e-6으로 clip한다) 채널 전체가 상수 0인 죽은 입력이었다.
+    강수량에 합치면 두 문제가 같이 사라진다.
     """
 
     def __init__(self, config: MergedDemandConfig) -> None:
         super().__init__()
-        weather_mean = [float(v) for v in (config.weather_mean or [])]
-        weather_std = [float(v) for v in (config.weather_std or [])]
-        if len(weather_mean) != 3 or len(weather_std) != 3:
+        missing = [
+            name
+            for name in ('temperature_min', 'temperature_max', 'precipitation_max')
+            if getattr(config, name) is None
+        ]
+        if missing:
             raise ValueError(
-                'weather_mean/weather_std(각 3개, train split 통계)가 필요함 — '
-                '시간 리크를 막으려면 train.py가 train 구간에서만 계산해 넘겨야 한다'
+                f'날씨 정규화 기준이 없음: {missing}. train 구간에서 재서 '
+                'configs/model/merged_<city>.yaml에 적어야 한다 — val/test를 보면 시간 리크다'
             )
-        if any(v <= 0 for v in weather_std):
-            raise ValueError('weather_std는 양수여야 함 (0으로 나누기 방지)')
-
-        # persistent=True여야 from_pretrained가 값을 복원한다(meta device 초기화 때문).
-        self.register_buffer(
-            'weather_mean', torch.tensor(weather_mean, dtype=torch.float32), persistent=True
-        )
-        self.register_buffer(
-            'weather_std', torch.tensor(weather_std, dtype=torch.float32), persistent=True
-        )
+        # 값은 config에만 둔다(버퍼로 만들면 from_pretrained의 meta device 초기화에서
+        # 복원 여부를 따로 챙겨야 한다). 스칼라라 텐서와 그냥 연산된다.
+        self.temperature_min = float(config.temperature_min)
+        self.temperature_range = float(config.temperature_max) - self.temperature_min
+        self.precipitation_max = float(config.precipitation_max)
+        if self.temperature_range <= 0:
+            raise ValueError('temperature_max는 temperature_min보다 커야 함')
+        if self.precipitation_max <= 0:
+            raise ValueError('precipitation_max는 양수여야 함')
+        # 적설 -> 강수량 환산계수. 1.0(적설 1cm = 강수 1mm)에서 출발해 학습으로 조정된다.
+        # 스칼라 하나라 모든 시점/노드가 같은 값을 쓴다.
+        self.snow_scale = nn.Parameter(torch.tensor(1.0))
         # 요일/시간대만 임베딩한다. 세 관점이 같은 테이블을 공유한다 — 요일 3은 어느
         # 관점에서나 요일 3이다.
         self.weekday_embedding = nn.Embedding(7, config.weekday_dim)
@@ -95,11 +119,23 @@ class ContextEncoder(nn.Module):
             ``[B, L, C]`` 시점별 보조 정보.
         """
 
+        temperature, rainfall, snowfall = weather.unbind(dim=-1)
+
         # 정규화를 여기 한 곳에서만 한다 — 날것의 기온(수십 단위)이 log1p 수요를 압도하는
-        # 일이 없어야 한다. 정규화 후의 0은 train split 평균 = "정보 없음"의 자연스러운 값이다.
-        weather_norm = (weather - self.weather_mean) / self.weather_std
+        # 일이 없어야 한다.
+        temperature_norm = (temperature - self.temperature_min) / self.temperature_range
+
+        # 강수는 최소값이 0이라 (x - min)/(max - min)이 x/max로 줄어든다. 덕분에 "비도 눈도
+        # 안 왔다"가 정확히 0이 된다 — 정보 없음과 같은 값이다.
+        precipitation = rainfall + self.snow_scale * snowfall
+        precipitation_norm = precipitation / self.precipitation_max
+
         return torch.cat(
-            [weather_norm, self.weekday_embedding(day_of_week), self.hour_embedding(hour_of_day)],
+            [
+                torch.stack([temperature_norm, precipitation_norm], dim=-1),
+                self.weekday_embedding(day_of_week),
+                self.hour_embedding(hour_of_day),
+            ],
             dim=-1,
         )
 
@@ -213,6 +249,10 @@ class LocalViewEncoder(nn.Module):
             batch_first=True,
             norm_first=True,
         )
+        # nn.TransformerEncoderLayer는 dropout 인자 하나를 네 곳에 다 쓴다. 그중 어텐션
+        # 가중치에 걸리는 것만 따로 떼어 다시 설정한다 — TransformerEncoder가 이 레이어를
+        # deepcopy하므로 복제 전에 바꿔야 모든 층에 반영된다.
+        encoder_layer.self_attn.dropout = config.attention_dropout
         self.transformer = nn.TransformerEncoder(
             encoder_layer, num_layers=config.transformer_layers, enable_nested_tensor=False
         )

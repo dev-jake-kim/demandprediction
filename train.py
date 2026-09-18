@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import asdict
 from pathlib import Path
 
 import hydra
@@ -241,6 +242,9 @@ def main(cfg: DictConfig) -> None:
     weather_mean = train_weather.mean(axis=0)
     weather_std = train_weather.std(axis=0).clip(min=1e-6)
     logger.info(f'weather_mean={weather_mean.tolist()}, weather_std={weather_std.tolist()}')
+    # 모델이 실제로 쓰는 것은 이쪽 min-max 기준이다(dataset이 train 구간에서 재 둔다).
+    weather_norm = train_ds.weather_norm
+    logger.info(f'weather_norm={weather_norm}')
 
     # smoke 테스트용. null이면 전체를 쓴다(원본 --max-batches에 대응).
     limit = cfg.get('limit_samples')
@@ -278,6 +282,9 @@ def main(cfg: DictConfig) -> None:
         retrieval_train_end=train_ds.train_end,
         weather_mean=weather_mean.tolist(),
         weather_std=weather_std.tolist(),
+        temperature_min=weather_norm.temperature_min,
+        temperature_max=weather_norm.temperature_max,
+        precipitation_max=weather_norm.precipitation_max,
         node_adaptive_indices=node_adaptive_indices,
         **model_kwargs,
     )
@@ -482,6 +489,7 @@ def main(cfg: DictConfig) -> None:
         'weather_path': str(dataset_kwargs['weather_csv_path']),
         'weather_mean': weather_mean.tolist(),
         'weather_std': weather_std.tolist(),
+        'weather_norm': asdict(weather_norm),
         'device': str(trainer.args.device),
         'retrieval_scope': cfg.model.retrieval_scope,
         # stage1(=model.loss_type)과 stage2의 목적함수를 따로 남긴다. 2-stage 런의

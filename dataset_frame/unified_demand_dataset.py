@@ -33,6 +33,12 @@ WEATHER_COLUMNS = ['기온(°C)', '강수량(mm)', '적설(cm)']
 # (강수/적설이 없으면 값을 아예 안 채움). 기온은 이 관례가 적용되지 않으므로 제외한다.
 ZERO_FILL_WEATHER_COLUMNS = ['강수량(mm)', '적설(cm)']
 NUM_WEATHER_FEATURES = len(WEATHER_COLUMNS)
+# WEATHER_COLUMNS의 축 순서. 모델도 같은 순서를 전제한다.
+TEMPERATURE_INDEX, RAINFALL_INDEX, SNOWFALL_INDEX = 0, 1, 2
+# 총강수 = 강수량 + scale * 적설에서 정규화 기준을 잴 때 쓰는 scale.
+# 모델의 snow_scale은 학습 파라미터라 학습 중 계속 바뀌므로, 정규화 분모는 그 초깃값인
+# 1.0("적설 1cm ≈ 강수 1mm")에서 한 번 재서 고정한다.
+SNOW_SCALE_REFERENCE = 1.0
 
 # dataset_frame/ 의 부모 = 저장소 루트.
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -136,6 +142,24 @@ class SplitBounds:
     total: int
 
 
+@dataclass(frozen=True)
+class WeatherNormStats:
+    """날씨 min-max 정규화 기준. **train 구간에서만 잰다**(시간 리크 방지).
+
+    학습되지 않는 상수다. 모델은 이 값으로 이렇게 정규화한다::
+
+        기온   -> (t - temperature_min) / (temperature_max - temperature_min)
+        총강수 -> (강수량 + snow_scale * 적설) / precipitation_max
+
+    총강수는 최소값이 0이라(두 값 모두 음수가 될 수 없다) 분자를 그대로 쓴다 — 덕분에
+    "비도 눈도 안 왔다"가 정확히 0이 되어 "정보 없음"과 같은 값이 된다.
+    """
+
+    temperature_min: float
+    temperature_max: float
+    precipitation_max: float
+
+
 class UnifiedDemandDataset(Dataset):
     """One sample per target time from a ``[T, H, W]`` temporal grid.
 
@@ -210,10 +234,37 @@ class UnifiedDemandDataset(Dataset):
         all_times = np.arange(self.total_steps, dtype=np.int64)
         self.hour_table, self.day_of_week_table = _calendar_features(all_times)
 
+        self.weather_norm = self._compute_weather_norm_stats()
+
         self.daily_values, self.daily_mask = self._make_lag_table(self.daily_lag_values)
         self.weekly_values, self.weekly_mask = self._make_lag_table(self.weekly_lag_values)
         self.daily_context = self._make_lag_context(self.daily_lag_values)
         self.weekly_context = self._make_lag_context(self.weekly_lag_values)
+
+    def _compute_weather_norm_stats(self) -> WeatherNormStats:
+        """train 구간에서 날씨 min-max 정규화 기준을 잰다.
+
+        구간은 실제로 학습에 쓰이는 창(``[time_step, train_end)``)이다 — split이 무엇이든
+        같은 값이 나오므로 val/test 데이터셋에서 읽어도 안전하다.
+        """
+
+        window = self.weather[self.time_step : self.train_end]
+        if len(window) == 0:
+            raise ValueError('train 구간이 비어 있어 날씨 정규화 기준을 잴 수 없다')
+        temperature = window[:, TEMPERATURE_INDEX]
+        precipitation = (
+            window[:, RAINFALL_INDEX] + SNOW_SCALE_REFERENCE * window[:, SNOWFALL_INDEX]
+        )
+        precipitation_max = float(precipitation.max())
+        if precipitation_max <= 0:
+            # train 구간 내내 비도 눈도 안 온 데이터. 0으로 나누지 않도록 1로 둔다
+            # (어차피 분자가 항상 0이라 채널 값은 0으로 고정된다).
+            precipitation_max = 1.0
+        return WeatherNormStats(
+            temperature_min=float(temperature.min()),
+            temperature_max=float(temperature.max()),
+            precipitation_max=precipitation_max,
+        )
 
     def _make_lag_context(self, lags: np.ndarray) -> dict[str, np.ndarray]:
         """lag 시점별 날씨/캘린더를 ``[T, L, ...]``로 미리 만든다.
@@ -293,8 +344,10 @@ class UnifiedDemandDataset(Dataset):
 
 __all__ = [
     'NUM_WEATHER_FEATURES',
+    'SNOW_SCALE_REFERENCE',
     'WEATHER_COLUMNS',
     'UnifiedDemandDataset',
+    'WeatherNormStats',
     'load_weather_table',
     'resolve_dataset_path',
 ]

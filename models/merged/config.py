@@ -23,6 +23,8 @@ class MergedDemandConfig(PretrainedConfig):
         height: int = 14,
         width: int = 12,
         time_step: int = 24,
+        # train.py가 계산해 주입하지만 모델은 더 이상 쓰지 않는다 — 어떤 통계로 돌린
+        # 런인지 체크포인트에 남기는 기록용이다. 정규화는 아래 min/max로 한다.
         weather_mean: list[float] | None = None,
         weather_std: list[float] | None = None,
         retrieval_grid_path: str | None = None,
@@ -32,6 +34,14 @@ class MergedDemandConfig(PretrainedConfig):
         # 관점마다 폭을 따로 두지 않는 것이 이번 재설계의 핵심 단순화다.
         d_model: int = 64,
         dropout: float = 0.1,
+        # ①어텐션 가중치 dropout만 따로 뗀 값. nn.TransformerEncoderLayer는 dropout 하나를
+        # 네 곳(어텐션 가중치 / 어텐션 출력 / FFN 은닉 / FFN 출력)에 모두 쓰는데, 앞의 하나만
+        # 성격이 다르다 — 활성값의 원소를 끄는 게 아니라 "CLS가 이 이웃 칸을 보는 연결"을
+        # 통째로 끊는다. 수요 격자는 셀의 74%가 0이라 정보를 가진 이웃이 몇 개 안 되고,
+        # 그중 하나를 끊는 것은 상대적으로 매우 큰 교란이다. 기본값 0.0으로 끈다.
+        # 부수효과: PyTorch의 SDPA는 batch > 65535일 때 어텐션 dropout이 0이 아니면
+        # 거부한다(attention.cu). 이 값이 0이면 그 한계가 사라진다.
+        attention_dropout: float = 0.0,
         # --- local 관점 ---
         # 각 노드가 보는 이웃 창의 반지름 a. 창 크기는 (2a+1)^2.
         local_radius: int = 2,
@@ -48,6 +58,14 @@ class MergedDemandConfig(PretrainedConfig):
         retrieval_scope: str = 'observed_past',
         retrieval_chunk_size: int = 256,
         # --- 보조 정보(날씨/캘린더) ---
+        # 날씨 2채널의 min-max 정규화 기준. **train 구간에서 재서 여기 적어 넣는다**
+        # (configs/model/merged_<city>.yaml). 시간 리크를 막으려면 val/test를 보면 안 된다.
+        temperature_min: float | None = None,
+        temperature_max: float | None = None,
+        # (강수량 + snow_scale * 적설)의 train 구간 최대값. snow_scale은 학습 중 계속
+        # 변하므로 그때그때 다시 잴 수 없다 — **snow_scale=1.0 기준**으로 한 번 재서 고정한다.
+        # 최소값은 0이다(두 값 모두 음수가 될 수 없다).
+        precipitation_max: float | None = None,
         weekday_dim: int = 7,
         hour_dim: int = 5,
         # --- 손실 ---
@@ -69,6 +87,7 @@ class MergedDemandConfig(PretrainedConfig):
 
         self.d_model = d_model
         self.dropout = dropout
+        self.attention_dropout = attention_dropout
         self.local_radius = local_radius
         self.num_fourier_bands = num_fourier_bands
         self.transformer_layers = transformer_layers
@@ -77,6 +96,9 @@ class MergedDemandConfig(PretrainedConfig):
         self.num_retrieval = num_retrieval
         self.retrieval_scope = retrieval_scope
         self.retrieval_chunk_size = retrieval_chunk_size
+        self.temperature_min = temperature_min
+        self.temperature_max = temperature_max
+        self.precipitation_max = precipitation_max
         self.weekday_dim = weekday_dim
         self.hour_dim = hour_dim
 
@@ -106,8 +128,12 @@ class MergedDemandConfig(PretrainedConfig):
 
     @property
     def context_dim(self) -> int:
-        """C = 정규화 날씨 3 + 요일 임베딩 + 시간대 임베딩."""
-        return 3 + self.weekday_dim + self.hour_dim
+        """C = 날씨 2채널(기온, 총강수) + 요일 임베딩 + 시간대 임베딩.
+
+        CSV는 기온/강수량/적설 3개지만 ``ContextEncoder``가 강수량과 적설을 학습 가능한
+        환산계수로 하나의 총강수 채널로 합친다(:class:`~models.merged.modeling.ContextEncoder`).
+        """
+        return 2 + self.weekday_dim + self.hour_dim
 
 
 __all__ = ['MergedDemandConfig']
