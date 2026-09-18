@@ -1,15 +1,19 @@
 """재설계된 수요 예측 모델 — 골격.
 
-구현이 끝난 것은 :class:`LocalViewEncoder` 하나이고 나머지는 ``forward``가 ``pass``다.
-비어 있는 블록이 확정하는 것은 **정보의 흐름**, 즉 어떤 정보를 받아 어떤 shape로 내보내는지뿐이다.
+**지금 학습 가능한 것은 local 관점 하나짜리 모델이다.** ``ContextEncoder``,
+:class:`LocalViewEncoder`, :class:`PredictionHead`, 그리고 ``MergedDemandModel.forward``가
+구현돼 있어 end-to-end로 돈다. 나머지 세 관점(:class:`PeriodicViewEncoder`,
+:class:`RetrievalViewEncoder`)과 :class:`ViewFusion`은 ``forward``가 ``pass``이고,
+파라미터가 하나도 없어서 모델에 매달려 있어도 학습에 영향을 주지 않는다. 비어 있는
+블록이 확정하는 것은 **정보의 흐름**, 즉 어떤 정보를 받아 어떤 shape로 내보내는지뿐이다.
 
 거시적 구조::
 
     demand_history [B,k,H,W] ─┬─> LocalViewEncoder      ──> [B,N,D]  "내 주변에서 최근 k시간"
                               │
-                              └─> RetrievalViewEncoder  ──> [B,N,D]  "과거의 비슷했던 n개 시점"
-    daily_demand   [B,Ld,N,1] ──> PeriodicViewEncoder   ──> [B,N,D]  "며칠 전 같은 시간대"
-    weekly_demand  [B,Lw,N,1] ──> PeriodicViewEncoder   ──> [B,N,D]  "몇 주 전 같은 요일·시간대"
+                              └─> RetrievalViewEncoder  ──> [B,N,D]  "과거의 비슷했던 n개 시점" (미구현)
+    daily_demand   [B,Ld,N,1] ──> PeriodicViewEncoder   ──> [B,N,D]  "며칠 전 같은 시간대"     (미구현)
+    weekly_demand  [B,Lw,N,1] ──> PeriodicViewEncoder   ──> [B,N,D]  "몇 주 전 같은 요일·시간대" (미구현)
 
                               stack -> [B,N,4,D]
                                          │
@@ -58,6 +62,27 @@ class ContextEncoder(nn.Module):
 
     def __init__(self, config: MergedDemandConfig) -> None:
         super().__init__()
+        weather_mean = [float(v) for v in (config.weather_mean or [])]
+        weather_std = [float(v) for v in (config.weather_std or [])]
+        if len(weather_mean) != 3 or len(weather_std) != 3:
+            raise ValueError(
+                'weather_mean/weather_std(각 3개, train split 통계)가 필요함 — '
+                '시간 리크를 막으려면 train.py가 train 구간에서만 계산해 넘겨야 한다'
+            )
+        if any(v <= 0 for v in weather_std):
+            raise ValueError('weather_std는 양수여야 함 (0으로 나누기 방지)')
+
+        # persistent=True여야 from_pretrained가 값을 복원한다(meta device 초기화 때문).
+        self.register_buffer(
+            'weather_mean', torch.tensor(weather_mean, dtype=torch.float32), persistent=True
+        )
+        self.register_buffer(
+            'weather_std', torch.tensor(weather_std, dtype=torch.float32), persistent=True
+        )
+        # 요일/시간대만 임베딩한다. 세 관점이 같은 테이블을 공유한다 — 요일 3은 어느
+        # 관점에서나 요일 3이다.
+        self.weekday_embedding = nn.Embedding(7, config.weekday_dim)
+        self.hour_embedding = nn.Embedding(24, config.hour_dim)
 
     def forward(self, weather: Tensor, hour_of_day: Tensor, day_of_week: Tensor) -> Tensor:
         """
@@ -70,7 +95,13 @@ class ContextEncoder(nn.Module):
             ``[B, L, C]`` 시점별 보조 정보.
         """
 
-        pass
+        # 정규화를 여기 한 곳에서만 한다 — 날것의 기온(수십 단위)이 log1p 수요를 압도하는
+        # 일이 없어야 한다. 정규화 후의 0은 train split 평균 = "정보 없음"의 자연스러운 값이다.
+        weather_norm = (weather - self.weather_mean) / self.weather_std
+        return torch.cat(
+            [weather_norm, self.weekday_embedding(day_of_week), self.hour_embedding(hour_of_day)],
+            dim=-1,
+        )
 
 
 def crop_local_windows(demands: Tensor, radius: int) -> Tensor:
@@ -341,6 +372,12 @@ class PredictionHead(nn.Module):
 
     def __init__(self, config: MergedDemandConfig) -> None:
         super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_model, 1),
+        )
 
     def forward(self, fused: Tensor) -> Tensor:
         """
@@ -351,7 +388,9 @@ class PredictionHead(nn.Module):
             ``[B, N]`` 노드별 예측 수요(raw 스케일, >= 0).
         """
 
-        pass
+        # softplus(x) = log(1+exp(x)). 수요는 음수가 될 수 없고, ReLU와 달리 0 근처에서
+        # gradient가 죽지 않는다 — 셀의 74%가 0인 데이터라 이 차이가 중요하다.
+        return F.softplus(self.mlp(fused).squeeze(-1))
 
 
 class MergedDemandModel(PreTrainedModel):
@@ -366,6 +405,9 @@ class MergedDemandModel(PreTrainedModel):
 
     def __init__(self, config: MergedDemandConfig) -> None:
         super().__init__(config)
+
+        self.height = config.height
+        self.width = config.width
 
         self.context_encoder = ContextEncoder(config)
         self.local_view = LocalViewEncoder(config)
@@ -467,19 +509,65 @@ class MergedDemandModel(PreTrainedModel):
             ``{'logits': [B, H, W]}``. ``labels``가 있으면 ``'loss'``(스칼라)가 추가된다.
             ``Trainer``는 ``loss``를 제외한 모든 키를 배치마다 gather하므로 디버그 텐서를
             여기 넣으면 안 된다 — 필요하면 :meth:`forward_views`를 쓴다.
+
+        **지금은 local 관점만 쓴다.** daily/weekly/retrieval 인자를 받기는 하지만 아직
+        읽지 않는다 — 그 세 인코더가 비어 있어서다. 인자 목록을 미리 맞춰 두면 관점을
+        채워 넣을 때 dataset/train.py 쪽을 건드릴 일이 없다.
         """
 
-        pass
+        views = self._encode_views(
+            demand_history=demand_history,
+            weather=weather,
+            hour_of_day=hour_of_day,
+            day_of_week=day_of_week,
+        )
+        logits = self.head(views['fused']).reshape(-1, self.height, self.width)
+
+        output: dict[str, Tensor] = {'logits': logits}
+        if labels is not None:
+            if self.loss_is_scalar:
+                # rmse_mape는 전체 원소에 걸친 하나의 sqrt(mean(...))이라 요소별로 분해되지
+                # 않는다. 손실 객체가 이미 스칼라를 돌려준다.
+                output['loss'] = self.loss_fn(logits, labels)
+            else:
+                # reduction='none'으로 받아 여기서 한 번만 평균낸다. 배치 크기가 균일하지
+                # 않아(drop_last=False) 배치 평균의 평균은 원소 평균과 다르다.
+                output['loss'] = self.loss_fn(logits, labels).mean()
+        return output
+
+    def _encode_views(
+        self,
+        *,
+        demand_history: Tensor,
+        weather: Tensor,
+        hour_of_day: Tensor,
+        day_of_week: Tensor,
+    ) -> dict[str, Tensor]:
+        """관점별 임베딩과 융합 결과. ``forward``와 ``forward_views``가 공유한다.
+
+        관점이 하나뿐인 동안은 융합할 것이 없어 ``fused``가 ``local``과 같은 텐서다.
+        """
+
+        context = self.context_encoder(weather, hour_of_day, day_of_week)  # [B,k,C]
+        local = self.local_view(demand_history, context)  # [B,N,D]
+        return {'local': local, 'fused': local}
 
     def forward_views(self, **batch) -> dict[str, Tensor]:
         """관점별 임베딩을 그대로 돌려준다(분석/디버깅용, 학습 경로에서 쓰지 않는다).
 
         Returns:
-            ``{'local'|'daily'|'weekly'|'retrieval': [B, N, D], 'fused': [B, N, D],
-            'logits': [B, H, W]}``
+            ``{'local': [B, N, D], 'fused': [B, N, D], 'logits': [B, H, W]}``.
+            관점이 채워지면 ``'daily'``/``'weekly'``/``'retrieval'``이 함께 나온다.
         """
 
-        pass
+        views = self._encode_views(
+            demand_history=batch['demand_history'],
+            weather=batch['weather'],
+            hour_of_day=batch['hour_of_day'],
+            day_of_week=batch['day_of_week'],
+        )
+        views['logits'] = self.head(views['fused']).reshape(-1, self.height, self.width)
+        return views
 
 
 __all__ = [
