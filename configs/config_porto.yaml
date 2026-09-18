@@ -31,12 +31,12 @@ data:
   lag_radius: 0
 
 train:
-  # porto(19x20=380노드)는 batch_size*time_step*nodes가 커서(8*24*380=72,960) memory-efficient
-  # SDPA가 못 버틴다 — train.py가 65535 한계 기준으로 7까지는 자동으로 낮추지만, d_model을 키운
-  # 변종에서 그마저도 activation 메모리로 OOM이 났다. 튜닝 스윕에서 실제로 전부 batch=4로
-  # 돌려 검증했으므로 그 값을 그대로 쓴다(원본 배치 8보다 작음 — 이 도시의 구조적 제약).
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 4
+  # 이전에는 4였다. porto를 19x20=380노드로 잘못 알고 있을 때 SDPA 한계
+  # (batch*time_step*nodes <= 65535)를 넘지 않으려고 낮춘 값이다.
+  # 정본 격자는 10x20=200노드라 8*24*200=38,400으로 한계에서 멀고, 포팅 전 merged_model도
+  # 원래 8을 썼다. ulsan과 같은 값이 되어 두 도시 비교의 교란 요인도 사라진다.
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
   dataloader_num_workers: 0
   # 원본은 torch.compile을 쓰지 않는다.
   torch_compile: false

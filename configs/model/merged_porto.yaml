@@ -1,19 +1,19 @@
-# MergedDemandConfig 하이퍼파라미터 — porto 최적값.
+# MergedDemandConfig 하이퍼파라미터 — porto.
 # height/width/time_step/retrieval_grid_path/retrieval_train_end/weather_mean/weather_std는
 # 데이터에서 파생되므로 train.py가 채운다.
 #
-# 파라미터 튜닝 스윕(baseline + d_model/num_fourier_bands/transformer_layers/transformer_heads/
-# history_hidden/periodic_hidden 각 1개 변종, seed=245) 결과: history_hidden=128이 baseline
-# 대비 RMSE(1.1227->1.1045)와 MAPE(+1)(7.997->7.912) 둘 다 개선한 유일한 변종이었다(다른
-# 변종은 전부 둘 중 하나가 baseline보다 나빠지거나, d_model128처럼 둘 다 나빠짐).
-# (원자료: output/merged/runs/tune_porto_*_seed245.json) 1개 시드 결과라 확정적이지 않다.
+# **history_hidden은 128이었다가 64로 되돌렸다.** 128은 2026-09-10-11 튜닝 스윕에서
+# 채택한 값인데, 그 스윕이 잘못된 격자(19x20=380노드)로 돌아간 것이라 무효다.
+# porto의 정본 격자는 10x20=200노드이고(preprocessing/porto/create_graph.py가 생성,
+# landuse_grid.npy와 같은 shape), 그 격자로 돌았던 포팅 전 merged_model은 history_hidden=64를
+# 썼다. 근거가 사라진 128 대신 그 값으로 되돌린다 — porto 튜닝 스윕은 재실행이 필요하다.
 local_radius: 2
 d_model: 64
 num_fourier_bands: 8
 transformer_layers: 2
 transformer_heads: 4
 transformer_ffn: 128
-history_hidden: 128
+history_hidden: 64
 periodic_hidden: 64
 fusion_dim: 128
 dropout: 0.10
