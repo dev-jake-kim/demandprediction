@@ -211,6 +211,12 @@ class LocalViewEncoder(nn.Module):
     ``B*k*N``개의 길이 ``1+P`` 시퀀스가 한 번에 들어간다. ulsan(B=8,k=24,N=168) 기준
     32,256개다. 창 안의 공간 배치는 attention이 직접 알 수 없고 ``position_embedding``이
     학습으로 담는다.
+
+    ``config.zero_node_indices``로 학습에서 뺀 노드가 있으면 **crop 직후 잘라낸다**. 이후
+    모든 단계(토큰 임베딩/Transformer/LSTM)가 노드별로 독립이라 남은 노드의 결과는 전부
+    계산한 뒤 버리는 것과 수치적으로 같고, 시퀀스 수만 줄어 그만큼 빨라진다. 뺀 노드도
+    *이웃으로서는* 그대로 남는다 — crop이 이미 끝난 뒤에 자르므로 남은 노드의 창 안에
+    입력값으로 계속 들어간다.
     """
 
     def __init__(self, config: MergedDemandConfig) -> None:
@@ -222,6 +228,18 @@ class LocalViewEncoder(nn.Module):
         self.local_radius = config.local_radius
         self.num_nodes = config.num_nodes
         self.num_neighbors = config.num_neighbors
+
+        # 결과를 내야 하는 노드 id. None이면 전부. 학습에서 뺀 노드를 crop 직후 잘라내는 데 쓴다.
+        # 텐서가 아니라 파이썬 리스트로 들고 있는다 — from_pretrained가 meta device에서
+        # __init__을 돌기 때문에 버퍼로 만들면 체크포인트에 없을 때 쓰레기값이 남는다.
+        self.active_node_ids: list[int] | None = None
+        if config.zero_node_indices:
+            excluded = set(int(v) for v in config.zero_node_indices)
+            self.active_node_ids = [n for n in range(self.num_nodes) if n not in excluded]
+        self.num_active_nodes = (
+            self.num_nodes if self.active_node_ids is None else len(self.active_node_ids)
+        )
+        self._cached_active_index: Tensor | None = None
 
         # persistent=True여야 한다: from_pretrained는 meta device에서 모델을 만든 뒤
         # 체크포인트에 있는 키만 실체화하므로, persistent=False 버퍼는 값이 복원되지 않는다.
@@ -259,6 +277,17 @@ class LocalViewEncoder(nn.Module):
         # 시간 축을 접는다. 입력은 시점별 창 요약(D) + 그 시점의 보조 정보(C).
         self.temporal_lstm = nn.LSTM(d_model + config.context_dim, d_model, batch_first=True)
 
+    def active_node_index(self, device: torch.device) -> Tensor | None:
+        """결과를 내는 노드 id 텐서. 전부 계산하면 None. device별로 캐시한다."""
+
+        if self.active_node_ids is None:
+            return None
+        cached = self._cached_active_index
+        if cached is None or cached.device != device:
+            cached = torch.as_tensor(self.active_node_ids, dtype=torch.long, device=device)
+            self._cached_active_index = cached
+        return cached
+
     def forward(self, demand_history: Tensor, context: Tensor) -> Tensor:
         """
         Args:
@@ -266,10 +295,17 @@ class LocalViewEncoder(nn.Module):
             context: ``[B, k, C]`` 같은 k시점의 보조 정보.
 
         Returns:
-            ``[B, N, D]`` 노드별 공간 관점 임베딩.
+            ``[B, N_active, D]`` 노드별 공간 관점 임베딩. 학습에서 뺀 노드가 없으면
+            ``N_active == N``이고, 있으면 남은 노드만 ``active_node_ids`` 순서로 돌려준다.
         """
 
         local_crop = crop_local_windows(demand_history, self.local_radius)
+        # 여기서 자른다 — crop이 끝난 뒤라 뺀 노드도 남은 노드의 창 안에는 그대로 들어 있다.
+        active = self.active_node_index(local_crop.device)
+        neighbor_valid = self.neighbor_valid
+        if active is not None:
+            local_crop = local_crop.index_select(2, active)
+            neighbor_valid = neighbor_valid.index_select(0, active)
         batch, steps, nodes, neighbors = local_crop.shape
 
         # 수요는 꼬리가 긴 분포라 log1p로 압축한 뒤 토큰으로 만든다.
@@ -278,11 +314,14 @@ class LocalViewEncoder(nn.Module):
         # 격자 밖은 "수요 0"이 아니라 "값이 없음"이다 — 전용 EDGE 토큰으로 갈아끼운다.
         edge_token = self.special_embedding.weight[1].view(1, 1, 1, 1, -1)
         tokens = torch.where(
-            self.neighbor_valid.view(1, 1, nodes, neighbors, 1), tokens, edge_token
+            neighbor_valid.view(1, 1, nodes, neighbors, 1), tokens, edge_token
         )
 
+        node_embedding = self.node_embedding
+        if active is not None:
+            node_embedding = node_embedding.index_select(0, active)
         cls_token = self.special_embedding.weight[0].view(1, 1, 1, 1, -1)
-        cls_token = cls_token + self.node_embedding.view(1, 1, nodes, 1, -1)
+        cls_token = cls_token + node_embedding.view(1, 1, nodes, 1, -1)
         cls_token = cls_token.expand(batch, steps, -1, -1, -1)
         tokens = torch.cat([cls_token, tokens], dim=3)
         tokens = tokens + self.position_embedding.view(1, 1, 1, 1 + neighbors, -1)
@@ -449,6 +488,21 @@ class MergedDemandModel(PreTrainedModel):
         self.height = config.height
         self.width = config.width
 
+        # 학습에서 제외할 노드(train 구간 평균 수요가 거의 0). 예측을 정확히 0으로 고정하고
+        # 손실에서도 빼서, 남은 노드에만 용량과 gradient가 가도록 한다.
+        # 텐서가 아니라 파이썬 리스트로 들고 있는다 — from_pretrained가 meta device에서
+        # __init__을 돌기 때문에 버퍼로 만들면 체크포인트에 없을 때 쓰레기값이 남는다.
+        self.zero_node_indices = (
+            [int(v) for v in config.zero_node_indices] if config.zero_node_indices else None
+        )
+        if self.zero_node_indices is not None:
+            bad = [i for i in self.zero_node_indices if not 0 <= i < config.num_nodes]
+            if bad:
+                raise ValueError(f'zero_node_indices가 노드 범위(0..{config.num_nodes - 1})를 벗어남: {bad[:5]}')
+            if len(self.zero_node_indices) >= config.num_nodes:
+                raise ValueError('모든 노드를 학습에서 제외할 수는 없다')
+        self._cached_node_keep: Tensor | None = None
+
         self.context_encoder = ContextEncoder(config)
         self.local_view = LocalViewEncoder(config)
         # daily/weekly는 같은 클래스의 별개 인스턴스 — 파라미터를 공유하지 않는다.
@@ -496,6 +550,22 @@ class MergedDemandModel(PreTrainedModel):
         """
 
         return
+
+    def node_keep_mask(self, device: torch.device) -> Tensor | None:
+        """``[H, W]``. 학습에 쓰는 노드가 1.0, 제외한 노드가 0.0. 제외가 없으면 None.
+
+        config의 파이썬 리스트에서 만들되 device별로 캐시한다.
+        """
+
+        if self.zero_node_indices is None:
+            return None
+        cached = self._cached_node_keep
+        if cached is None or cached.device != device:
+            keep = torch.ones(self.height * self.width, device=device)
+            keep[torch.as_tensor(self.zero_node_indices, dtype=torch.long, device=device)] = 0.0
+            cached = keep.view(self.height, self.width)
+            self._cached_node_keep = cached
+        return cached
 
     def node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
         """노드별 weight offset(ΔW). 재설계에서 빠졌으므로 항상 비어 있다.
@@ -561,18 +631,42 @@ class MergedDemandModel(PreTrainedModel):
             hour_of_day=hour_of_day,
             day_of_week=day_of_week,
         )
-        logits = self.head(views['fused']).reshape(-1, self.height, self.width)
+        # [B, N_active] — 학습에서 뺀 노드가 있으면 그만큼 짧다.
+        predictions = self.head(views['fused'])
+        active = self.local_view.active_node_index(predictions.device)
+        if active is None:
+            logits = predictions.reshape(-1, self.height, self.width)
+        else:
+            # 뺀 노드 자리는 **정확히** 0이다. Softplus는 0에 점근할 뿐 0이 될 수 없으므로
+            # 계산해서 버리는 대신 아예 자리만 0으로 채운다. autograd가 두 경로의 gradient를
+            # 받아야 하므로 in-place 대입이 아니라 out-of-place index_copy를 쓴다.
+            full = predictions.new_zeros(len(predictions), self.height * self.width)
+            logits = full.index_copy(1, active, predictions).reshape(
+                -1, self.height, self.width
+            )
+        keep = self.node_keep_mask(logits.device)
 
         output: dict[str, Tensor] = {'logits': logits}
         if labels is not None:
             if self.loss_is_scalar:
                 # rmse_mape는 전체 원소에 걸친 하나의 sqrt(mean(...))이라 요소별로 분해되지
                 # 않는다. 손실 객체가 이미 스칼라를 돌려준다.
+                if keep is not None:
+                    raise ValueError(
+                        f'loss_type={self.loss_type!r}는 요소별로 분해되지 않아 노드 제외 '
+                        '마스크를 적용할 수 없다 — combined/mae/demand_split 중에서 고른다'
+                    )
                 output['loss'] = self.loss_fn(logits, labels)
             else:
                 # reduction='none'으로 받아 여기서 한 번만 평균낸다. 배치 크기가 균일하지
                 # 않아(drop_last=False) 배치 평균의 평균은 원소 평균과 다르다.
-                output['loss'] = self.loss_fn(logits, labels).mean()
+                elementwise = self.loss_fn(logits, labels)
+                if keep is None:
+                    output['loss'] = elementwise.mean()
+                else:
+                    # 제외 노드의 오차는 gradient를 만들지 않는다. 남은 노드에 대해서만
+                    # 평균내야 제외 노드 수가 손실의 크기(=유효 학습률)를 바꾸지 않는다.
+                    output['loss'] = (elementwise * keep).sum() / (keep.sum() * len(elementwise))
         return output
 
     def _encode_views(

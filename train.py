@@ -231,6 +231,24 @@ def _summarize_history(
     return history, best_epoch, best_val
 
 
+def select_zero_node_indices(train_ds: UnifiedDemandDataset, max_demand: float) -> list[int]:
+    """train 구간 평균 수요가 ``max_demand`` 이하인 노드 id 목록 — 학습에서 제외할 노드.
+
+    ``select_node_adaptive_indices``와 같은 이유로 **train 구간에서만** 계산한다. 전체
+    기간으로 고르면 어떤 노드를 뺄지가 test 정보에 의존해 시간 리크가 된다.
+    """
+
+    window = train_ds.grid[train_ds.time_step : train_ds.train_end]
+    node_mean = window.reshape(len(window), -1).mean(axis=0)
+    indices = [int(node) for node in (node_mean <= max_demand).nonzero()[0]]
+    if len(indices) >= train_ds.num_nodes:
+        raise ValueError(
+            f'zero_node_max_demand={max_demand}가 너무 커서 모든 노드가 제외된다 '
+            f'(노드 평균 수요 최댓값 {float(node_mean.max()):.3f})'
+        )
+    return indices
+
+
 @hydra.main(config_path='configs', config_name='config_ulsan', version_base=None)
 def main(cfg: DictConfig) -> None:
     data_path, dataset_kwargs, train_ds, val_ds, test_ds = build_datasets(cfg)
@@ -273,7 +291,21 @@ def main(cfg: DictConfig) -> None:
             f'({len(node_adaptive_indices) / total_nodes * 100:.1f}%)에만 ΔW를 준다'
         )
 
+    # 항상 0에 가까운 노드를 학습에서 뺄지. null이면 이 기능이 없던 때와 동일하게 동작한다.
+    zero_node_max_demand = model_kwargs.get('zero_node_max_demand')
+    zero_node_indices = None
+    if zero_node_max_demand is not None:
+        zero_node_indices = select_zero_node_indices(train_ds, float(zero_node_max_demand))
+        total_nodes = train_ds.num_nodes
+        logger.info(
+            f'[zero_node] train 구간 평균 수요 <= {zero_node_max_demand}인 노드 '
+            f'{len(zero_node_indices)}/{total_nodes} '
+            f'({len(zero_node_indices) / total_nodes * 100:.1f}%)를 학습에서 제외한다 '
+            '(예측 0 고정 + 손실 제외). 평가는 전체 노드로 그대로 한다.'
+        )
+
     model_config = MergedDemandConfig(
+        zero_node_indices=zero_node_indices,
         height=train_ds.height,
         width=train_ds.width,
         time_step=train_ds.time_step,
@@ -494,6 +526,9 @@ def main(cfg: DictConfig) -> None:
         'weather_mean': weather_mean.tolist(),
         'weather_std': weather_std.tolist(),
         'weather_norm': asdict(weather_norm),
+        'zero_node_max_demand': zero_node_max_demand,
+        'zero_node_count': len(zero_node_indices) if zero_node_indices is not None else 0,
+        'zero_node_indices': zero_node_indices,
         'device': str(trainer.args.device),
         'retrieval_scope': cfg.model.retrieval_scope,
         # stage1(=model.loss_type)과 stage2의 목적함수를 따로 남긴다. 2-stage 런의

@@ -68,6 +68,16 @@ class MergedDemandConfig(PretrainedConfig):
         precipitation_max: float | None = None,
         weekday_dim: int = 7,
         hour_dim: int = 5,
+        # --- 항상 0인 노드 제외 ---
+        # train 구간 평균 수요가 이 값 이하인 노드는 학습에서 뺀다: 예측을 정확히 0으로
+        # 고정하고 손실에서도 제외해, 남은 노드에만 용량과 gradient가 가도록 한다.
+        # None이면 이 기능이 없던 때와 완전히 동일하게 동작한다.
+        zero_node_max_demand: float | None = None,
+        # 위 기준으로 실제 선택된 노드 id. 시간 리크를 막으려면 train 구간에서만 계산해야
+        # 하므로 train.py가 계산해 주입한다. 체크포인트에 남겨야 같은 마스크가 복원된다.
+        # **버퍼로 만들면 안 된다** — from_pretrained의 meta device 초기화에서 체크포인트에
+        # 없는 버퍼는 torch.empty(쓰레기값)로 남는다.
+        zero_node_indices: list[int] | None = None,
         # --- 손실 ---
         loss_type: str = 'combined',
         loss_gamma: float = 1.0,
@@ -102,6 +112,8 @@ class MergedDemandConfig(PretrainedConfig):
         self.weekday_dim = weekday_dim
         self.hour_dim = hour_dim
 
+        self.zero_node_max_demand = zero_node_max_demand
+        self.zero_node_indices = zero_node_indices
         self.loss_type = loss_type
         self.loss_gamma = loss_gamma
         self.loss_eps = loss_eps
