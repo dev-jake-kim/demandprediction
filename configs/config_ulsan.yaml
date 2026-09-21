@@ -64,23 +64,6 @@ train:
   seed: ${seed}
   full_determinism: false
 
-# 2-stage 학습의 stage 2(노드별 ΔW 해제 후 finetuning) 전용 설정.
-# 나머지는 train 블록을 그대로 재사용한다. model.node_adaptive=false면 쓰이지 않는다
-# (그 경우 지금까지와 동일한 단일 stage 학습이다).
-stage2:
-  # stage 1의 1/10. 수렴한 공유 가중치에서 크게 이탈하지 않으면서 ΔW가 움직일 여지는 준다.
-  learning_rate: 1e-4
-  # 'rmse_mape'(rmse_weight*RMSE + MAPE(+1)) 또는 'combined'(stage 1과 동일한 CombinedLoss).
-  # rmse_mape의 두 항은 models/metrics.py의 보고 지표와 같은 식이라 최적화 대상과 평가가 일치한다.
-  loss: rmse_mape
-  rmse_weight: 10.0
-  # stage 1을 새로 학습하지 않고 이 체크포인트의 가중치에서 stage 2를 시작한다.
-  # optimizer/scheduler/global step을 복구하는 중단 재개(resume)가 아니라 weights-only warm start다.
-  # node_adaptive를 끄고 학습한 단일 stage 체크포인트를 그대로 쓰면 된다 — ΔW 키가 없으면
-  # _init_weights가 0으로 채운다(models/merged/modeling.py 참고).
-  # null이면 stage 1부터 학습한다.
-  init_from: null
-
 callbacks:
   early_stopping:
     # patience만 만지는 것보다 min_epochs를 함께 쓰는 쪽이 낫다. 기록을 보면 best 갱신 직전의

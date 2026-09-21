@@ -1,4 +1,11 @@
-# merged 모델 노드별 ΔW(node_adaptive) + stage2 loss 실험 결과
+# merged 모델 노드별 ΔW(node_adaptive) + stage2 loss 실험 결과 (역사 기록)
+> **역사 기록 — 현재 코드와 분리됨.** 이 문서는 삭제된 2-stage ΔW 학습 workflow의
+> seed 245 결과를 보존한다. 이 workflow는 현재 코드에 더 이상 존재하지 않으며,
+> `node_adaptive`는 단일 stage의 `combined` 학습으로 동작한다. 따라서 아래의 stage 1/
+> stage 2, `stage2.loss`, `stage2.init_from` 표기와 설정은 당시 실행을 설명하는
+> 역사적 기록일 뿐 현재 사용할 수 있는 설정이 아니다. 채택한 Ulsan gated ΔW + FP8
+> 3-seed 결과와 현재 설정의 재현 방법은 [`MERGED_GATED_FP8_RESULTS.md`](MERGED_GATED_FP8_RESULTS.md)를
+> 참고한다.
 
 `model.node_adaptive=true`로 history LSTM에 노드별 weight offset(ΔW)을 붙이고, stage 2의
 목적함수를 바꿔가며 측정한 결과다. 설계와 제약은 `docs/MERGED_ARCHITECTURE.md`의

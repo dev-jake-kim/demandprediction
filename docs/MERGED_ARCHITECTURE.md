@@ -31,7 +31,7 @@ dataset or training loop.
 | `train.py` | Hydra + `Trainer` 학습 진입점, early stopping, 결과 JSON | training schedule or CLI |
 | `test.py` | 체크포인트 단독 평가 | 평가 지표/스플릿 |
 | `validate_merged.py` | structural, gradient, mask, and causal checks | regression checks |
-| `configs/config_ulsan.yaml` / `configs/config_porto.yaml` | 학습 하이퍼파라미터(원본 `training:` 블록과 1:1) + `stage2:` 블록 — 도시별 루트 config | 학습 스케줄, `--config-name` 선택, 2-stage 설정 |
+| `configs/config_ulsan.yaml` / `configs/config_porto.yaml` | 학습 하이퍼파라미터(원본 `training:` 블록과 1:1) — 도시별 루트 config | 학습 스케줄, `--config-name` 선택 |
 | `configs/model/merged_ulsan.yaml` / `configs/model/merged_porto.yaml` | 모델 하이퍼파라미터 + ablation 스위치 기본값 — 도시별 최적값(`docs/MERGED_TUNING_RESULTS.md`) | dimensions, lags, retrieval policy, `weekday_dim`, `hour_dim` |
 | `run_ablation.sh` / `run_seeds.sh` | 큐/다중 시드 러너 (ablation 이름 → Hydra 오버라이드) | 실행 조합 |
 
@@ -95,71 +95,75 @@ The retrieval module uses raw values and only candidate times
 `[time_step, target_time)`. Its CPU cache is not part of the checkpoint; it is
 reconstructed from the temporal grid when a model is created.
 
-## 노드별 LSTM weight offset (`node_adaptive`)
+## 게이티드 노드별 LSTM weight offset + shared-weight FP8 (`node_adaptive`)
 
-lora 브랜치의 node_adaptive(W + ΔW)를 이 모델의 **history LSTM 하나에만** 옮긴 것이다.
-`model.node_adaptive=true`일 때만 켜지며, 기본값은 `false`다 — 꺼져 있으면 delta 파라미터가
-아예 만들어지지 않아 `state_dict`가 이 기능 추가 이전과 정확히 같고, 기존 체크포인트와
-`tests/test_merged_parity.py`가 그대로 유지된다.
+lora 브랜치의 node_adaptive(W + ΔW)를 이 모델의 **`LocalViewEncoder`의 temporal LSTM
+하나에만** 옮긴 뒤, 공유 가중치와 노드별 보정의 비율을 학습하는 구조다.
+`model.node_adaptive=true`일 때만
+켜지며, Ulsan 모델 config의 기본값은 `node_adaptive=true`와
+`shared_weight_fp8=true`이고, Porto는 근거가 없어 `node_adaptive=false`다.
+
+적응 노드 `a`의 네 shared LSTM tensor(`weight_ih_l0`, `weight_hh_l0`,
+`bias_ih_l0`, `bias_hh_l0`)는 다음처럼 합성한다:
 
 ```text
-weight_ih = history_lstm.weight_ih_l0 + node_delta_weight_ih   # (A, 4h, d_model+extra_dim)
-weight_hh = history_lstm.weight_hh_l0 + node_delta_weight_hh   # (A, 4h, history_hidden)
-bias      = bias_ih_l0 + bias_hh_l0   + node_delta_bias        # (A, 4h)
+W_eff,a = s * W_shared + (1 - s) * ΔW_a
+
+s: 학습 가능한 fp32 scalar, init 1.0
+ΔW_a: 노드별 fp32 tensor, init 0
 ```
 
-`A`는 전체 노드가 아니라 **train 구간 평균 수요가 `node_adaptive_min_demand`(기본 0.8)를
-넘는 노드** 수다 — ulsan 44/168(26.2%), porto 49/380(12.9%). 수요가 거의 0인 노드(porto는
-노드 중앙값이 0.009)에 노드당 36,864개 파라미터를 주면 노이즈를 외울 용량만 늘어나고,
-파라미터가 base의 25~53배로 불어난다. 선택 기준은 시간 리크를 막기 위해 train 구간에서만
-계산하며(`train.py: select_node_adaptive_indices`), 결과 노드 목록은 `config.node_adaptive_indices`에
-저장돼 `from_pretrained`가 같은 마스크를 복원한다.
+`s=1`, `ΔW=0`이면 학습 시작점에서 `W_eff`가 shared LSTM과 정확히 같은
+function-level copy다. `s`와 ΔW는 single-stage 학습에서 일반 파라미터로 함께 갱신한다.
+
+`A`는 전체 노드가 아니라 **train 구간 평균 수요가
+`node_adaptive_min_demand`(기본 0.8)를 넘는 노드** 수다. 채택한 Ulsan 설정은
+168개 중 44개 노드(44/168)만 적응 경로를 사용한다. 선택 기준은 시간 리크를 막기 위해
+train 구간에서만 계산하며(`train.py: select_node_adaptive_indices`), 결과 노드 목록은
+`config.node_adaptive_indices`에 저장돼 `from_pretrained`가 같은 마스크를 복원한다.
 
 설계상 지켜야 할 것들:
 
-- **선택되지 않은 노드는 `nn.LSTM`(cuDNN fused) 결과를 그대로 쓴다.** 선택된 노드만 수동 셀
-  루프로 다시 계산해 `index_copy`로 덮어쓴다. 그래서 대다수 노드는 속도 손해가 없다.
-- **ΔW는 0으로 시작한다.** 그래야 학습 시작 시점이 `node_adaptive=false`와 동일해서
-  측정된 차이가 ΔW 때문임이 분리된다. `validate_merged.py`의
-  `_check_node_adaptive_identity`가 ΔW=0 ≡ `nn.LSTM`을 대조로 고정한다.
-- **노드 목록을 버퍼로 저장하면 안 된다.** transformers 5.0의 `from_pretrained`는 meta device에서
-  모델을 만든 뒤 체크포인트에 있는 키만 실체화한다. stage 2가 이어받는 stage 1 체크포인트에는
-  그 키가 없어서, 버퍼로 두면 `torch.empty`(쓰레기값)로 남아 엉뚱한 노드를 고른다.
-  config의 파이썬 리스트에서 forward 시점에 텐서를 만들어 device별로 캐시한다.
-- **`_init_weights`에서 `super()._init_weights(module)`를 부르면 안 된다.** lora 브랜치의 같은
-  이름 메서드는 정반대 규칙이라 그쪽 코드를 복사해 오면 모델 전체의 초기 분포가 바뀌어
-  기존 ablation/튜닝 결과와 출발점이 달라진다. delta만 0으로 채우고 나머지는 건드리지 않는다.
+- **선택되지 않은 노드와 적응 노드의 계산 경로가 다르다.** 비적응 노드는 외부 weight를
+  넘기는 `torch._VF.lstm`으로 shared 가중치를 실행한다. 적응 노드는 `i,f,g,o` 게이트
+  순서의 수동 cell loop에서 `W_eff`를 다시 계산한 뒤 `index_copy`로 결과를 합친다.
+- **ΔW는 0, s는 1로 시작한다.** 따라서 게이트를 켜도 학습 첫 순간의 함수는 shared LSTM과
+  동일하며, 이후 학습된 s가 shared weight와 ΔW의 비율을 정한다.
+- **노드 목록을 버퍼로 저장하면 안 된다.** transformers 5.0의 `from_pretrained`는 meta
+  device에서 모델을 만든 뒤 체크포인트에 있는 키만 실체화한다. config의 파이썬 리스트에서
+  forward 시점에 텐서를 만들어 device별로 캐시한다.
+- **ΔW(0)와 s(1.0)는 생성자에서 직접 초기화한다.** `_init_weights`는 의도적으로 아무것도
+  하지 않는다 — `PreTrainedModel._init_weights`를 부르면 나머지 블록이 전제하는 PyTorch
+  기본 초기화가 std=0.02 정규분포로 조용히 덮인다.
 - daily/weekly 주기 브랜치는 대상이 아니다 — `pack_padded_sequence`가 노드 축을 흐트러뜨려
   노드별 가중치를 붙이려면 packing 자체를 걷어내야 한다.
+- `node_adaptive`와 `zero_node_max_demand`/`zero_node_indices`는 함께 쓸 수 없다. 두
+  옵션의 노드 축이 서로 달라 `modeling.py`가 `ValueError`를 발생시킨다.
 
-### 2-stage 학습
+### shared-weight FP8 fake quantization
 
-`node_adaptive=true`면 `train.py`가 자동으로 2-stage로 나눈다(꺼져 있으면 지금까지와 동일한
-단일 stage다).
+`shared_weight_fp8=true`이면 네 shared LSTM tensor를 absmax per-tensor 방식으로
+`torch.float8_e4m3fn`에 fake quantize하고 straight-through gradient를 쓴다. ΔW와 s는
+fp32를 유지하며 master weight와 모든 수학 연산도 fp32다. 이는 **정확도 QAT 동작**이지
+FP8 메모리 절약이나 속도 향상이 아니다. 외부 weight를 전달하는 경로 때문에 cuDNN에서
+non-contiguous RNN weight warning이 발생할 수 있다.
 
-| | stage 1 | stage 2 |
-|---|---|---|
-| ΔW | `requires_grad_(False)` (0 고정) | `requires_grad_(True)` |
-| loss | `model.loss_type` (기본 `combined`) | `stage2.loss` (기본 `rmse_mape`) |
-| lr | `train.learning_rate` | `stage2.learning_rate` (기본 1e-4) |
-| best 기준 | `eval_loss` | `rmse_mape_objective` |
-| output_dir | `<run>/stage1` | `<run>/stage2` |
+### 단일 stage 학습과 결과 JSON
 
-- stage마다 `Trainer`를 새로 만든다 — optimizer / LR 스케줄러 / early stopping 상태가 경계에서
-  초기화돼야 하고, `save_total_limit=1`이라 같은 디렉터리를 쓰면 stage 2가 stage 1 체크포인트를
-  지운다.
-- `rmse_mape`는 `rmse_weight * RMSE + MAPE(+1)`이고 **요소별로 분해되지 않는 스칼라**다
-  (RMSE가 전체 원소에 걸친 하나의 `sqrt(mean(...))`). `modeling.py`의 `_compute`가
-  `SCALAR_LOSS_TYPES`로 분기해 `loss_sum` 집계를 건너뛴다. best checkpoint 선택은 학습 중의
-  미니배치 surrogate가 아니라 `train.py`가 전체 validation 예측으로 다시 계산한
-  `rmse_mape_objective`를 쓴다.
-- `stage2.init_from`에 체크포인트 경로를 주면 stage 1을 건너뛰고 그 가중치에서 시작한다.
-  optimizer/step을 복구하는 resume이 아니라 weights-only warm start이며, `node_adaptive`를 끄고
-  학습한 단일 stage 체크포인트를 그대로 쓸 수 있다(ΔW 키가 없으면 `_init_weights`가 0으로 채움).
-  학습된 stage 2 체크포인트를 실수로 넣지 않도록 `train.py`가 ΔW=0인지 검사한다.
-- 결과 JSON은 `node_adaptive`/`node_adaptive_nodes`/`node_delta_params`/`stages`/`stage1`/
-  `stage1_test`/`best_metric` 필드를 추가로 남기고, 파일 이름에 `_nodeadaptive`가 붙어
-  기존 단일 stage 결과를 덮어쓰지 않는다.
+`node_adaptive=true`여도 `train.py`는 단일 stage만 학습하며 `combined` loss를 사용한다.
+예전처럼 stage를 나누거나 ΔW를 별도 stage에서 해제하지 않고, s와 ΔW를 일반 파라미터로
+동시에 학습한다. 채택한 Ulsan 결과와 재현 절차는
+[`MERGED_GATED_FP8_RESULTS.md`](MERGED_GATED_FP8_RESULTS.md)에 기록한다.
+
+결과 JSON은 현재 다음 node-adaptive 필드를 보존한다:
+
+- `node_adaptive`, `node_adaptive_min_demand`, `node_adaptive_nodes`,
+  `node_adaptive_indices`
+- `node_delta_params` — 실제 적응 노드의 ΔW 파라미터 수(s는 세지 않는다)
+- `shared_weight_fp8` — 공유 weight FP8 fake quantization 사용 여부
+
+stage별 결과를 나타내는 키는 더 이상 없다. 파일 이름은 `node_adaptive`가 켜진 런에
+계속 `_nodeadaptive` suffix를 붙인다.
 
 ## Maintenance rules
 

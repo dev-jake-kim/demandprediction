@@ -10,11 +10,12 @@ class MergedDemandConfig(PretrainedConfig):
     ``retrieval_train_end``/``weather_mean``/``weather_std``)은 ``train.py``가 계산해 주입하고,
     나머지는 ``configs/model/merged_{ulsan,porto}.yaml``에서 온다.
 
-    이전 설계에 있던 필드(transformer_*, history_hidden, periodic_hidden, fusion_dim,
-    9개 ablation 스위치, node_adaptive*)는 전부 사라졌다. yaml에 아직 남아 있는 그 키들은
-    ``PretrainedConfig``의 ``**kwargs``로 흘러들어가 보관만 되고 모델은 읽지 않는다.
-    """
+    ``node_adaptive`` / ``node_adaptive_min_demand`` / ``node_adaptive_indices``는
+    train.py가 train 구간 통계로 결정해 주입하는 노드별 temporal LSTM 적응 설정이다.
+    ``shared_weight_fp8``은 공유 LSTM weight에만 fake-FP8 양자화를 적용하는 실험 스위치다.
+    yaml에 남아 있는 다른 키들은 ``PretrainedConfig``의 ``**kwargs``로 흘러들어가 보관된다.
 
+    """
     model_type = 'merged_demand'
 
     def __init__(
@@ -68,6 +69,16 @@ class MergedDemandConfig(PretrainedConfig):
         precipitation_max: float | None = None,
         weekday_dim: int = 7,
         hour_dim: int = 5,
+        # --- 노드별 temporal LSTM weight offset ---
+        # node_adaptive=true이면 train.py가 train 구간 평균 수요 기준으로 고른
+        # node_adaptive_indices에만 fp32 ΔW를 만든다. 목록은 버퍼가 아니라 config의
+        # 파이썬 리스트로 보관한다(from_pretrained meta 초기화에서의 쓰레기값 방지).
+        node_adaptive: bool = False,
+        node_adaptive_min_demand: float = 0.8,
+        node_adaptive_indices: list[int] | None = None,
+        # 공유 LSTM weight 4개를 absmax-scaled torch.float8_e4m3fn으로 fake quantize한다.
+        # ΔW와 결합 스칼라 s는 항상 fp32로 유지한다.
+        shared_weight_fp8: bool = False,
         # --- 항상 0인 노드 제외 ---
         # train 구간 평균 수요가 이 값 이하인 노드는 학습에서 뺀다: 예측을 정확히 0으로
         # 고정하고 손실에서도 제외해, 남은 노드에만 용량과 gradient가 가도록 한다.
@@ -112,7 +123,18 @@ class MergedDemandConfig(PretrainedConfig):
         self.weekday_dim = weekday_dim
         self.hour_dim = hour_dim
 
+        self.node_adaptive = bool(node_adaptive)
+        self.node_adaptive_min_demand = float(node_adaptive_min_demand)
+        self.node_adaptive_indices = node_adaptive_indices
+        self.shared_weight_fp8 = bool(shared_weight_fp8)
         self.zero_node_max_demand = zero_node_max_demand
+        if self.node_adaptive and (
+            self.zero_node_max_demand is not None or zero_node_indices
+        ):
+            raise ValueError(
+                'node_adaptive=true는 zero_node_max_demand/zero_node_indices와 '
+                '동시에 사용할 수 없음: 적응 노드 id와 잘린 노드 축이 어긋남'
+            )
         self.zero_node_indices = zero_node_indices
         self.loss_type = loss_type
         self.loss_gamma = loss_gamma

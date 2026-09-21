@@ -47,20 +47,23 @@ use_branch_attention: true
 use_neighbors: true
 use_softplus: true
 
-# --- 노드별 LSTM weight offset (lora 브랜치 node_adaptive와 같은 구조) ---
-# history LSTM의 weight/bias를 노드마다 다르게 쓴다(공유 W + node id별 ΔW, 0으로 초기화).
-# false면 이 필드가 없던 시절과 완전히 동일하게 동작한다 — 기존 ablation/튜닝 결과와의
-# 비교 기준이 유지되도록 기본값은 false다. 2-stage 학습(train.py)의 stage 2에서만 켠다.
+# --- 노드별 gated LSTM weight offset + 공유 weight FP8 ---
+# 적응 노드의 유효 weight를 s*W_shared + (1-s)*ΔW로 바꾼다(설계는 configs/model/
+# merged_ulsan.yaml 주석과 docs/MERGED_GATED_FP8_RESULTS.md 참고). ulsan은 3-seed 근거로
+# 둘 다 켜서 채택했지만 **porto에는 대응 근거가 없어 끈 채로 둔다** — 켜려면 porto에서
+# 같은 3-seed 비교를 먼저 돌려야 한다. false면 이 기능이 없던 때와 동일하게 동작한다.
 node_adaptive: false
 # ΔW를 받을 노드: train 구간 평균 수요가 이 값을 넘는 노드만. porto 기준 49/380 (12.9%).
 # porto는 노드 중앙값이 0.009로 절반 이상이 사실상 항상 0이라, 전 노드에 주면
 # (14.0M 파라미터, base의 53배) 노이즈를 외울 용량만 늘어난다. 이 기준으로 1.81M까지 준다.
 # 실제 노드 id 목록(node_adaptive_indices)은 train.py가 train 구간에서 계산해 주입한다.
 node_adaptive_min_demand: 0.8
+# 공유 temporal LSTM weight 4개의 FP8(e4m3fn) fake quantization. node_adaptive와 함께 켠다.
+shared_weight_fp8: false
 
 # 'combined'(저장소 공용 CombinedLoss, 다른 모든 브랜치와 동일한 목적함수) |
 # 'mae'(merged_model이 원래 쓰던 raw 스케일 L1) |
-# 'rmse_mape'(rmse_weight*RMSE + MAPE(+1), 2-stage의 stage 2용).
+# 'rmse_mape'(rmse_weight*RMSE + MAPE(+1)).
 # train 구간 평균 수요가 이 값 이하인 노드는 학습에서 제외한다 — 예측을 정확히 0으로 고정하고
 # 손실에서도 뺀다. null이면 이 기능이 없던 때와 동일하다. **평가는 항상 전체 노드로 한다**
 # (평가 대상을 바꾸면 기존 결과와 비교가 성립하지 않는다).

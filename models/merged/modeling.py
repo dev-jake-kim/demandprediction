@@ -223,6 +223,13 @@ class LocalViewEncoder(nn.Module):
         super().__init__()
         if config.d_model % config.transformer_heads != 0:
             raise ValueError('d_model은 transformer_heads로 나누어떨어져야 함')
+        if config.node_adaptive and (
+            config.zero_node_max_demand is not None or config.zero_node_indices
+        ):
+            raise ValueError(
+                'node_adaptive=true는 zero_node_max_demand/zero_node_indices와 '
+                '동시에 사용할 수 없음: 적응 노드 id와 잘린 노드 축이 어긋남'
+            )
 
         d_model = config.d_model
         self.local_radius = config.local_radius
@@ -276,6 +283,166 @@ class LocalViewEncoder(nn.Module):
         )
         # 시간 축을 접는다. 입력은 시점별 창 요약(D) + 그 시점의 보조 정보(C).
         self.temporal_lstm = nn.LSTM(d_model + config.context_dim, d_model, batch_first=True)
+        self.shared_weight_fp8 = bool(config.shared_weight_fp8)
+        if self.shared_weight_fp8 and not hasattr(torch, 'float8_e4m3fn'):
+            raise RuntimeError(
+                'shared_weight_fp8=true에는 torch.float8_e4m3fn을 지원하는 PyTorch가 필요함'
+            )
+
+        # 적응 노드 id는 config의 파이썬 리스트로만 보관한다. 버퍼로 등록하면
+        # from_pretrained의 meta 초기화에서 체크포인트에 없는 id가 torch.empty 쓰레기값이 된다.
+        self.node_adaptive = bool(config.node_adaptive)
+        self._node_adaptive_index_list: list[int] | None = None
+        self._cached_node_adaptive_index: Tensor | None = None
+        if self.node_adaptive:
+            if config.node_adaptive_indices is None:
+                raise ValueError(
+                    'node_adaptive=true인데 node_adaptive_indices가 주어지지 않음'
+                )
+            index_list = [int(value) for value in config.node_adaptive_indices]
+            if not index_list:
+                raise ValueError('node_adaptive_indices는 비어 있지 않은 목록이어야 함')
+            if min(index_list) < 0 or max(index_list) >= config.num_nodes:
+                raise ValueError(
+                    f'node_adaptive_indices가 노드 범위(0..{config.num_nodes - 1})를 벗어남'
+                )
+            if len(set(index_list)) != len(index_list):
+                raise ValueError('node_adaptive_indices에 중복이 있음')
+            self._node_adaptive_index_list = index_list
+
+        # s와 ΔW는 fp32 학습 파라미터다. s=1, ΔW=0이면 fp8 off에서 baseline
+        # temporal_lstm과 같은 함수가 되고, fp8 on에서는 공유 weight만 양자화된다.
+        if self.node_adaptive:
+            num_adaptive = len(self._node_adaptive_index_list)
+            n_gates = 4 * d_model
+            self.s = nn.Parameter(torch.tensor(1.0))
+            self.node_delta_weight_ih = nn.Parameter(
+                torch.zeros(num_adaptive, n_gates, d_model + config.context_dim)
+            )
+            self.node_delta_weight_hh = nn.Parameter(
+                torch.zeros(num_adaptive, n_gates, d_model)
+            )
+            self.node_delta_bias = nn.Parameter(torch.zeros(num_adaptive, n_gates))
+
+    def node_adaptive_index(self, device: torch.device) -> Tensor:
+        """ΔW를 받는 전역 노드 id 텐서. config 리스트를 device별로 캐시한다."""
+
+        if not self.node_adaptive or self._node_adaptive_index_list is None:
+            raise RuntimeError('node_adaptive가 꺼져 있어 adaptive index가 없음')
+        cached = self._cached_node_adaptive_index
+        if cached is None or cached.device != device:
+            cached = torch.as_tensor(
+                self._node_adaptive_index_list, dtype=torch.long, device=device
+            )
+            self._cached_node_adaptive_index = cached
+        return cached
+
+    @staticmethod
+    def _fake_quantize_fp8(weight: Tensor) -> tuple[Tensor, Tensor]:
+        """absmax scaled FP8 fake quantization with a straight-through gradient.
+
+        Returns the fp32 STE value used by both functional and manual LSTM paths and
+        the fp32 scale used to map the tensor to the e4m3fn representable range.
+        """
+
+        if not hasattr(torch, 'float8_e4m3fn'):
+            raise RuntimeError('설치된 torch에 torch.float8_e4m3fn이 없음')
+        absmax = weight.detach().abs().amax()
+        # FP8 e4m3fn의 최대 유한값 448을 활용한다. all-zero tensor도 안전하게
+        # 양자화할 수 있도록 scale=1을 쓴다.
+        scale = torch.where(
+            absmax > 0,
+            absmax / weight.new_tensor(448.0),
+            weight.new_tensor(1.0),
+        )
+        quantized = (weight / scale).to(torch.float8_e4m3fn)
+        dequantized = quantized.to(weight.dtype) * scale
+        ste = weight + (dequantized - weight).detach()
+        return ste, scale
+
+    def shared_lstm_weights(self, *, quantize: bool | None = None) -> tuple[Tensor, ...]:
+        """Return the four shared temporal-LSTM tensors used by both execution paths.
+
+        ``quantize`` defaults to the config switch and exists to make CPU acceptance
+        checks able to compare the exact functional fp32 and fake-FP8 paths.
+        """
+
+        if quantize is None:
+            quantize = self.shared_weight_fp8
+        params = (
+            self.temporal_lstm.weight_ih_l0,
+            self.temporal_lstm.weight_hh_l0,
+            self.temporal_lstm.bias_ih_l0,
+            self.temporal_lstm.bias_hh_l0,
+        )
+        if not quantize:
+            return params
+        if not hasattr(torch, 'float8_e4m3fn'):
+            raise RuntimeError('설치된 torch에 torch.float8_e4m3fn이 없음')
+        return tuple(self._fake_quantize_fp8(param)[0] for param in params)
+
+    def functional_lstm(
+        self, sequence: Tensor, weights: tuple[Tensor, ...] | None = None
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        """Run the temporal LSTM with externally supplied weights.
+
+        ``torch._VF.lstm`` takes ``(input, hx, params, has_biases, num_layers,
+        dropout, train, bidirectional, batch_first)``. Keeping this call in one
+        method ensures the non-adaptive path uses exactly the same (possibly FP8
+        fake-quantized) tensors as the adaptive cell loop.
+        """
+
+        if weights is None:
+            weights = self.shared_lstm_weights()
+        hidden0 = sequence.new_zeros(1, sequence.shape[0], self.temporal_lstm.hidden_size)
+        cell0 = sequence.new_zeros(1, sequence.shape[0], self.temporal_lstm.hidden_size)
+        output, hidden, cell = torch._VF.lstm(
+            sequence,
+            (hidden0, cell0),
+            list(weights),
+            True,
+            1,
+            0.0,
+            self.training,
+            False,
+            True,
+        )
+        return output, (hidden, cell)
+
+    def _node_adaptive_hidden(
+        self, sequence: Tensor, shared_weights: tuple[Tensor, ...]
+    ) -> Tensor:
+        """Compute adaptive-node hidden states with the gated convex combination."""
+
+        batch, num_adaptive, steps, _ = sequence.shape
+        weight_ih_shared, weight_hh_shared, bias_ih_shared, bias_hh_shared = shared_weights
+        one_minus_s = 1.0 - self.s
+        weight_ih = (
+            self.s * weight_ih_shared.unsqueeze(0)
+            + one_minus_s * self.node_delta_weight_ih
+        )
+        weight_hh = (
+            self.s * weight_hh_shared.unsqueeze(0)
+            + one_minus_s * self.node_delta_weight_hh
+        )
+        bias = (
+            self.s * (bias_ih_shared + bias_hh_shared).unsqueeze(0)
+            + one_minus_s * self.node_delta_bias
+        )
+
+        # Input projection is independent of h, so project all k steps once.
+        gates_x = torch.einsum('bakf,agf->bakg', sequence, weight_ih) + bias.unsqueeze(1)
+        hidden = sequence.new_zeros(batch, num_adaptive, self.temporal_lstm.hidden_size)
+        cell = sequence.new_zeros(batch, num_adaptive, self.temporal_lstm.hidden_size)
+        for step in range(steps):
+            gates = gates_x[:, :, step] + torch.einsum(
+                'bah,agh->bag', hidden, weight_hh
+            )
+            in_gate, forget_gate, cell_gate, out_gate = gates.chunk(4, dim=-1)
+            # PyTorch LSTM gate order is i, f, g, o.
+            cell = forget_gate.sigmoid() * cell + in_gate.sigmoid() * cell_gate.tanh()
+            hidden = out_gate.sigmoid() * cell.tanh()
+        return hidden
 
     def active_node_index(self, device: torch.device) -> Tensor | None:
         """결과를 내는 노드 id 텐서. 전부 계산하면 None. device별로 캐시한다."""
@@ -338,8 +505,18 @@ class LocalViewEncoder(nn.Module):
             .reshape(batch * nodes, steps, -1)
         )
         sequence = torch.cat([sequence, expanded_context], dim=-1)
-        _, (hidden, _) = self.temporal_lstm(sequence)
-        return hidden[-1].reshape(batch, nodes, -1)
+        shared_weights = self.shared_lstm_weights()
+        _, (hidden, _) = self.functional_lstm(sequence, shared_weights)
+        node_hidden = hidden[-1].reshape(batch, nodes, -1)
+        if self.node_adaptive:
+            # Non-adaptive nodes stay on the external-weight functional LSTM above.
+            # Adaptive nodes are recomputed with the same shared (possibly FP8)
+            # tensors and their gated convex combination, then merged out-of-place.
+            index = self.node_adaptive_index(sequence.device)
+            adaptive_sequence = sequence.reshape(batch, nodes, steps, -1).index_select(1, index)
+            adaptive_hidden = self._node_adaptive_hidden(adaptive_sequence, shared_weights)
+            node_hidden = node_hidden.index_copy(1, index, adaptive_hidden)
+        return node_hidden
 
 
 class PeriodicViewEncoder(nn.Module):
@@ -516,15 +693,13 @@ class MergedDemandModel(PreTrainedModel):
         self.configure_loss(config.loss_type)
         self.post_init()
 
-    def configure_loss(self, loss_type: str, *, rmse_weight: float | None = None) -> None:
+    def configure_loss(self, loss_type: str) -> None:
         """학습 loss를 교체하고 선택값을 config에도 동기화한다.
 
         config를 함께 갱신해야 체크포인트를 ``from_pretrained``로 다시 열었을 때 런타임에
         골랐던 loss가 조용히 되돌아가지 않는다.
         """
 
-        if rmse_weight is not None:
-            self.config.rmse_weight = float(rmse_weight)
         self.loss_fn = build_loss(
             loss_type,
             gamma=self.config.loss_gamma,
@@ -566,15 +741,6 @@ class MergedDemandModel(PreTrainedModel):
             cached = keep.view(self.height, self.width)
             self._cached_node_keep = cached
         return cached
-
-    def node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
-        """노드별 weight offset(ΔW). 재설계에서 빠졌으므로 항상 비어 있다.
-
-        ``train.py``의 2-stage 학습이 이 메서드를 부르기 때문에 스텁으로 남긴다 —
-        노드별 적응을 다시 넣을지는 아직 정하지 않았다.
-        """
-
-        return ()
 
     def forward(
         self,
