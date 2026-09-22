@@ -67,6 +67,15 @@ train:
   seed: ${seed}
   full_determinism: false
 
+# configs/config_ulsan.yaml의 같은 블록 주석 참고. name: null이면 지금까지와 동일하게
+# train.lr_scheduler_type을 쓴다.
+optimizer_schedule:
+  name: null
+  warmup_epochs: 5
+  warmup_lr_init: 1e-6
+  cosine_epochs: 60
+  eta_min: 1e-4
+
 callbacks:
   early_stopping:
     # 원본은 무조건 patience를 센다(최소 epoch 제한 없음).

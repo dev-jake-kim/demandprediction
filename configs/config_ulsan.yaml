@@ -64,34 +64,23 @@ train:
   seed: ${seed}
   full_determinism: false
 
+# LR 스케줄러를 train.lr_scheduler_type 대신 ADFormer utils/utils.py의
+# WarmupCosineAnnealingLR(수식 그대로 이식)로 바꾸는 실험용 스위치.
+# name: null이면 지금까지와 동일하게 train.lr_scheduler_type을 쓴다.
+# warmup_epochs epoch 동안 warmup_lr_init -> train.learning_rate로 선형 상승,
+# 이어서 cosine_epochs epoch 동안 train.learning_rate -> eta_min으로 cosine 감쇠,
+# 그 뒤로는 eta_min 유지. 단위는 epoch이며 epoch 단위 계단형으로 적용한다(원본과 동일).
+optimizer_schedule:
+  name: null
+  warmup_epochs: 5
+  warmup_lr_init: 1e-6
+  cosine_epochs: 60
+  eta_min: 1e-4
+
 callbacks:
   early_stopping:
-    # patience만 만지는 것보다 min_epochs를 함께 쓰는 쪽이 낫다. 기록을 보면 best 갱신 직전의
-    # 긴 무개선 구간(G>=6)이 전 구간에 흩어져 있지 않고 **epoch 12~17에 몰려 있다**.
-    # 그 구간은 min_epochs로 통째로 건너뛰고, 그 뒤 수렴 국면에만 작은 patience를 세면
-    # 같은 결과를 더 적은 epoch로 얻는다.
-    min_epochs: 13
-    # 원본 merged_model은 min_epochs 없이 patience=20이었다.
-    #
-    # 이 값은 모듈 ablation을 제외한 baseline/lora/tmp 세 갈래의 ulsan 학습 기록 37건을
-    # (min_epochs, patience) 격자로 시뮬레이션해서 고른 것이다. 판정 기준은
-    # "37건 전부 best_epoch가 원본(min=0, patience=20)과 동일할 것"이다.
-    #
-    #   min=0  pat=20  (원본)   총 1028 epoch            여유 10
-    #   min=0  pat=10           총  748 epoch (-27.2%)   여유  0
-    #   min=13 pat=5            총  657 epoch (-36.1%)   여유  0
-    #   min=13 pat=6            총  685 epoch (-33.4%)   여유  1
-    #   min=13 pat=8  <- 채택   총  741 epoch (-27.9%)   여유  3
-    #
-    # "여유"는 patience를 더 줄여도 결과가 안 깨지는 칸 수다. pat=10(여유 0)은 기록에
-    # 딱 붙은 값이라 한 epoch만 더 정체하는 새 런이 나오면 바로 깨진다. min=13과 함께 쓰면
-    # 같은 절감폭에서 여유를 3까지 벌 수 있어 이쪽을 택했다.
-    #
-    # 주의: 관측된 기록에 대한 보장이다. 새로운 설정(node_adaptive, dropout/batch 변경 등)에서
-    # 정체가 더 길어지면 결과가 달라질 수 있다 — 결과가 기존 기록보다 나쁘면 이 값부터 의심할 것.
-    # porto는 정체 구간이 epoch 10~28로 넓게 퍼져 있어 이 방식이 통하지 않는다
-    # (configs/config_porto.yaml 참고).
-    early_stopping_patience: 8
+    min_epochs: 10
+    early_stopping_patience: 50
 
 # 기존 도구(run_ablation.sh / run_seeds.sh / ABLATION_RESULTS.md) 호환용 요약 JSON.
 # ablation은 파일 이름과 JSON 메타데이터에만 쓰이는 라벨이다 — 실제 스위치는 model.use_* 이다.

@@ -33,12 +33,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import asdict
 from pathlib import Path
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
+from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import Subset
 from transformers import EarlyStoppingCallback, Trainer, TrainerCallback, TrainingArguments, set_seed
 
@@ -121,6 +123,100 @@ class MinEpochEarlyStoppingCallback(EarlyStoppingCallback):
         callback_state = super().state()
         callback_state['args']['min_epochs'] = self.min_epochs
         return callback_state
+
+
+class WarmupCosineAnnealingLR(LRScheduler):
+    """ADFormer ``utils/utils.py``의 동명 스케줄러를 그대로 옮긴 것.
+
+    LR 궤적을 그 구현과 **수식 단위로 동일하게** 유지해야 두 모델의 학습 스케줄을
+    같다고 말할 수 있으므로, get_lr 본문을 재작성하지 않고 그대로 둔다.
+    ``T_max``/``warmup_t``의 단위는 epoch이다(원본이 epoch마다 step()을 부른다).
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        T_max,
+        warmup_t=0,
+        warmup_lr_init=1e-5,
+        eta_min=0,
+        last_epoch=-1,
+    ) -> None:
+        self.T_max = T_max
+        self.warmup_t = warmup_t
+        self.warmup_lr_init = warmup_lr_init
+        self.eta_min = eta_min
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_t:
+            # Warmup phase
+            warmup_lr = self.warmup_lr_init + (self.base_lrs[0] - self.warmup_lr_init) * self.last_epoch / self.warmup_t
+            return [warmup_lr for _ in self.base_lrs]
+        else:
+            # Cosine annealing phase
+            epoch_in_cosine_phase = self.last_epoch - self.warmup_t
+            if epoch_in_cosine_phase >= self.T_max:
+                # After T_max, keep the learning rate at eta_min
+                return [self.eta_min for _ in self.base_lrs]
+            else:
+                cosine_lr = self.eta_min + (self.base_lrs[0] - self.eta_min) * (1 + math.cos(math.pi * epoch_in_cosine_phase / self.T_max)) / 2
+                return [cosine_lr for _ in self.base_lrs]
+
+
+class PerEpochWarmupCosineAnnealingLR(WarmupCosineAnnealingLR):
+    """위 스케줄러를 HF ``Trainer``에 붙이기 위한 어댑터.
+
+    ``Trainer``는 optimizer step마다 ``step()``을 부르지만 원본은 epoch마다 부른다.
+    ``steps_per_epoch``번의 호출을 1 epoch으로 묶어 **epoch 단위 계단형 LR**을
+    그대로 재현한다(step 단위로 보간하면 원본과 다른 궤적이 된다).
+    """
+
+    def __init__(self, optimizer, steps_per_epoch: int, **kwargs) -> None:
+        if steps_per_epoch < 1:
+            raise ValueError(f'steps_per_epoch는 1 이상이어야 함: got {steps_per_epoch}')
+        self.steps_per_epoch = steps_per_epoch
+        self._pending_steps = 0
+        self._initialized = False
+        super().__init__(optimizer, **kwargs)
+        # _LRScheduler.__init__이 부르는 최초 step()은 epoch 0을 세팅하는 것이라 통과시킨다.
+        self._initialized = True
+
+    def step(self, *args, **kwargs):
+        if not self._initialized:
+            return super().step(*args, **kwargs)
+        self._pending_steps += 1
+        if self._pending_steps < self.steps_per_epoch:
+            return None
+        self._pending_steps = 0
+        return super().step(*args, **kwargs)
+
+
+class WarmupCosineTrainer(Trainer):
+    """optimizer는 ``Trainer``가 만든 것을 쓰고 스케줄러만 교체한다.
+
+    optimizer를 직접 만들면 ``Trainer``의 파라미터 그룹 분리(bias/LayerNorm은
+    weight decay 제외)를 다시 구현해야 한다 — ``create_scheduler``만 덮어써서
+        ``train.weight_decay``의 적용 방식을 기존 런과 동일하게 유지한다.
+    """
+
+    def __init__(self, *args, schedule: dict, steps_per_epoch: int, **kwargs) -> None:
+        self._schedule = schedule
+        self._steps_per_epoch = steps_per_epoch
+        super().__init__(*args, **kwargs)
+
+    def create_scheduler(self, num_training_steps: int, optimizer=None):
+        if self.lr_scheduler is None:
+            self.lr_scheduler = PerEpochWarmupCosineAnnealingLR(
+                optimizer if optimizer is not None else self.optimizer,
+                steps_per_epoch=self._steps_per_epoch,
+                T_max=int(self._schedule['cosine_epochs']),
+                warmup_t=int(self._schedule['warmup_epochs']),
+                warmup_lr_init=float(self._schedule['warmup_lr_init']),
+                eta_min=float(self._schedule['eta_min']),
+            )
+        return self.lr_scheduler
+
 
 
 def build_dataset_kwargs(cfg: DictConfig) -> dict:
@@ -343,7 +439,7 @@ def main(cfg: DictConfig) -> None:
         )
 
     train_args = TrainingArguments(output_dir=output_dir, **train_cfg)
-    trainer = Trainer(
+    trainer_kwargs = dict(
         model=model,
         args=train_args,
         train_dataset=train_set,
@@ -357,6 +453,35 @@ def main(cfg: DictConfig) -> None:
             ),
         ],
     )
+    # ADFormer와 LR 궤적을 맞추는 실험용 경로. null이면 train.lr_scheduler_type을 그대로 쓴다.
+    schedule_cfg = OmegaConf.to_container(cfg.optimizer_schedule, resolve=True)
+    schedule_name = schedule_cfg.get('name')
+    if schedule_name is None:
+        trainer = Trainer(**trainer_kwargs)
+    elif schedule_name == 'warmup_cosine':
+        accumulation = int(train_cfg.get('gradient_accumulation_steps', 1) or 1)
+        steps_per_epoch = max(
+            1,
+            math.ceil(
+                math.ceil(len(train_set) / int(train_cfg['per_device_train_batch_size']))
+                / accumulation
+            ),
+        )
+        logger.info(
+            f'[schedule] WarmupCosineAnnealingLR(ADFormer) — '
+            f'warmup {schedule_cfg["warmup_epochs"]} epoch '
+            f'({schedule_cfg["warmup_lr_init"]} -> {train_cfg["learning_rate"]}), '
+            f'cosine {schedule_cfg["cosine_epochs"]} epoch '
+            f'({train_cfg["learning_rate"]} -> {schedule_cfg["eta_min"]}), '
+            f'이후 {schedule_cfg["eta_min"]} 유지 | steps/epoch={steps_per_epoch}'
+        )
+        trainer = WarmupCosineTrainer(
+            schedule=schedule_cfg, steps_per_epoch=steps_per_epoch, **trainer_kwargs
+        )
+    else:
+        raise ValueError(
+            f"알 수 없는 optimizer_schedule.name: {schedule_name!r} (가능: null, 'warmup_cosine')"
+        )
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     node_delta_params = sum(
         param.numel()
