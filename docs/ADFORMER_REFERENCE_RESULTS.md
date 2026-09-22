@@ -29,7 +29,7 @@
 
 ## 표 4. 채택 모델 Ulsan seed별 성능 
 
-### commithash:
+### commithash: fd14d62
 
 | Seed | MAE | RMSE | MAPE (%) |
 |---:|---:|---:|---:|
