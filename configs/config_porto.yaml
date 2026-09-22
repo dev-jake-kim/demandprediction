@@ -15,11 +15,9 @@ project_name: test_porto
 seed: 2026
 device: cuda
 
-# 이 모델은 다른 데이터셋 사용자와 다른 분할 비율(0.80/0.10/0.10)을 쓴다.
-# configs/dataset/*.yaml의 기본값(0.7/0.15)을 여기서 로컬 오버라이드한다.
-dataset:
-  train_ratio: 0.80
-  val_ratio: 0.10
+# ADFormer 기준표(docs/ADFORMER_REFERENCE_RESULTS.md)와 같은 test 구간을 쓰려고
+# configs/dataset/*.yaml의 기본값(0.7/0.15)을 그대로 쓴다. 이 모델은 예전에 0.80/0.10을
+# 썼고, 그때 기록은 test 구간이 달라 지금 기록과 직접 비교할 수 없다.
 
 # UnifiedDemandDataset의 daily/weekly lag 구성. 원본 merged_model/config.yaml의 data: 블록.
 # time_step은 configs/dataset/*.yaml의 것을 쓴다.
@@ -41,17 +39,17 @@ train:
   # 원본은 torch.compile을 쓰지 않는다.
   torch_compile: false
   disable_tqdm: true
-  # 원본: epochs 2000 / patience 20 (min_epochs 없음 -> callbacks.early_stopping.min_epochs: 0)
-  num_train_epochs: 2000
+  # ADFormer와 같은 학습 길이. LR 스케줄(optimizer_schedule)이 120 epoch를 전제로 한다.
+  num_train_epochs: 120
   remove_unused_columns: false
   save_strategy: epoch
   save_total_limit: 1
   # 원본: torch.optim.AdamW(lr, weight_decay). betas/eps는 TrainingArguments 기본값과 동일.
   optim: adamw_torch
   learning_rate: 1e-3
-  weight_decay: 1e-4
-  # 원본에는 LR 스케줄러도 warmup도 없다(고정 lr). TrainingArguments 기본값은 linear+warmup이라
-  # 반드시 덮어써야 한다.
+  weight_decay: 0.05
+  # LR은 optimizer_schedule(WarmupCosineAnnealingLR)이 만든다. 아래 두 값은 그 경로에서
+  # 쓰이지 않지만, optimizer_schedule.name=null로 되돌렸을 때의 기본값으로 남겨 둔다.
   lr_scheduler_type: constant
   warmup_ratio: 0.0
   # 원본: clip_grad_norm_(max_norm=5.0). TrainingArguments 기본값은 1.0.
@@ -70,7 +68,7 @@ train:
 # configs/config_ulsan.yaml의 같은 블록 주석 참고. name: null이면 지금까지와 동일하게
 # train.lr_scheduler_type을 쓴다.
 optimizer_schedule:
-  name: null
+  name: warmup_cosine
   warmup_epochs: 5
   warmup_lr_init: 1e-6
   cosine_epochs: 60
@@ -78,28 +76,10 @@ optimizer_schedule:
 
 callbacks:
   early_stopping:
-    # 원본은 무조건 patience를 센다(최소 epoch 제한 없음).
-    #
-    # **porto는 ulsan과 달리 이 값을 낮출 실익이 없어 원본값을 유지한다.**
-    # 모듈 ablation을 제외한 porto 학습 기록 26건을 (min_epochs, patience) 격자로
-    # 시뮬레이션한 결과:
-    #
-    #   min=0  pat=20  (원본)   총 801 epoch            여유 7
-    #   min=0  pat=13           총 675 epoch (-15.7%)   여유 0
-    #   min=28 pat=1            총 655 epoch (-18.2%)   여유 0
-    #   min=20 pat=8            결과 깨짐
-    #   min=18 pat=10           결과 깨짐
-    #
-    # ulsan은 긴 정체가 epoch 12~17에 몰려 있어 min_epochs로 잘라낼 수 있지만, porto는
-    # epoch 10~28에 넓게 퍼져 있어(G=12 @ep28, G=11 @ep24/20/14) 잘라낼 지점이 없다.
-    # 최선인 min=28/pat=1도 절감은 2.5%p 더일 뿐인데 개선이 한 번만 멈추면 바로 종료라
-    # 실전에서 위험하다. 절감 15.7%를 위해 여유 7 -> 0을 내주는 건 남는 장사가 아니다.
-    #
-    # 참고로 patience=8로 낮추면 4건이 깨진다. 특히 tune_porto_periodic128은 epoch 2에서
-    # 20 epoch 가까이 정체하다 22에서 갱신되는 패턴이라 best가 ep 2로 앞당겨지고 val이
-    # +5.12% 나빠진다 — porto 튜닝에서 RMSE를 가장 크게 개선했던(-4.0%) 변종이 이것이다.
+    # 120 epoch를 끝까지 돌린다 — cosine 감쇠 뒤 eta_min 구간까지 스케줄을 다 태워야
+    # ADFormer와 같은 조건이 된다. best 체크포인트는 load_best_model_at_end가 고른다.
     min_epochs: 0
-    early_stopping_patience: 20
+    early_stopping_patience: 120
 
 # 기존 도구(run_ablation.sh / run_seeds.sh / ABLATION_RESULTS.md) 호환용 요약 JSON.
 # ablation은 파일 이름과 JSON 메타데이터에만 쓰이는 라벨이다 — 실제 스위치는 model.use_* 이다.

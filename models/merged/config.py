@@ -90,7 +90,7 @@ class MergedDemandConfig(PretrainedConfig):
         # 없는 버퍼는 torch.empty(쓰레기값)로 남는다.
         zero_node_indices: list[int] | None = None,
         # --- 손실 ---
-        loss_type: str = 'combined',
+        loss_type: str = 'mae',
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
         rmse_weight: float = 10.0,

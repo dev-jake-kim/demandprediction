@@ -15,11 +15,10 @@ project_name: test_ulsan
 seed: 2026
 device: cuda
 
-# 이 모델은 다른 데이터셋 사용자와 다른 분할 비율(0.80/0.10/0.10)을 쓴다.
-# configs/dataset/*.yaml의 기본값(0.7/0.15)을 여기서 로컬 오버라이드한다.
-dataset:
-  train_ratio: 0.80
-  val_ratio: 0.10
+# ADFormer 기준표(docs/ADFORMER_REFERENCE_RESULTS.md)와 같은 test 구간을 쓰려고
+# configs/dataset/*.yaml의 기본값(0.7/0.15)을 그대로 쓴다. 이 모델은 예전에 0.80/0.10을
+# 썼고, 그때 기록(output/experiments/exp3_fp8_shared_ulsan_seed*.json)은 test 구간이 달라
+# 지금 기록과 직접 비교할 수 없다.
 
 # UnifiedDemandDataset의 daily/weekly lag 구성. 원본 merged_model/config.yaml의 data: 블록.
 # time_step은 configs/dataset/*.yaml의 것을 쓴다.
@@ -38,17 +37,17 @@ train:
   # 원본은 torch.compile을 쓰지 않는다.
   torch_compile: false
   disable_tqdm: true
-  # 원본: epochs 2000 / patience 20 (min_epochs 없음 -> callbacks.early_stopping.min_epochs: 0)
-  num_train_epochs: 2000
+  # ADFormer와 같은 학습 길이. LR 스케줄(optimizer_schedule)이 120 epoch를 전제로 한다.
+  num_train_epochs: 120
   remove_unused_columns: false
   save_strategy: epoch
   save_total_limit: 1
   # 원본: torch.optim.AdamW(lr, weight_decay). betas/eps는 TrainingArguments 기본값과 동일.
   optim: adamw_torch
   learning_rate: 1e-3
-  weight_decay: 1e-4
-  # 원본에는 LR 스케줄러도 warmup도 없다(고정 lr). TrainingArguments 기본값은 linear+warmup이라
-  # 반드시 덮어써야 한다.
+  weight_decay: 0.05
+  # LR은 optimizer_schedule(WarmupCosineAnnealingLR)이 만든다. 아래 두 값은 그 경로에서
+  # 쓰이지 않지만, optimizer_schedule.name=null로 되돌렸을 때의 기본값으로 남겨 둔다.
   lr_scheduler_type: constant
   warmup_ratio: 0.0
   # 원본: clip_grad_norm_(max_norm=5.0). TrainingArguments 기본값은 1.0.
@@ -71,7 +70,7 @@ train:
 # 이어서 cosine_epochs epoch 동안 train.learning_rate -> eta_min으로 cosine 감쇠,
 # 그 뒤로는 eta_min 유지. 단위는 epoch이며 epoch 단위 계단형으로 적용한다(원본과 동일).
 optimizer_schedule:
-  name: null
+  name: warmup_cosine
   warmup_epochs: 5
   warmup_lr_init: 1e-6
   cosine_epochs: 60
@@ -79,8 +78,10 @@ optimizer_schedule:
 
 callbacks:
   early_stopping:
-    min_epochs: 10
-    early_stopping_patience: 50
+    # 120 epoch를 끝까지 돌린다 — cosine 감쇠 뒤 eta_min 구간까지 스케줄을 다 태워야
+    # ADFormer와 같은 조건이 된다. best 체크포인트는 load_best_model_at_end가 고른다.
+    min_epochs: 0
+    early_stopping_patience: 120
 
 # 기존 도구(run_ablation.sh / run_seeds.sh / ABLATION_RESULTS.md) 호환용 요약 JSON.
 # ablation은 파일 이름과 JSON 메타데이터에만 쓰이는 라벨이다 — 실제 스위치는 model.use_* 이다.
