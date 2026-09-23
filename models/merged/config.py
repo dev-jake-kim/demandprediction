@@ -53,11 +53,15 @@ class MergedDemandConfig(PretrainedConfig):
         transformer_heads: int = 4,
         transformer_ffn: int = 128,
         # --- retrieval 관점 ---
-        # 최근 k시간 패턴과 비슷한 과거 시점을 몇 개 가져올지.
+        # 검색 관점을 쓸지. false면 관점이 local 하나뿐인 모델과 완전히 같다.
+        use_retrieval: bool = True,
+        # 질의와 가장 비슷한 과거 윈도우를 몇 개 골라 쓸지(top-k).
         num_retrieval: int = 20,
         # 후보 범위. 'observed_past' = tau < target_time, 'train_prefix' = train split까지만.
         retrieval_scope: str = 'observed_past',
-        retrieval_chunk_size: int = 256,
+        # 답안지(윈도우 직후 수요) 임베딩 테이블의 상한. 인덱스는 min(max_table, round(x))라
+        # 이 값 이상의 수요는 한 칸으로 합쳐진다. 테이블 크기는 max_table + 1이다.
+        retrieval_max_table: int = 10,
         # --- 보조 정보(날씨/캘린더) ---
         # 날씨 2채널의 min-max 정규화 기준. **train 구간에서 재서 여기 적어 넣는다**
         # (configs/model/merged_<city>.yaml). 시간 리크를 막으려면 val/test를 보면 안 된다.
@@ -114,9 +118,10 @@ class MergedDemandConfig(PretrainedConfig):
         self.transformer_layers = transformer_layers
         self.transformer_heads = transformer_heads
         self.transformer_ffn = transformer_ffn
+        self.use_retrieval = bool(use_retrieval)
         self.num_retrieval = num_retrieval
         self.retrieval_scope = retrieval_scope
-        self.retrieval_chunk_size = retrieval_chunk_size
+        self.retrieval_max_table = int(retrieval_max_table)
         self.temperature_min = temperature_min
         self.temperature_max = temperature_max
         self.precipitation_max = precipitation_max

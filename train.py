@@ -510,6 +510,15 @@ def main(cfg: DictConfig) -> None:
                     f'max_abs={param.abs().max():.4f}'
                 )
 
+    view_gate = getattr(model.fusion, 'view_gate', None)
+    view_gate_values = None
+    if view_gate is not None:
+        # local 외 관점이 실제로 쓰였는지의 유일한 근거다. 0에서 안 움직였으면 그 관점은
+        # 출력에 기여하지 않았다는 뜻이라 결과 해석이 달라진다.
+        view_gate_values = [float(v) for v in view_gate.detach().cpu()]
+        for name, value in zip(model.view_names[1:], view_gate_values):
+            logger.info(f'[view_fusion] gate[{name}]={value:.6f}')
+
     history, best_epoch, best_val = _summarize_history(trainer.state.log_history)
     result = {
         'dataset': cfg.dataset.city,
@@ -523,6 +532,9 @@ def main(cfg: DictConfig) -> None:
         'zero_node_indices': zero_node_indices,
         'device': str(trainer.args.device),
         'retrieval_scope': cfg.model.retrieval_scope,
+        'view_names': list(model.view_names),
+        'view_gate': view_gate_values,
+        'retrieval_max_table': int(model_kwargs.get('retrieval_max_table', 10)),
         # 학습 목적함수. 'objective'는 기존 78건 JSON과의 스키마 호환을 위해 남긴 이름이다.
         'objective': cfg.model.loss_type,
         'ablation': cfg.ablation,

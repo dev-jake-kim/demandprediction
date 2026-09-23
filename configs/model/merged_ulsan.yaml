@@ -22,10 +22,14 @@ dropout: 0.10
 # 격자의 74%가 0이라 정보를 가진 이웃이 몇 개 없어서 그 교란이 상대적으로 크므로 기본은 0이다.
 # 0이 아니면 PyTorch SDPA의 batch<=65535 제한이 살아나 train.py가 배치를 깎는다.
 attention_dropout: 0.0
-retrieval_k: 20
-retrieval_chunk_size: 256
+# --- retrieval 관점 ---
+# 질의(그 노드의 최근 k시간 수요)와 코사인 유사도가 가장 높은 과거 윈도우 top-k.
+num_retrieval: 20
 # 검색 후보 범위. observed_past = tau < target_time(원본 기본값), train_prefix = train split까지만.
 retrieval_scope: observed_past
+# 답안지(윈도우 직후 수요) 임베딩 테이블 상한. 인덱스는 min(max_table, round(수요))라
+# 이 값 이상은 한 칸으로 합쳐진다. 테이블 크기는 max_table + 1이다.
+retrieval_max_table: 10
 # 요일/시간대 임베딩 차원. 날씨는 임베딩하지 않고 정규화한 3값을 그대로 concat하므로,
 # 세 LSTM에 붙는 보조 텐서는 3 + weekday_dim + hour_dim = 15차원이 된다.
 weekday_dim: 7

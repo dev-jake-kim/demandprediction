@@ -100,8 +100,8 @@ reconstructed from the temporal grid when a model is created.
 lora 브랜치의 node_adaptive(W + ΔW)를 이 모델의 **`LocalViewEncoder`의 temporal LSTM
 하나에만** 옮긴 뒤, 공유 가중치와 노드별 보정의 비율을 학습하는 구조다.
 `model.node_adaptive=true`일 때만
-켜지며, Ulsan 모델 config의 기본값은 `node_adaptive=true`와
-`shared_weight_fp8=true`이고, Porto는 근거가 없어 `node_adaptive=false`다.
+켜지며, Ulsan/Porto 모델 config 모두 기본값이 `node_adaptive=true`와
+`shared_weight_fp8=true`다(Porto는 아직 자체 대조 근거가 없다).
 
 적응 노드 `a`의 네 shared LSTM tensor(`weight_ih_l0`, `weight_hh_l0`,
 `bias_ih_l0`, `bias_hh_l0`)는 다음처럼 합성한다:

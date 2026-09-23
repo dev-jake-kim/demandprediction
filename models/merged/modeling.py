@@ -40,7 +40,9 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -547,41 +549,240 @@ class PeriodicViewEncoder(nn.Module):
         pass
 
 
+class RetrievalTarget:
+    """검색 대상(과거 전체 수요)을 들고 있는 읽기 전용 저장소.
+
+    원본 temporal grid ``[T, H, W]``를 ``[T, N]``으로 펴서 보관하고, 후보 윈도우
+    ``[tau-k, tau)``마다 두 가지를 **생성 시 한 번** 미리 계산한다:
+
+    - ``candidate_norm[c, n]`` — 그 윈도우의 L2 norm. 후보는 배치와 무관하므로 매 step
+      다시 잴 이유가 없다. sliding 제곱합은 ``cumsum`` 차분으로 ``O(T*N)``에 끝난다
+      (ones-kernel conv1d는 같은 값을 ``O(T*N*k)``에 구한다 — k배 비싸다).
+    - ``label_index[c, n]`` — 그 윈도우 **직후** 시점의 수요를 ``min(max_table, round(x))``로
+      자른 임베딩 테이블 인덱스.
+
+    ``nn.Module``이 아니다 — 이 텐서들은 데이터에서 결정되는 상수라 state_dict에 들어가면
+    체크포인트만 키우고, 버퍼로 만들면 ``from_pretrained``의 meta device 초기화에서
+    복원 여부를 따로 챙겨야 한다.
+    """
+
+    def __init__(
+        self,
+        grid_path: str | Path,
+        *,
+        height: int,
+        width: int,
+        time_step: int,
+        max_table: int,
+    ) -> None:
+        path = Path(grid_path).expanduser().resolve()
+        grid = np.load(path, mmap_mode='r')
+        if grid.ndim != 3 or tuple(grid.shape[1:]) != (height, width):
+            raise ValueError(
+                f'검색 대상 grid는 [T,{height},{width}]여야 함 (받음: {tuple(grid.shape)})'
+            )
+        values = torch.from_numpy(np.array(grid, dtype=np.float32, copy=True))
+        if not torch.isfinite(values).all() or float(values.min()) < 0:
+            raise ValueError('검색 대상 grid는 유한하고 음이 아닌 값이어야 함')
+        total_steps = values.shape[0]
+        if total_steps <= time_step:
+            raise ValueError(
+                f'검색 대상 길이 T={total_steps}가 time_step={time_step}보다 커야 함'
+            )
+
+        self.grid_path = str(path)
+        self.time_step = time_step
+        self.max_table = max_table
+        self.total_steps = total_steps
+        self.num_nodes = height * width
+        # [T, N]. 창 하나가 후보 하나이므로 노드축은 그대로 두고 시간축만 민다.
+        self.series = values.reshape(total_steps, self.num_nodes).contiguous()
+
+        # 후보 c는 윈도우 [c, c+k)이고 그 직후 시점이 tau = c + k다. tau <= T-1이어야
+        # 답안지(다음 수요)가 존재하므로 후보 수는 C = T - k다.
+        self.num_candidates = total_steps - time_step
+        self.candidate_time = torch.arange(
+            time_step, total_steps, dtype=torch.long
+        )  # [C] 각 후보의 tau
+
+        # sliding 제곱합 = cumsum 차분. fp64로 누적해 긴 시계열의 상쇄 오차를 없앤다
+        # (생성 시 1회라 비용이 문제되지 않는다).
+        squared = self.series.to(torch.float64).pow(2)
+        cumulative = torch.cat(
+            [torch.zeros(1, self.num_nodes, dtype=torch.float64), squared.cumsum(0)]
+        )
+        window_sq = cumulative[time_step : time_step + self.num_candidates] - cumulative[
+            : self.num_candidates
+        ]
+        self.candidate_norm = (
+            window_sq.clamp_min(1e-12).sqrt().to(torch.float32).contiguous()
+        )  # [C, N]
+
+        # 답안지: 윈도우 직후 시점의 수요를 임베딩 인덱스로 미리 바꿔 둔다.
+        labels = self.series[time_step:total_steps]
+        self.label_index = (
+            labels.round().clamp_(0, max_table).to(torch.long).contiguous()
+        )  # [C, N]
+
+        self._device = self.series.device
+
+    def to(self, device: torch.device) -> 'RetrievalTarget':
+        """device별로 한 번만 옮긴다. 같은 device면 아무것도 하지 않는다."""
+
+        if self._device != device:
+            self.series = self.series.to(device)
+            self.candidate_norm = self.candidate_norm.to(device)
+            self.label_index = self.label_index.to(device)
+            self.candidate_time = self.candidate_time.to(device)
+            self._device = device
+        return self
+
+    def past(self, target_time: Tensor) -> tuple[Tensor, Tensor]:
+        """샘플별 인과 경계를 후보축 마스크로 돌려준다.
+
+        Args:
+            target_time: ``[B]`` 예측 대상 시점 t의 절대 인덱스.
+
+        Returns:
+            ``series``: ``[T, N]`` 검색 대상 전체(=t 이전 정보를 포함하는 상위 집합).
+            ``valid``: ``[B, C]`` bool. 후보 c의 답안지 시점 ``tau``가 ``tau < t``인가.
+                배치마다 쓸 수 있는 후보 수가 다르므로 축은 C로 고정하고 여기서 자른다.
+        """
+
+        valid = self.candidate_time.view(1, -1) < target_time.view(-1, 1)
+        return self.series, valid
+
+
 class RetrievalViewEncoder(nn.Module):
     """관점 4 — 유추. "지금과 비슷했던 과거 n개 시점에서는, 그 다음 시간에 무슨 일이 있었나."
 
-    두 단계로 나뉜다:
+    노드별로 독립이다. 질의는 그 노드의 최근 k시간 수요 ``[B, N, k]``이고, 후보는 같은
+    노드의 과거 윈도우 전체다(이웃을 보지 않는다 — 그건 local 관점의 몫이다).
 
-    1. :meth:`search` — 학습 대상이 아니다(``no_grad``). 원본 temporal grid를 직접 읽어
-       현재 윈도우와 가장 비슷한 과거 시점 n개를 고른다. 인과성을 지켜야 하므로 후보는
-       ``tau < target_time``(``retrieval_scope='observed_past'``) 또는 train split 안쪽
-       (``'train_prefix'``)으로 제한한다.
-    2. :meth:`forward` — 그렇게 찾아온 값들을 다른 세 관점과 같은 ``[B, N, D]`` 임베딩으로
-       바꾼다. **이전 설계와 달라진 지점이 여기다** — 검색 결과를 곧바로 예측값(스칼라)으로
-       쓰지 않고, 관점 하나의 임베딩으로 만들어 융합 단계에 넘긴다.
+    ::
+
+        cos[b,n,c] = <q[b,n], x[n,c]> / (|q[b,n]| * |x[n,c]|)
+        out[b,n]   = sum_{i in topk} cos[b,n,i] * Emb(label[i,n])
+
+    분자는 배치마다 질의가 달라 매번 계산해야 하고, ``unfold``로 후보를 펼치면
+    ``[B,N,C,k]``(ulsan 기준 1 GB 이상)가 실체화된다. 그래서 **depthwise conv1d**로
+    sliding 내적을 구한다 — 후보 텐서를 만들지 않고 같은 값을 얻는다. 분모는 후보쪽이
+    배치와 무관하므로 :class:`RetrievalTarget`이 생성 시 ``cumsum``으로 미리 재 둔다.
+
+    집계는 softmax를 쓰지 않는다. top-k 유사도를 **그대로** 가중치로 쓰므로 "비슷한 과거가
+    얼마나 있었나"가 출력의 크기에 남는다. 유효 후보가 k개보다 적은 샘플은 모자란 자리의
+    가중치를 0으로 눌러야 한다 — softmax가 없으면 마스크 값(-inf)이 그대로 곱해지기 때문이다.
+
+    검색 자체에는 gradient가 흐르지 않는다. 학습 파라미터는 답안지 임베딩 테이블뿐이다.
     """
 
-    def __init__(self, config: MergedDemandConfig) -> None:
+    def __init__(self, config: MergedDemandConfig, target: RetrievalTarget) -> None:
         super().__init__()
+        if target.time_step != config.time_step:
+            raise ValueError('RetrievalTarget의 time_step이 config와 다름')
+        if target.num_nodes != config.num_nodes:
+            raise ValueError('RetrievalTarget의 노드 수가 config와 다름')
+        if config.num_retrieval <= 0:
+            raise ValueError('num_retrieval은 1 이상이어야 함')
+        if config.retrieval_scope not in ('observed_past', 'train_prefix'):
+            raise ValueError(
+                "retrieval_scope는 'observed_past' | 'train_prefix' 중 하나여야 함"
+            )
 
+        # nn.Module이 아니라 일반 속성으로 단다 — state_dict에 들어가면 안 된다.
+        object.__setattr__(self, 'target', target)
+        self.time_step = config.time_step
+        self.num_nodes = config.num_nodes
+        self.num_retrieval = config.num_retrieval
+        self.retrieval_scope = config.retrieval_scope
+        self.retrieval_train_end = config.retrieval_train_end
+        if self.retrieval_scope == 'train_prefix' and self.retrieval_train_end is None:
+            raise ValueError("retrieval_scope='train_prefix'에는 retrieval_train_end가 필요함")
+
+        # 답안지 수요 -> 임베딩. min(max_table, round(x))로 잘라 테이블을 작게 유지한다.
+        self.label_embedding = nn.Embedding(target.max_table + 1, config.d_model)
+
+        # 결과를 내는 노드(zero_node 제외 후). local 관점과 노드축을 맞춘다.
+        self.active_node_ids: list[int] | None = None
+        if config.zero_node_indices:
+            excluded = set(int(v) for v in config.zero_node_indices)
+            self.active_node_ids = [
+                n for n in range(self.num_nodes) if n not in excluded
+            ]
+        self._cached_active_index: Tensor | None = None
+
+    def _active_index(self, device: torch.device) -> Tensor | None:
+        if self.active_node_ids is None:
+            return None
+        cached = self._cached_active_index
+        if cached is None or cached.device != device:
+            cached = torch.as_tensor(self.active_node_ids, dtype=torch.long, device=device)
+            self._cached_active_index = cached
+        return cached
+
+    @torch.no_grad()
     def search(self, demand_history: Tensor, sample_idx: Tensor) -> tuple[Tensor, Tensor]:
-        """현재 윈도우와 비슷한 과거 시점 n개를 찾아 그 **직후 실제 수요**를 가져온다.
-
-        학습 파라미터가 없고 gradient도 흐르지 않는다. 같은 ``sample_idx``에 대한 결과는
-        항상 같으므로 캐시할 수 있다.
+        """질의와 가장 비슷한 과거 윈도우 top-k의 유사도와 답안지 인덱스.
 
         Args:
-            demand_history: ``[B, k, H, W]`` 질의로 쓸 최근 k시간 윈도우.
-            sample_idx: ``[B]`` 예측 대상 시점 t의 **절대** 시간 인덱스(split 로컬 아님).
-                인과성 경계를 정하는 데 쓴다.
+            demand_history: ``[B, k, H, W]`` 최근 k시간 격자 전체 수요(raw 스케일).
+            sample_idx: ``[B]`` 예측 대상 시점 t의 절대 인덱스.
 
         Returns:
-            ``neighbor_demand``: ``[B, n, N]`` 찾아온 각 시점 tau의 **다음 시간** 실제 수요.
-                즉 "그때는 이렇게 됐다"는 답안지다.
-            ``neighbor_score``: ``[B, n]`` 질의와의 유사도. 클수록 비슷하다.
+            ``score``: ``[B, N_active, n]`` 코사인 유사도. 유효 후보가 모자란 자리는 0이다.
+            ``label_index``: ``[B, N_active, n]`` 그 후보 직후 수요의 임베딩 인덱스.
         """
 
-        pass
+        batch, steps = demand_history.shape[0], demand_history.shape[1]
+        if steps != self.time_step:
+            raise ValueError(f'질의 길이가 time_step({self.time_step})과 다름: {steps}')
+        device = demand_history.device
+        target = self.target.to(device)
+
+        series, valid = target.past(sample_idx.to(device))
+        if self.retrieval_scope == 'train_prefix':
+            limit = int(self.retrieval_train_end)
+            valid = valid & (target.candidate_time.view(1, -1) < limit)
+
+        active = self._active_index(device)
+        candidate_norm = target.candidate_norm
+        label_index = target.label_index
+        if active is not None:
+            series = series.index_select(1, active)
+            candidate_norm = candidate_norm.index_select(1, active)
+            label_index = label_index.index_select(1, active)
+        nodes = series.shape[1]
+
+        # [B, k, H, W] -> [B, N, k] (질의는 자기 노드의 수요 시계열 하나뿐)
+        query = demand_history.reshape(batch, steps, self.num_nodes).permute(0, 2, 1)
+        if active is not None:
+            query = query.index_select(1, active)
+        query = query.to(torch.float32)
+
+        # depthwise conv1d로 sliding 내적. 그룹마다 커널이 달라야 하므로 입력을
+        # (batch, node) 채널로 펴고 groups=B*N으로 돈다.
+        signal = series.transpose(0, 1).unsqueeze(0).expand(batch, nodes, -1)
+        signal = signal.reshape(1, batch * nodes, -1).contiguous()
+        weight = query.reshape(batch * nodes, 1, steps)
+        dot = F.conv1d(signal, weight, groups=batch * nodes)
+        # conv 출력 위치 c는 윈도우 [c, c+k)에 대응한다. 답안지가 있는 C개만 남긴다.
+        dot = dot.reshape(batch, nodes, -1)[:, :, : target.num_candidates]
+
+        query_norm = query.norm(dim=-1).clamp_min(1e-8).unsqueeze(-1)
+        score = dot / (query_norm * candidate_norm.transpose(0, 1).unsqueeze(0))
+        score = score.nan_to_num(0.0, 0.0, 0.0)
+
+        # 인과 경계 밖 후보는 절대 뽑히지 않도록 최소값으로 눌러 둔다.
+        floor = torch.finfo(score.dtype).min
+        score = score.masked_fill(~valid.unsqueeze(1), floor)
+
+        take = min(self.num_retrieval, score.shape[-1])
+        top_score, top_position = score.topk(take, dim=-1)
+        # 유효 후보가 take개보다 적은 샘플은 마스크 값을 골랐다 — 가중치를 0으로 만든다.
+        top_score = top_score.masked_fill(top_score <= floor / 2, 0.0)
+        top_label = label_index.transpose(0, 1).unsqueeze(0).expand(batch, -1, -1)
+        top_label = top_label.gather(2, top_position)
+        return top_score, top_label
 
     def forward(self, demand_history: Tensor, sample_idx: Tensor) -> Tensor:
         """
@@ -590,34 +791,45 @@ class RetrievalViewEncoder(nn.Module):
             sample_idx: ``[B]``
 
         Returns:
-            ``[B, N, D]`` 노드별 유추 관점 임베딩.
+            ``[B, N_active, D]`` 노드별 유추 관점 임베딩.
         """
 
-        pass
+        score, label_index = self.search(demand_history, sample_idx)
+        embedded = self.label_embedding(label_index)  # [B, N, n, D]
+        return (score.unsqueeze(-1) * embedded).sum(dim=2)
 
 
 class ViewFusion(nn.Module):
-    """네 관점을 노드별로 하나의 벡터로 합친다.
+    """관점별 노드 임베딩을 하나로 합친다.
 
-    합치는 방식(가중 평균 / 어텐션 / concat+MLP)은 아직 정하지 않았다. 확정된 것은
-    입출력 규약뿐이라, 관점 수 ``V``가 바뀌어도 이 블록의 시그니처는 그대로다.
+    0번(local)을 기준으로 두고 나머지 관점은 **0으로 초기화된 스칼라 게이트**를 거쳐 더한다.
+    따라서 학습 시작 시점의 함수는 관점을 추가하기 전(local 단독)과 정확히 같고, 새 관점이
+    쓸모 있는 만큼만 게이트가 자란다. 게이트 값 자체가 "그 관점이 실제로 쓰였나"의 근거다.
     """
 
     def __init__(self, config: MergedDemandConfig, num_views: int) -> None:
         super().__init__()
+        if num_views < 1:
+            raise ValueError('num_views는 1 이상이어야 함')
         self.num_views = num_views
+        # 0번 관점은 게이트 없이 그대로 간다. 나머지 V-1개만 게이트를 가진다.
+        self.view_gate = nn.Parameter(torch.zeros(num_views - 1)) if num_views > 1 else None
 
     def forward(self, views: Tensor) -> Tensor:
         """
         Args:
-            views: ``[B, N, V, D]`` 관점별 노드 임베딩.
-                V=4, 순서는 (local, daily, weekly, retrieval).
+            views: ``[B, N, V, D]`` 관점별 노드 임베딩. 0번은 local이다.
 
         Returns:
             ``[B, N, D]`` 융합된 노드 임베딩.
         """
 
-        pass
+        if views.shape[2] != self.num_views:
+            raise ValueError(f'관점 수가 {self.num_views}가 아님: {views.shape[2]}')
+        fused = views[:, :, 0]
+        if self.view_gate is not None:
+            fused = fused + (self.view_gate.view(1, 1, -1, 1) * views[:, :, 1:]).sum(dim=2)
+        return fused
 
 
 class PredictionHead(nn.Module):
@@ -657,7 +869,8 @@ class MergedDemandModel(PreTrainedModel):
     main_input_name = 'demand_history'
 
     # 융합에 들어가는 순서. ViewFusion의 V 축 의미를 여기 한 곳에서만 정의한다.
-    VIEW_NAMES = ('local', 'daily', 'weekly', 'retrieval')
+    # daily/weekly는 아직 인코더가 비어 있어 살아 있는 관점은 local과 retrieval 둘이다.
+    VIEW_NAMES = ('local', 'retrieval')
 
     def __init__(self, config: MergedDemandConfig) -> None:
         super().__init__(config)
@@ -682,11 +895,23 @@ class MergedDemandModel(PreTrainedModel):
 
         self.context_encoder = ContextEncoder(config)
         self.local_view = LocalViewEncoder(config)
-        # daily/weekly는 같은 클래스의 별개 인스턴스 — 파라미터를 공유하지 않는다.
-        self.daily_view = PeriodicViewEncoder(config)
-        self.weekly_view = PeriodicViewEncoder(config)
-        self.retrieval_view = RetrievalViewEncoder(config)
-        self.fusion = ViewFusion(config, num_views=len(self.VIEW_NAMES))
+        # 검색 관점은 원본 grid 경로가 있고 use_retrieval이 켜져 있을 때만 만든다.
+        # 두 조건 중 하나라도 빠지면 관점이 local 하나뿐인 모델과 완전히 같다.
+        self.use_retrieval = bool(config.use_retrieval and config.retrieval_grid_path)
+        self.retrieval_view: RetrievalViewEncoder | None = None
+        if self.use_retrieval:
+            target = RetrievalTarget(
+                config.retrieval_grid_path,
+                height=config.height,
+                width=config.width,
+                time_step=config.time_step,
+                max_table=config.retrieval_max_table,
+            )
+            self.retrieval_view = RetrievalViewEncoder(config, target)
+        self.view_names = tuple(
+            name for name in self.VIEW_NAMES if name != 'retrieval' or self.use_retrieval
+        )
+        self.fusion = ViewFusion(config, num_views=len(self.view_names))
         self.head = PredictionHead(config)
 
         self.loss_fn: nn.Module
@@ -786,9 +1011,9 @@ class MergedDemandModel(PreTrainedModel):
             ``Trainer``는 ``loss``를 제외한 모든 키를 배치마다 gather하므로 디버그 텐서를
             여기 넣으면 안 된다 — 필요하면 :meth:`forward_views`를 쓴다.
 
-        **지금은 local 관점만 쓴다.** daily/weekly/retrieval 인자를 받기는 하지만 아직
-        읽지 않는다 — 그 세 인코더가 비어 있어서다. 인자 목록을 미리 맞춰 두면 관점을
-        채워 넣을 때 dataset/train.py 쪽을 건드릴 일이 없다.
+        **daily/weekly 관점은 아직 비어 있다.** 그 인자들은 받기만 하고 읽지 않는다 —
+        인코더를 채울 때 dataset/train.py를 건드리지 않으려고 목록을 미리 맞춰 둔 것이다.
+        local과 retrieval 두 관점이 ``ViewFusion``으로 합쳐진다.
         """
 
         views = self._encode_views(
@@ -796,6 +1021,7 @@ class MergedDemandModel(PreTrainedModel):
             weather=weather,
             hour_of_day=hour_of_day,
             day_of_week=day_of_week,
+            sample_idx=sample_idx,
         )
         # [B, N_active] — 학습에서 뺀 노드가 있으면 그만큼 짧다.
         predictions = self.head(views['fused'])
@@ -842,15 +1068,20 @@ class MergedDemandModel(PreTrainedModel):
         weather: Tensor,
         hour_of_day: Tensor,
         day_of_week: Tensor,
+        sample_idx: Tensor,
     ) -> dict[str, Tensor]:
         """관점별 임베딩과 융합 결과. ``forward``와 ``forward_views``가 공유한다.
 
-        관점이 하나뿐인 동안은 융합할 것이 없어 ``fused``가 ``local``과 같은 텐서다.
+        ``use_retrieval=false``면 관점이 local 하나뿐이라 ``fused``가 ``local``과 같다.
         """
 
         context = self.context_encoder(weather, hour_of_day, day_of_week)  # [B,k,C]
-        local = self.local_view(demand_history, context)  # [B,N,D]
-        return {'local': local, 'fused': local}
+        encoded = {'local': self.local_view(demand_history, context)}  # [B,N,D]
+        if self.retrieval_view is not None:
+            encoded['retrieval'] = self.retrieval_view(demand_history, sample_idx)
+        stacked = torch.stack([encoded[name] for name in self.view_names], dim=2)
+        encoded['fused'] = self.fusion(stacked)
+        return encoded
 
     def forward_views(self, **batch) -> dict[str, Tensor]:
         """관점별 임베딩을 그대로 돌려준다(분석/디버깅용, 학습 경로에서 쓰지 않는다).
@@ -865,6 +1096,7 @@ class MergedDemandModel(PreTrainedModel):
             weather=batch['weather'],
             hour_of_day=batch['hour_of_day'],
             day_of_week=batch['day_of_week'],
+            sample_idx=batch['sample_idx'],
         )
         views['logits'] = self.head(views['fused']).reshape(-1, self.height, self.width)
         return views
@@ -877,6 +1109,7 @@ __all__ = [
     'MergedDemandModel',
     'PeriodicViewEncoder',
     'PredictionHead',
+    'RetrievalTarget',
     'RetrievalViewEncoder',
     'ViewFusion',
     'crop_local_windows',
