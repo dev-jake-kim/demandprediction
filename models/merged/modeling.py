@@ -662,16 +662,18 @@ class RetrievalViewEncoder(nn.Module):
     ::
 
         cos[b,n,c] = <q[b,n], x[n,c]> / (|q[b,n]| * |x[n,c]|)
-        out[b,n]   = sum_{i in topk} cos[b,n,i] * Emb(label[i,n])
+        w[b,n,:]   = softmax_{i in topk}(cos[b,n,i])
+        out[b,n]   = sum_{i in topk} w[b,n,i] * Emb(label[i,n])
 
     분자는 배치마다 질의가 달라 매번 계산해야 하고, ``unfold``로 후보를 펼치면
     ``[B,N,C,k]``(ulsan 기준 1 GB 이상)가 실체화된다. 그래서 **depthwise conv1d**로
     sliding 내적을 구한다 — 후보 텐서를 만들지 않고 같은 값을 얻는다. 분모는 후보쪽이
     배치와 무관하므로 :class:`RetrievalTarget`이 생성 시 ``cumsum``으로 미리 재 둔다.
 
-    집계는 softmax를 쓰지 않는다. top-k 유사도를 **그대로** 가중치로 쓰므로 "비슷한 과거가
-    얼마나 있었나"가 출력의 크기에 남는다. 유효 후보가 k개보다 적은 샘플은 모자란 자리의
-    가중치를 0으로 눌러야 한다 — softmax가 없으면 마스크 값(-inf)이 그대로 곱해지기 때문이다.
+    집계는 top-k 유사도의 **softmax** 가중 평균이다. 가중치 합이 1이라 출력 크기가 후보
+    수나 유사도 절대값에 끌려가지 않고 답안지 임베딩과 같은 스케일에 머문다. 인과 경계
+    때문에 유효 후보가 k개보다 적은 샘플은 모자란 자리를 softmax 전에 ``-inf``로 빼고,
+    유효 후보가 하나도 없는 샘플은 출력이 0 벡터다.
 
     검색 자체에는 gradient가 흐르지 않는다. 학습 파라미터는 답안지 임베딩 테이블뿐이다.
     """
@@ -721,16 +723,19 @@ class RetrievalViewEncoder(nn.Module):
         return cached
 
     @torch.no_grad()
-    def search(self, demand_history: Tensor, sample_idx: Tensor) -> tuple[Tensor, Tensor]:
-        """질의와 가장 비슷한 과거 윈도우 top-k의 유사도와 답안지 인덱스.
+    def search(
+        self, demand_history: Tensor, sample_idx: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """질의와 가장 비슷한 과거 윈도우 top-k의 유사도, 답안지 인덱스, 유효 여부.
 
         Args:
             demand_history: ``[B, k, H, W]`` 최근 k시간 격자 전체 수요(raw 스케일).
             sample_idx: ``[B]`` 예측 대상 시점 t의 절대 인덱스.
 
         Returns:
-            ``score``: ``[B, N_active, n]`` 코사인 유사도. 유효 후보가 모자란 자리는 0이다.
+            ``score``: ``[B, N_active, n]`` 코사인 유사도. 무효 자리는 0이다.
             ``label_index``: ``[B, N_active, n]`` 그 후보 직후 수요의 임베딩 인덱스.
+            ``valid``: ``[B, N_active, n]`` bool. 인과 경계 안의 실제 후보를 골랐는가.
         """
 
         batch, steps = demand_history.shape[0], demand_history.shape[1]
@@ -778,11 +783,12 @@ class RetrievalViewEncoder(nn.Module):
 
         take = min(self.num_retrieval, score.shape[-1])
         top_score, top_position = score.topk(take, dim=-1)
-        # 유효 후보가 take개보다 적은 샘플은 마스크 값을 골랐다 — 가중치를 0으로 만든다.
-        top_score = top_score.masked_fill(top_score <= floor / 2, 0.0)
+        # 유효 후보가 take개보다 적은 샘플은 마스크 값을 골랐다 — 그 자리를 표시해 둔다.
+        top_valid = top_score > floor / 2
+        top_score = top_score.masked_fill(~top_valid, 0.0)
         top_label = label_index.transpose(0, 1).unsqueeze(0).expand(batch, -1, -1)
         top_label = top_label.gather(2, top_position)
-        return top_score, top_label
+        return top_score, top_label, top_valid
 
     def forward(self, demand_history: Tensor, sample_idx: Tensor) -> Tensor:
         """
@@ -794,17 +800,27 @@ class RetrievalViewEncoder(nn.Module):
             ``[B, N_active, D]`` 노드별 유추 관점 임베딩.
         """
 
-        score, label_index = self.search(demand_history, sample_idx)
+        score, label_index, valid = self.search(demand_history, sample_idx)
+        # 무효 자리는 softmax에서 빼고, 유효 후보가 하나도 없는 행(전부 -inf -> NaN)은
+        # 가중치를 0으로 둔다 — 그 샘플의 출력은 0 벡터가 된다.
+        weight = torch.softmax(score.masked_fill(~valid, float('-inf')), dim=-1)
+        weight = weight.nan_to_num(0.0)
         embedded = self.label_embedding(label_index)  # [B, N, n, D]
-        return (score.unsqueeze(-1) * embedded).sum(dim=2)
+        return (weight.unsqueeze(-1) * embedded).sum(dim=2)
 
 
 class ViewFusion(nn.Module):
     """관점별 노드 임베딩을 하나로 합친다.
 
-    0번(local)을 기준으로 두고 나머지 관점은 **0으로 초기화된 스칼라 게이트**를 거쳐 더한다.
-    따라서 학습 시작 시점의 함수는 관점을 추가하기 전(local 단독)과 정확히 같고, 새 관점이
-    쓸모 있는 만큼만 게이트가 자란다. 게이트 값 자체가 "그 관점이 실제로 쓰였나"의 근거다.
+    0번(local)을 기준으로 두고 나머지 관점은 **local 임베딩에서 선형으로 만든 게이트**를
+    거쳐 더한다::
+
+        g[b,n,:] = Linear(local[b,n])            # [V-1] — 노드·샘플마다 다르다
+        fused    = local + sum_j g[b,n,j] * view_j[b,n]
+
+    "지금 이 노드의 국소 상황이 이렇다면 다른 관점을 얼마나 믿을까"를 local이 정한다.
+    Linear의 weight와 bias를 0으로 초기화하므로 학습 시작 시점의 함수는 local 단독과
+    정확히 같고, 게이트는 쓸모 있는 만큼만 자란다.
     """
 
     def __init__(self, config: MergedDemandConfig, num_views: int) -> None:
@@ -812,8 +828,19 @@ class ViewFusion(nn.Module):
         if num_views < 1:
             raise ValueError('num_views는 1 이상이어야 함')
         self.num_views = num_views
-        # 0번 관점은 게이트 없이 그대로 간다. 나머지 V-1개만 게이트를 가진다.
-        self.view_gate = nn.Parameter(torch.zeros(num_views - 1)) if num_views > 1 else None
+        # 0번 관점은 게이트 없이 그대로 간다. 나머지 V-1개의 게이트를 local에서 만든다.
+        self.gate_proj: nn.Linear | None = None
+        if num_views > 1:
+            self.gate_proj = nn.Linear(config.d_model, num_views - 1)
+            nn.init.zeros_(self.gate_proj.weight)
+            nn.init.zeros_(self.gate_proj.bias)
+
+    def gate(self, local: Tensor) -> Tensor | None:
+        """``[B, N, D]`` -> ``[B, N, V-1]`` 관점별 게이트. 관점이 하나뿐이면 None."""
+
+        if self.gate_proj is None:
+            return None
+        return self.gate_proj(local)
 
     def forward(self, views: Tensor) -> Tensor:
         """
@@ -826,10 +853,11 @@ class ViewFusion(nn.Module):
 
         if views.shape[2] != self.num_views:
             raise ValueError(f'관점 수가 {self.num_views}가 아님: {views.shape[2]}')
-        fused = views[:, :, 0]
-        if self.view_gate is not None:
-            fused = fused + (self.view_gate.view(1, 1, -1, 1) * views[:, :, 1:]).sum(dim=2)
-        return fused
+        local = views[:, :, 0]
+        gate = self.gate(local)
+        if gate is None:
+            return local
+        return local + (gate.unsqueeze(-1) * views[:, :, 1:]).sum(dim=2)
 
 
 class PredictionHead(nn.Module):

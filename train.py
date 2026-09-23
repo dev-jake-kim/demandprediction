@@ -40,6 +40,7 @@ from pathlib import Path
 import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
+import torch
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import Subset
 from transformers import EarlyStoppingCallback, Trainer, TrainerCallback, TrainingArguments, set_seed
@@ -497,7 +498,18 @@ def main(cfg: DictConfig) -> None:
     trainer.save_model(output_dir)
     logger.info(f'Model saved to: {output_dir}')
 
+    # 관점 게이트는 local 임베딩에서 샘플·노드마다 만들어지므로 파라미터 하나로 요약되지
+    # 않는다. test 평가 중에 실제로 나온 게이트 값을 모아 분포로 남긴다 — local 외 관점이
+    # 출력에 실제로 쓰였는지의 근거다.
+    gate_batches: list = []
+    gate_hook = None
+    if getattr(model.fusion, 'gate_proj', None) is not None:
+        gate_hook = model.fusion.gate_proj.register_forward_hook(
+            lambda _module, _inputs, output: gate_batches.append(output.detach().float().cpu())
+        )
     test_metrics = trainer.evaluate(eval_dataset=eval_test_set, metric_key_prefix='test')
+    if gate_hook is not None:
+        gate_hook.remove()
     logger.info(f'Test metrics: {test_metrics}')
 
     if node_delta_params:
@@ -510,14 +522,20 @@ def main(cfg: DictConfig) -> None:
                     f'max_abs={param.abs().max():.4f}'
                 )
 
-    view_gate = getattr(model.fusion, 'view_gate', None)
-    view_gate_values = None
-    if view_gate is not None:
-        # local 외 관점이 실제로 쓰였는지의 유일한 근거다. 0에서 안 움직였으면 그 관점은
-        # 출력에 기여하지 않았다는 뜻이라 결과 해석이 달라진다.
-        view_gate_values = [float(v) for v in view_gate.detach().cpu()]
-        for name, value in zip(model.view_names[1:], view_gate_values):
-            logger.info(f'[view_fusion] gate[{name}]={value:.6f}')
+    view_gate_stats = None
+    if gate_batches:
+        gates = torch.cat([g.reshape(-1, g.shape[-1]) for g in gate_batches])  # [샘플*노드, V-1]
+        view_gate_stats = {}
+        for index, name in enumerate(model.view_names[1:]):
+            column = gates[:, index]
+            view_gate_stats[name] = {
+                'mean': float(column.mean()),
+                'std': float(column.std()),
+                'abs_mean': float(column.abs().mean()),
+                'min': float(column.min()),
+                'max': float(column.max()),
+            }
+            logger.info(f'[view_fusion] gate[{name}] (test) {view_gate_stats[name]}')
 
     history, best_epoch, best_val = _summarize_history(trainer.state.log_history)
     result = {
@@ -533,7 +551,7 @@ def main(cfg: DictConfig) -> None:
         'device': str(trainer.args.device),
         'retrieval_scope': cfg.model.retrieval_scope,
         'view_names': list(model.view_names),
-        'view_gate': view_gate_values,
+        'view_gate_test': view_gate_stats,
         'retrieval_max_table': int(model_kwargs.get('retrieval_max_table', 10)),
         # 학습 목적함수. 'objective'는 기존 78건 JSON과의 스키마 호환을 위해 남긴 이름이다.
         'objective': cfg.model.loss_type,
