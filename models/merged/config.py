@@ -48,7 +48,11 @@ class MergedDemandConfig(PretrainedConfig):
         local_radius: int = 2,
         # 창 안의 스칼라 수요를 토큰으로 바꿀 때 쓰는 학습 가능한 Fourier 밴드 수.
         num_fourier_bands: int = 8,
-        # 창 하나(길이 1+(2a+1)^2 시퀀스)를 요약하는 Transformer.
+        # 창 인코더 종류. 'transformer' = CLS + 이웃 토큰 self-attention(기본),
+        # 'conv' = 창을 (2a+1)x(2a+1) 이미지로 보고 residual 3x3 conv 블록을 쌓는다
+        # (위치 임베딩 없음, 요약은 중앙 칸). 두 경로 모두 transformer_layers만큼 쌓는다.
+        local_encoder: str = 'transformer',
+        # 창 하나를 요약하는 블록 수.
         transformer_layers: int = 2,
         transformer_heads: int = 4,
         transformer_ffn: int = 128,
@@ -111,6 +115,7 @@ class MergedDemandConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.local_radius = local_radius
         self.num_fourier_bands = num_fourier_bands
+        self.local_encoder = str(local_encoder)
         self.transformer_layers = transformer_layers
         self.transformer_heads = transformer_heads
         self.transformer_ffn = transformer_ffn

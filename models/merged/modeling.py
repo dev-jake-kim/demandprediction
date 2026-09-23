@@ -195,6 +195,45 @@ class FourierScalarEmbedding(nn.Module):
         return self.projection(torch.cat([value, phase.sin(), phase.cos()], dim=-1))
 
 
+class WindowConvEncoder(nn.Module):
+    """창 하나를 attention 대신 2D conv로 요약한다.
+
+    ``(2a+1) x (2a+1)`` 창을 채널이 ``D``인 이미지로 보고 residual conv 블록을 쌓는다.
+    블록 구조는 Transformer의 pre-norm 잔차 블록과 같게 맞췄다::
+
+        x = x + Dropout(GELU(Conv3x3(LayerNorm(x))))
+
+    위치 임베딩이 없다 — conv 커널 자체가 "어느 방향 이웃인지"를 가중치로 구분하므로
+    Transformer처럼 자리를 따로 알려 줄 필요가 없다. 요약은 CLS 토큰이 아니라 창의
+    **중앙 칸**(=그 노드 자신)에서 읽는다.
+    """
+
+    def __init__(self, d_model: int, window_size: int, layers: int, dropout: float) -> None:
+        super().__init__()
+        self.window_size = window_size
+        self.center = (window_size * window_size) // 2
+        self.norms = nn.ModuleList(nn.LayerNorm(d_model) for _ in range(layers))
+        self.convs = nn.ModuleList(
+            nn.Conv2d(d_model, d_model, kernel_size=3, padding=1) for _ in range(layers)
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        """``[M, P, D]`` 창 토큰 -> ``[M, D]`` 창 요약."""
+
+        size = self.window_size
+        batch, neighbors, d_model = tokens.shape
+        if neighbors != size * size:
+            raise ValueError(f'창 토큰 수가 {size * size}가 아님: {neighbors}')
+        hidden = tokens
+        for norm, conv in zip(self.norms, self.convs):
+            normed = norm(hidden)
+            grid = normed.transpose(1, 2).reshape(batch, d_model, size, size)
+            delta = conv(grid).reshape(batch, d_model, neighbors).transpose(1, 2)
+            hidden = hidden + self.dropout(F.gelu(delta))
+        return hidden[:, self.center]
+
+
 class LocalViewEncoder(nn.Module):
     """관점 1 — 공간. "내 주변 (2a+1)^2 칸에서 최근 k시간 동안 무슨 일이 있었나."
 
@@ -258,29 +297,42 @@ class LocalViewEncoder(nn.Module):
         self.scalar_embedding = FourierScalarEmbedding(d_model, config.num_fourier_bands)
         # 0 = CLS(요약을 모으는 자리), 1 = EDGE(격자 밖 = 값이 없음).
         self.special_embedding = nn.Embedding(2, d_model)
-        # "몇 번 노드의 요약인지"를 CLS에 새겨 넣는다.
+        # "몇 번 노드의 요약인지"를 창에 새겨 넣는다. transformer 경로는 CLS 토큰에,
+        # conv 경로는 창의 모든 칸에 더한다(CLS가 없으므로).
         self.node_embedding = nn.Parameter(torch.randn(self.num_nodes, d_model) * 0.02)
-        # 창 안의 자리(CLS 1개 + 이웃 P개)를 구분하는 위치 임베딩.
-        self.position_embedding = nn.Parameter(
-            torch.randn(1 + self.num_neighbors, d_model) * 0.02
-        )
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=config.transformer_heads,
-            dim_feedforward=config.transformer_ffn,
-            dropout=config.dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,
-        )
-        # nn.TransformerEncoderLayer는 dropout 인자 하나를 네 곳에 다 쓴다. 그중 어텐션
-        # 가중치에 걸리는 것만 따로 떼어 다시 설정한다 — TransformerEncoder가 이 레이어를
-        # deepcopy하므로 복제 전에 바꿔야 모든 층에 반영된다.
-        encoder_layer.self_attn.dropout = config.attention_dropout
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=config.transformer_layers, enable_nested_tensor=False
-        )
+        self.local_encoder = str(config.local_encoder)
+        if self.local_encoder not in ('transformer', 'conv'):
+            raise ValueError("local_encoder는 'transformer' | 'conv'여야 함")
+        if self.local_encoder == 'transformer':
+            # 창 안의 자리(CLS 1개 + 이웃 P개)를 구분하는 위치 임베딩.
+            self.position_embedding = nn.Parameter(
+                torch.randn(1 + self.num_neighbors, d_model) * 0.02
+            )
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=config.transformer_heads,
+                dim_feedforward=config.transformer_ffn,
+                dropout=config.dropout,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,
+            )
+            # nn.TransformerEncoderLayer는 dropout 인자 하나를 네 곳에 다 쓴다. 그중 어텐션
+            # 가중치에 걸리는 것만 따로 떼어 다시 설정한다 — TransformerEncoder가 이 레이어를
+            # deepcopy하므로 복제 전에 바꿔야 모든 층에 반영된다.
+            encoder_layer.self_attn.dropout = config.attention_dropout
+            self.transformer = nn.TransformerEncoder(
+                encoder_layer, num_layers=config.transformer_layers, enable_nested_tensor=False
+            )
+        else:
+            # conv 경로에는 CLS도 위치 임베딩도 없다. 노드 정체성은 창의 모든 칸에
+            # 브로드캐스트로 더하고, 요약은 중앙 칸에서 읽는다.
+            self.window_conv = WindowConvEncoder(
+                d_model,
+                window_size=config.window_size,
+                layers=config.transformer_layers,
+                dropout=config.dropout,
+            )
         # 시간 축을 접는다. 입력은 시점별 창 요약(D) + 그 시점의 보조 정보(C).
         self.temporal_lstm = nn.LSTM(d_model + config.context_dim, d_model, batch_first=True)
         self.shared_weight_fp8 = bool(config.shared_weight_fp8)
@@ -487,15 +539,25 @@ class LocalViewEncoder(nn.Module):
         node_embedding = self.node_embedding
         if active is not None:
             node_embedding = node_embedding.index_select(0, active)
-        cls_token = self.special_embedding.weight[0].view(1, 1, 1, 1, -1)
-        cls_token = cls_token + node_embedding.view(1, 1, nodes, 1, -1)
-        cls_token = cls_token.expand(batch, steps, -1, -1, -1)
-        tokens = torch.cat([cls_token, tokens], dim=3)
-        tokens = tokens + self.position_embedding.view(1, 1, 1, 1 + neighbors, -1)
 
-        # (배치, 시점, 노드)를 batch 축으로 접는다 — 창 하나가 시퀀스 하나다.
-        encoded = self.transformer(tokens.reshape(batch * steps * nodes, 1 + neighbors, -1))
-        summary = encoded[:, 0].reshape(batch, steps, nodes, -1)  # CLS만 꺼낸다
+        if self.local_encoder == 'transformer':
+            cls_token = self.special_embedding.weight[0].view(1, 1, 1, 1, -1)
+            cls_token = cls_token + node_embedding.view(1, 1, nodes, 1, -1)
+            cls_token = cls_token.expand(batch, steps, -1, -1, -1)
+            tokens = torch.cat([cls_token, tokens], dim=3)
+            tokens = tokens + self.position_embedding.view(1, 1, 1, 1 + neighbors, -1)
+            # (배치, 시점, 노드)를 batch 축으로 접는다 — 창 하나가 시퀀스 하나다.
+            encoded = self.transformer(
+                tokens.reshape(batch * steps * nodes, 1 + neighbors, -1)
+            )
+            summary = encoded[:, 0].reshape(batch, steps, nodes, -1)  # CLS만 꺼낸다
+        else:
+            # CLS 자리가 없으므로 노드 임베딩을 창 전체에 더한다. 요약은 중앙 칸이다.
+            tokens = tokens + node_embedding.view(1, 1, nodes, 1, -1)
+            encoded = self.window_conv(
+                tokens.reshape(batch * steps * nodes, neighbors, -1)
+            )
+            summary = encoded.reshape(batch, steps, nodes, -1)
 
         # 시간 축을 접는다. 보조 정보는 노드에 무관하므로 노드 축으로 브로드캐스트해 붙인다.
         sequence = summary.permute(0, 2, 1, 3).reshape(batch * nodes, steps, -1)
@@ -879,6 +941,7 @@ __all__ = [
     'PredictionHead',
     'RetrievalViewEncoder',
     'ViewFusion',
+    'WindowConvEncoder',
     'crop_local_windows',
     'make_neighbor_valid',
 ]
