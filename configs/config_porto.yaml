@@ -79,7 +79,7 @@ callbacks:
     # 120 epoch를 끝까지 돌린다 — cosine 감쇠 뒤 eta_min 구간까지 스케줄을 다 태워야
     # ADFormer와 같은 조건이 된다. best 체크포인트는 load_best_model_at_end가 고른다.
     min_epochs: 0
-    early_stopping_patience: 120
+    early_stopping_patience: 10
 
 # 기존 도구(run_ablation.sh / run_seeds.sh / ABLATION_RESULTS.md) 호환용 요약 JSON.
 # ablation은 파일 이름과 JSON 메타데이터에만 쓰이는 라벨이다 — 실제 스위치는 model.use_* 이다.
