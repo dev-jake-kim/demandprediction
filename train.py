@@ -40,7 +40,6 @@ from pathlib import Path
 import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
-import torch
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import Subset
 from transformers import EarlyStoppingCallback, Trainer, TrainerCallback, TrainingArguments, set_seed
@@ -498,20 +497,7 @@ def main(cfg: DictConfig) -> None:
     trainer.save_model(output_dir)
     logger.info(f'Model saved to: {output_dir}')
 
-    # 검색 게이트 lambda는 샘플·노드마다 달라 파라미터 하나로 요약되지 않는다. test 평가
-    # 중에 실제로 나온 값을 모아 분포로 남긴다 — 검색 예측이 최종 출력에 얼마나 쓰였는지의
-    # 근거다(lambda=1이면 뉴럴 예측만, 0이면 검색 예측만 쓴 것이다).
-    lambda_batches: list = []
-    lambda_hook = None
-    if getattr(model, 'output_gate', None) is not None:
-        lambda_hook = model.output_gate.lambda_layer.register_forward_hook(
-            lambda _module, _inputs, output: lambda_batches.append(
-                torch.sigmoid(output.detach().float()).cpu()
-            )
-        )
     test_metrics = trainer.evaluate(eval_dataset=eval_test_set, metric_key_prefix='test')
-    if lambda_hook is not None:
-        lambda_hook.remove()
     logger.info(f'Test metrics: {test_metrics}')
 
     if node_delta_params:
@@ -523,18 +509,6 @@ def main(cfg: DictConfig) -> None:
                     f'[node_adaptive] {name}: norm={param.norm():.4f} '
                     f'max_abs={param.abs().max():.4f}'
                 )
-
-    lambda_stats = None
-    if lambda_batches:
-        lambdas = torch.cat([value.reshape(-1) for value in lambda_batches])
-        lambda_stats = {
-            'mean': float(lambdas.mean()),
-            'std': float(lambdas.std()),
-            'min': float(lambdas.min()),
-            'max': float(lambdas.max()),
-            'frac_above_half': float((lambdas > 0.5).float().mean()),
-        }
-        logger.info(f'[retrieval_gate] lambda (test) {lambda_stats}')
 
     history, best_epoch, best_val = _summarize_history(trainer.state.log_history)
     result = {
@@ -549,9 +523,6 @@ def main(cfg: DictConfig) -> None:
         'zero_node_indices': zero_node_indices,
         'device': str(trainer.args.device),
         'retrieval_scope': cfg.model.retrieval_scope,
-        'use_retrieval': bool(getattr(model, 'use_retrieval', False)),
-        'num_retrieval': int(model_kwargs.get('num_retrieval', 20)),
-        'retrieval_lambda_test': lambda_stats,
         # 학습 목적함수. 'objective'는 기존 78건 JSON과의 스키마 호환을 위해 남긴 이름이다.
         'objective': cfg.model.loss_type,
         'ablation': cfg.ablation,
