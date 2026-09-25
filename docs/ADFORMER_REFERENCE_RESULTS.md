@@ -27,13 +27,23 @@
 | 5123 | 0.4928 | 1.7191 | 15.2914 |
 | 535 | 0.4880 | 1.6235 | 15.5237 |
 
-## 표 4. 채택 모델 Ulsan seed별 성능 
+## 표 4. 이전 채택 모델(d_model=64 Transformer) Ulsan seed별 성능
 
 ### commithash: 7677ab3
 
 | Seed | MAE | RMSE | MAPE (%) |
 |---:|---:|---:|---:|
 | 245 | 0.3210(-2.322%) | 0.7311(+0.029%) | 15.1114(-5.170%) |
+
+## 표 4-1. 현재 채택 모델(d_model=16 Transformer) Ulsan seed 245
+
+기존 d_model=64와 나머지 설정이 같은 단일 seed 비교다. 다른 seed에서도 재현되는지는
+검증하지 않았다. 원자료: `output/experiments/var_d{64,16}_transformer_seed245.json`.
+
+| 설정 | MAE | RMSE | MAPE(+1) (%) |
+|---|---:|---:|---:|
+| d_model=64 Transformer | 0.320971 | 0.731112 | 15.111426 |
+| d_model=16 Transformer | 0.320882 | 0.724449 | 15.505391 |
 
 ## 표 5. merged 모델 Porto seed별 성능
 

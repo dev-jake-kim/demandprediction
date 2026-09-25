@@ -1,14 +1,15 @@
-# MergedDemandConfig 하이퍼파라미터 — ulsan 최적값.
+# MergedDemandConfig 하이퍼파라미터 — Ulsan 채택 설정.
 # height/width/time_step/retrieval_grid_path/retrieval_train_end/weather_mean/weather_std는
 # 데이터에서 파생되므로 train.py가 채운다.
 #
-# 파라미터 튜닝 스윕(baseline + d_model/num_fourier_bands/transformer_layers/transformer_heads/
-# history_hidden/periodic_hidden 각 1개 변종, seed=245) 결과: RMSE와 MAPE(+1)가 변종마다
-# 서로 반대로 움직여서(예: d_model128은 RMSE 개선·MAPE(+1) 악화, layers3는 그 반대) baseline보다
-# 두 지표 다 개선된 변종이 하나도 없었다. 그래서 이 baseline 값을 그대로 최적으로 채택한다.
-# (원자료: output/merged/runs/tune_ulsan_*_seed245.json)
+# 기존 d_model=64 튜닝 기록: output/merged/runs/tune_ulsan_*_seed245.json.
+# 같은 Ulsan 설정에서 d_model=16 Transformer로 바꾼 seed 245 비교는
+# RMSE 0.731112 -> 0.724449, MAE 0.320971 -> 0.320882로 개선되고
+# MAPE(+1) 15.111426 -> 15.505391로 악화했다. 단일 seed 결과다.
+# 원자료: output/experiments/var_d{64,16}_transformer_seed245.json.
 local_radius: 2
-d_model: 64
+d_model: 16
+local_encoder: transformer
 num_fourier_bands: 8
 transformer_layers: 2
 transformer_heads: 4
