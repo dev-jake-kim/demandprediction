@@ -1,99 +1,33 @@
-# Merged model code map
+# Merged 모델의 현재 실행 경로
 
-`MergedDemandModel` is one model and one training graph. The code is split by
-responsibility so that changes to one branch do not require edits to the
-dataset or training loop.
+`models/merged/modeling.py`가 local 창 인코더, 주기 인코더, 융합/예측 및
+손실을 구현한다. `dataset_frame/unified_demand_dataset.py`가 제공하는
+daily/weekly lag는 오래된 순서에서 가까운 순서로 정렬되어 있고, mask의 `True`는
+데이터 시작 이전이라 유효하지 않은 시점이다. Retrieval 관점은 현재 구현되지 않았다.
 
-이 문서는 원래 `merged_model/ARCHITECTURE.md`였다. 그 자기 완결형 패키지를 저장소 공용
-관례(HuggingFace `PreTrainedModel` + Hydra + `Trainer`)로 포팅하면서 경로만 갱신했다 —
-계산 그래프는 그대로다(`UnifiedDemandModel` → `MergedDemandModel`).
+## 주기 관점 실험 (`model.periodic_mode`)
 
-## Start here
+Ulsan 기본값은 `ma`, `d_model=16`, `local_encoder=transformer`다. 이전 local-only
+모델은 `model.periodic_mode=none`으로 실행하며 Porto 기본값도 기존 `none`이다.
 
-1. Read `docs/MODEL_PLAN.md` for the design contract and Mermaid diagrams.
-2. Read `models/merged/modeling.py` for the end-to-end tensor flow.
-3. Read the relevant file under `models/merged/modules/` for a branch-level change.
-4. Run `validate_merged.py` before starting an expensive training run.
+| mode | PeriodicViewEncoder의 daily/weekly 출력 | ViewFusion / PredictionHead |
+|---|---|---|
+| `none` | 호출하지 않음 | 기존 `PredictionHead(local)` |
+| `lstm` | 유효 lag만 시간순으로 압축하고 `log1p(수요) ⊕ 정규화 날씨/캘린더`를 별도 LSTM에 입력, 각각 `[B,N,D]` | `Linear(concat(local,daily,weekly)) → PredictionHead` |
+| `ma` | 유효한 raw 수요 lag의 산술평균, 각각 `[B,N]` | `Softplus(Linear(local) + sigmoid(g_daily[node])·daily + sigmoid(g_weekly[node])·weekly)`; 별도의 PredictionHead 없음 |
+| `ema` | 가장 가까운 lag의 가중치가 높은 지수평균. `α=2/(L+1)`, 유효 lag의 가중치만 재정규화 | `ma`와 같은 직접 예측 경로 |
 
-| Path | Responsibility | Typical changes |
-| --- | --- | --- |
-| `dataset_frame/unified_demand_dataset.py` | temporal-grid loading, split, lag tables, invalid masks, weather/calendar tables | time split, lag count, `lag_radius`, weather source |
-| `models/merged/modeling.py` | branch wiring, weather/calendar context assembly, raw-scale loss contract | tensor flow or output keys |
-| `models/merged/config.py` | `MergedDemandConfig` — 생성자 인자 전부와 9개 ablation 스위치 | 새 하이퍼파라미터 |
-| `models/merged/losses.py` | selectable objectives (`combined`, `mae`, `rmse_mape`); `combined`/`rmse_mape`은 공용 `models/losses.py`를 재사용 | the objective itself |
-| `models/merged/metrics.py` | RMSE/MAE/MAPE(+1)/MAPE(0제외) | 보고 지표 |
-| `models/merged/modules/embeddings.py` | scalar/Fourier token embedding | scalar feature encoding |
-| `models/merged/modules/history.py` | local crop, EDGE/CLS tokens, Transformer, history LSTM (context concatenated), 노드별 ΔW | another neural branch |
-| `models/merged/modules/periodic.py` | daily/weekly LSTM, invalid-lag compaction, context concatenation | periodic encoders |
-| `models/merged/modules/attention.py` | node-wise daily/weekly/neural attention | branch selection/fusion |
-| `models/merged/modules/retrieval.py` | raw causal cosine retrieval and cache | retrieval scope/top-k/chunking |
-| `models/merged/modules/fusion.py` | neural/retrieval output gate | final prediction fusion |
-| `train.py` | Hydra + `Trainer` 학습 진입점, early stopping, 결과 JSON | training schedule or CLI |
-| `test.py` | 체크포인트 단독 평가 | 평가 지표/스플릿 |
-| `validate_merged.py` | structural, gradient, mask, and causal checks | regression checks |
-| `configs/config_ulsan.yaml` / `configs/config_porto.yaml` | 학습 하이퍼파라미터(원본 `training:` 블록과 1:1) — 도시별 루트 config | 학습 스케줄, `--config-name` 선택 |
-| `configs/model/merged_ulsan.yaml` / `configs/model/merged_porto.yaml` | 모델 하이퍼파라미터 + ablation 스위치 기본값 — 도시별 최적값(`docs/MERGED_TUNING_RESULTS.md`) | dimensions, lags, retrieval policy, `weekday_dim`, `hour_dim` |
-| `run_ablation.sh` / `run_seeds.sh` | 큐/다중 시드 러너 (ablation 이름 → Hydra 오버라이드) | 실행 조합 |
+mask가 전부 무효인 샘플의 주기 출력은 정확히 0이며 융합 시에도 그 관점은 0으로
+취급한다. `none`에서는 새 파라미터가 생성되지 않아 기존 local-only 체크포인트와
+학습 초기화가 유지된다. MA/EMA에서는 노드별 게이트가 `[N]`의 학습 가능한
+스칼라 파라미터이며 0에서 초기화해 sigmoid 값 0.5로 출발한다. `zero_node_indices`
+사용 시 local에서 제외된 노드에 맞춰 주기 입력과 게이트도 같은 노드 축으로 자른다.
 
-## Directory layout
-
-```text
-dataset_frame/unified_demand_dataset.py   # temporal-grid Dataset
-models/merged/
-├── config.py               # MergedDemandConfig(PretrainedConfig)
-├── modeling.py             # MergedDemandModel(PreTrainedModel) — one graph
-├── losses.py               # combined | mae objectives
-├── metrics.py              # RMSE / MAE / MAPE(+1) / MAPE(0제외)
-└── modules/                # independently maintainable model blocks
-    ├── embeddings.py
-    ├── history.py
-    ├── periodic.py
-    ├── attention.py
-    ├── retrieval.py
-    ├── fusion.py
-    └── __init__.py
-configs/config_ulsan.yaml        # Hydra 루트 설정(학습 하이퍼파라미터) — ulsan, 기본값
-configs/config_porto.yaml        # Hydra 루트 설정 — porto, --config-name config_porto
-configs/model/merged_ulsan.yaml  # 모델 하이퍼파라미터 + ablation 스위치 — ulsan 최적값
-configs/model/merged_porto.yaml  # 모델 하이퍼파라미터 + ablation 스위치 — porto 최적값
-train.py                   # Hydra + Trainer 학습 진입점
-test.py                    # 체크포인트 단독 평가
-validate_merged.py         # fast pre-training checks
-run_ablation.sh            # ablation 큐 러너
-run_seeds.sh                # 다중 시드 러너
-```
-
-## Forward data flow
-
-```text
-context (per branch, 15 dims) = normalized weather (3) ⊕ weekday_emb (7) ⊕ hour_emb (5)
-
-raw history
-  ├─ LocalHistoryEncoder: crop → log1p/Fourier → Transformer → cls ⊕ context → LSTM(79) → h_neural
-  ├─ PeriodicLSTMEncoder: daily raw lags → log1p ⊕ context → LSTM(16) → h_daily
-  └─ PeriodicLSTMEncoder: weekly raw lags → log1p ⊕ context → LSTM(16) → h_weekly
-
-h_neural → query
-[h_daily, h_weekly, h_neural] → key/value candidates → branch attention → h_attn
-
-raw local crop + absolute sample_idx → CausalRetrieval → ir_out
-h_attn + ir_out → NeuralRetrievalGate → prediction → loss(labels)   # combined | mae | rmse_mape
-```
-
-The daily/weekly masks are applied twice: valid lags are compacted before the
-LSTM, and invalid branch tokens are excluded from attention. `h_neural` is
-always a valid candidate, so all-invalid periodic samples remain well-defined.
-
-Weather and calendar are node-independent, so the context is broadcast across
-nodes before concatenation. Weather is normalized with training-split statistics
-held as model buffers; it has no embedding layer. Invalid periodic lags carry
-zeroed context and are dropped by compaction, so the widened feature dimension
-must flow through the `gather` in `periodic.py` — `validate_merged.py` pins this with a
-reference-implementation comparison.
-
-The retrieval module uses raw values and only candidate times
-`[time_step, target_time)`. Its CPU cache is not part of the checkpoint; it is
-reconstructed from the temporal grid when a model is created.
+Ulsan 기본 실행은 `python train.py --config-name config_ulsan`이다. 이전
+local-only 및 다른 변종은 `model.periodic_mode=none|lstm|ema`로 선택한다.
+MA의 MAPE(+1)가 단일 seed 기준보다 0.5% 이상 개선돼 EMA도 시험했지만,
+EMA는 MA보다 RMSE와 MAPE(+1)이 모두 악화했다. 수치는
+[`ADFORMER_REFERENCE_RESULTS.md`](ADFORMER_REFERENCE_RESULTS.md)에 있다.
 
 ## 게이티드 노드별 LSTM weight offset + shared-weight FP8 (`node_adaptive`)
 
@@ -117,9 +51,9 @@ s: 학습 가능한 fp32 scalar, init 1.0
 function-level copy다. `s`와 ΔW는 single-stage 학습에서 일반 파라미터로 함께 갱신한다.
 
 `A`는 전체 노드가 아니라 **train 구간 평균 수요가
-`node_adaptive_min_demand`(기본 0.8)를 넘는 노드** 수다. 채택한 Ulsan 설정은
-168개 중 44개 노드(44/168)만 적응 경로를 사용한다. 선택 기준은 시간 리크를 막기 위해
-train 구간에서만 계산하며(`train.py: select_node_adaptive_indices`), 결과 노드 목록은
+`node_adaptive_min_demand`(기본 0.8)를 넘는 노드** 수다. 현재 Ulsan 0.70/0.15
+분할에서는 168개 중 45개 노드를 고른다. 선택 기준은 시간 리크를 막기 위해 train
+구간에서만 계산하며(`train.py: select_node_adaptive_indices`), 결과 노드 목록은
 `config.node_adaptive_indices`에 저장돼 `from_pretrained`가 같은 마스크를 복원한다.
 
 설계상 지켜야 할 것들:
@@ -150,10 +84,9 @@ non-contiguous RNN weight warning이 발생할 수 있다.
 
 ### 단일 stage 학습과 결과 JSON
 
-`node_adaptive=true`여도 `train.py`는 단일 stage만 학습하며 `combined` loss를 사용한다.
-예전처럼 stage를 나누거나 ΔW를 별도 stage에서 해제하지 않고, s와 ΔW를 일반 파라미터로
-동시에 학습한다. 채택한 Ulsan 결과와 재현 절차는
-[`MERGED_GATED_FP8_RESULTS.md`](MERGED_GATED_FP8_RESULTS.md)에 기록한다.
+`node_adaptive=true`여도 `train.py`는 단일 stage만 학습하며, 목적함수는
+`model.loss_type`(현재 Ulsan 기본값 `mae`)을 따른다. 과거 다른 분할/손실에서의 결과는
+[`MERGED_GATED_FP8_RESULTS.md`](MERGED_GATED_FP8_RESULTS.md)에 별도 기록돼 있다.
 
 결과 JSON은 현재 다음 node-adaptive 필드를 보존한다:
 
@@ -162,18 +95,13 @@ non-contiguous RNN weight warning이 발생할 수 있다.
 - `node_delta_params` — 실제 적응 노드의 ΔW 파라미터 수(s는 세지 않는다)
 - `shared_weight_fp8` — 공유 weight FP8 fake quantization 사용 여부
 
-stage별 결과를 나타내는 키는 더 이상 없다. 파일 이름은 `node_adaptive`가 켜진 런에
-계속 `_nodeadaptive` suffix를 붙인다.
+stage별 결과를 나타내는 키는 더 이상 없다. 자동 생성하는 결과 JSON 이름은
+기존 `none`의 이름을 유지하고, 다른 변종은 `_ma`/`_lstm`/`_ema`를 붙인 뒤
+`node_adaptive`가 켜지면 `_nodeadaptive`를 이어 붙인다.
 
-## Maintenance rules
+## 유지보수
 
-- Keep `MergedDemandModel.forward()` as the single public model contract. It
-  returns `{'loss', 'logits'}` — the slim dict the HF `Trainer` eval loop needs.
-  `forward_debug()` returns the full tensor dict (`neural_pred`, `ir_out`,
-  `lambda_weight`, `attention_weights`, ...) for validation scripts only.
-- Add branch-specific code under `models/merged/modules/`; do not put new
-  architecture into `train.py` or `dataset_frame/`.
-- Preserve output keys consumed by training and validation unless the contract
-  and documentation are updated together.
-- Run `python validate_merged.py --device cpu` after changes to data flow,
-  masks, shapes, or retrieval boundaries.
+- `MergedDemandModel.forward()`는 학습용 `{'loss', 'logits'}`만 돌려준다.
+  관점별 출력은 분석용 `forward_views()`에서 확인한다.
+- mask/시간순 압축, MA/EMA 평균, 게이트 미분 및 체크포인트 복원 계약은
+  `tests/test_periodic_variants.py`에서 검사한다.

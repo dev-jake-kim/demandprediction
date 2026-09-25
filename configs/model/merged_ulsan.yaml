@@ -10,6 +10,11 @@
 local_radius: 2
 d_model: 16
 local_encoder: transformer
+# MA 채택: 노드별 daily/weekly 평균 게이트 + local 선형항이 직접 예측한다.
+# seed 245에서 local-only 대비 RMSE 0.724449 -> 0.722502, MAPE(+1)
+# 15.505391 -> 15.311199로 개선, MAE 0.320882 -> 0.322443으로 악화.
+# 단일 seed 결과다. 이전 local-only 비교는 model.periodic_mode=none.
+periodic_mode: ma
 num_fourier_bands: 8
 transformer_layers: 2
 transformer_heads: 4

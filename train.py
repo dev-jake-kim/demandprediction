@@ -525,6 +525,7 @@ def main(cfg: DictConfig) -> None:
         'retrieval_scope': cfg.model.retrieval_scope,
         # 학습 목적함수. 'objective'는 기존 78건 JSON과의 스키마 호환을 위해 남긴 이름이다.
         'objective': cfg.model.loss_type,
+        'periodic_mode': cfg.model.get('periodic_mode', 'none'),
         'ablation': cfg.ablation,
         'ablation_mode': ABLATION_MODE,
         # 실제로 적용된 스위치. 라벨(cfg.ablation)이 아니라 이 값이 근거다.
@@ -568,15 +569,17 @@ def main(cfg: DictConfig) -> None:
 
     run_json = cfg.get('run_json')
     if run_json is None:
-        # node_adaptive 런은 파일 이름을 달리한다 — 안 그러면 같은 (city, loss, ablation, seed)의
-        # 기존 단일 stage 결과를 덮어써서 비교 기준 자체가 사라진다.
-        suffix = '_nodeadaptive' if node_adaptive else ''
+        # mode가 다르면 같은 (city, loss, ablation, seed)의 이전 결과를 덮어쓰지 않는다.
+        # none의 기존 파일명은 유지하고, 주기 변종에만 mode를 명시한다.
+        mode = cfg.model.get('periodic_mode', 'none')
+        mode_suffix = f'_{mode}' if mode != 'none' else ''
+        node_suffix = '_nodeadaptive' if node_adaptive else ''
         run_json = (
             Path('output')
             / cfg.project_name
             / 'runs'
-            / f'{cfg.dataset.city}_{cfg.model.loss_type}_{cfg.ablation}{suffix}'
-            f'_seed{cfg.train.seed}.json'
+            / f'{cfg.dataset.city}_{cfg.model.loss_type}_{cfg.ablation}'
+            f'{mode_suffix}{node_suffix}_seed{cfg.train.seed}.json'
         )
     run_json = Path(run_json).expanduser()
     if not run_json.is_absolute():

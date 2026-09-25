@@ -1,40 +1,10 @@
-"""재설계된 수요 예측 모델 — 골격.
+"""Local-view demand forecasting with optional daily/weekly periodic branches.
 
-**지금 학습 가능한 것은 local 관점 하나짜리 모델이다.** ``ContextEncoder``,
-:class:`LocalViewEncoder`, :class:`PredictionHead`, 그리고 ``MergedDemandModel.forward``가
-구현돼 있어 end-to-end로 돈다. 나머지 세 관점(:class:`PeriodicViewEncoder`,
-:class:`RetrievalViewEncoder`)과 :class:`ViewFusion`은 ``forward``가 ``pass``이고,
-파라미터가 하나도 없어서 모델에 매달려 있어도 학습에 영향을 주지 않는다. 비어 있는
-블록이 확정하는 것은 **정보의 흐름**, 즉 어떤 정보를 받아 어떤 shape로 내보내는지뿐이다.
-
-거시적 구조::
-
-    demand_history [B,k,H,W] ─┬─> LocalViewEncoder      ──> [B,N,D]  "내 주변에서 최근 k시간"
-                              │
-                              └─> RetrievalViewEncoder  ──> [B,N,D]  "과거의 비슷했던 n개 시점" (미구현)
-    daily_demand   [B,Ld,N,1] ──> PeriodicViewEncoder   ──> [B,N,D]  "며칠 전 같은 시간대"     (미구현)
-    weekly_demand  [B,Lw,N,1] ──> PeriodicViewEncoder   ──> [B,N,D]  "몇 주 전 같은 요일·시간대" (미구현)
-
-                              stack -> [B,N,4,D]
-                                         │
-                                    ViewFusion   -> [B,N,D]
-                                         │
-                                  PredictionHead -> [B,N] -> reshape -> [B,H,W]
-
-네 관점이 전부 **노드당 D차원 벡터 하나**라는 같은 규약으로 끝나는 것이 이 설계의 전부다.
-관점을 더하거나 빼는 일이 stack의 항목을 더하거나 빼는 일이 된다.
-
-축 이름 규약 (파일 전체에서 동일):
-
-===== ==========================================================================
-``B``  배치
-``k``  최근 히스토리 길이 (``config.time_step``, 기본 24시간)
-``H``  격자 세로, ``W`` 격자 가로, ``N = H*W`` 노드 수
-``Ld`` 일 주기 lag 개수, ``Lw`` 주 주기 lag 개수 (dataset이 정한다)
-``n``  검색해 오는 유사 시점 개수 (``config.num_retrieval``)
-``C``  보조 정보 차원 (``config.context_dim`` = 날씨 3 + 요일 + 시간대)
-``D``  노드 임베딩 차원 (``config.d_model``)
-===== ==========================================================================
+``periodic_mode='none'`` preserves the local-only model. ``lstm`` encodes valid
+daily/weekly lags as D-vectors, concatenates them with the local D-vector and
+uses the existing prediction head. ``ma``/``ema`` average raw lag demand and
+predict directly from node-gated averages plus a linear local contribution.
+The retrieval branch is not implemented or used in these experiments.
 """
 
 from __future__ import annotations
@@ -44,6 +14,7 @@ import math
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.nn.utils.rnn import pack_padded_sequence
 from transformers import PreTrainedModel
 
 from .config import MergedDemandConfig
@@ -53,8 +24,8 @@ from .losses import SCALAR_LOSS_TYPES, build_loss
 class ContextEncoder(nn.Module):
     """시점별 보조 정보(날씨 + 캘린더)를 한 벡터로 묶는다.
 
-    네 관점이 전부 이걸 공유한다. 관점마다 시점 축의 의미가 다를 뿐(최근 k시간 / 일 주기 lag /
-    주 주기 lag) 묶는 방식은 같아서, 여기 한 곳에서만 정의한다.
+    local 및 LSTM 주기 관점이 같은 날씨/캘린더 임베딩을 쓴다.
+    MA/EMA 주기 관점은 원 수요만 평균내므로 이 context를 쓰지 않는다.
 
     날씨는 임베딩하지 않고 train 구간 기준 min-max로 정규화한 값을 그대로 쓴다. 두 채널
     모두 train 구간에서 [0, 1]에 들어가고, val/test가 그 범위를 넘으면 1을 넘을 수 있다
@@ -582,31 +553,61 @@ class LocalViewEncoder(nn.Module):
 
 
 class PeriodicViewEncoder(nn.Module):
-    """관점 2·3 — 주기. "같은 시간대의 과거 값들이 어떻게 움직였나."
-
-    daily(하루 주기)와 weekly(일주일 주기)가 이 클래스의 서로 다른 인스턴스다. 둘의 차이는
-    dataset이 뽑아 주는 lag 집합뿐이라 코드를 나누지 않는다.
-
-    이 관점은 노드별로 독립이다 — 이웃 노드를 보지 않는다.
-    """
+    """유효한 과거 일/주 lag를 D벡터(LSTM) 또는 원 수요 평균(MA/EMA)으로 접는다."""
 
     def __init__(self, config: MergedDemandConfig) -> None:
         super().__init__()
+        self.mode = config.periodic_mode
+        if self.mode == 'lstm':
+            self.lstm = nn.LSTM(1 + config.context_dim, config.d_model, batch_first=True)
 
-    def forward(self, lag_demand: Tensor, lag_mask: Tensor, context: Tensor) -> Tensor:
-        """
-        Args:
-            lag_demand: ``[B, L, N, 1]`` 각 lag 시점의 노드별 수요(raw 스케일).
-                ``L``은 daily면 ``Ld``, weekly면 ``Lw``.
-            lag_mask: ``[B, L]`` bool. **True가 무효**(그 lag이 데이터 시작 이전이라 없음).
-                무효 시점은 ``lag_demand``에도 0이 채워져 있다.
-            context: ``[B, L, C]`` 각 lag 시점의 보조 정보.
+    def forward(self, lag_demand: Tensor, lag_mask: Tensor, context: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        """[B,L,N,1], 무효=True인 [B,L] -> ([B,N,D] 또는 [B,N], 유효=[B])."""
+        if lag_demand.ndim != 4 or lag_demand.shape[-1] != 1:
+            raise ValueError(f'lag_demand는 [B,L,N,1]이어야 함: {tuple(lag_demand.shape)}')
+        batch, length, nodes, _ = lag_demand.shape
+        if lag_mask.shape != (batch, length):
+            raise ValueError(f'lag_mask는 [B,L]이어야 함: {tuple(lag_mask.shape)}')
+        valid = ~lag_mask.bool()
+        lengths = valid.sum(dim=1)
+        if self.mode in ('ma', 'ema'):
+            weights = valid.to(lag_demand.dtype)
+            if self.mode == 'ema':
+                # 가장 가까운 lag가 마지막이다. 유효 lag만 다시 정규화해 상수 수요를 보존한다.
+                alpha = 2.0 / (length + 1)
+                age = torch.arange(length - 1, -1, -1, device=lag_demand.device)
+                weights = weights * (1.0 - alpha) ** age
+            average = torch.einsum('bln,bl->bn', lag_demand.squeeze(-1), weights)
+            average = average / weights.sum(dim=1).clamp_min(1e-12).unsqueeze(-1)
+            return average, lengths > 0
 
-        Returns:
-            ``[B, N, D]`` 노드별 주기 관점 임베딩.
-        """
-
-        pass
+        if self.mode != 'lstm':
+            raise ValueError(f'구현되지 않은 periodic_mode: {self.mode}')
+        if context is None or context.shape != (batch, length, self.lstm.input_size - 1):
+            raise ValueError(f'context는 [B,L,{self.lstm.input_size - 1}]이어야 함')
+        sequence = torch.log1p(torch.clamp_min(lag_demand, 0))
+        sequence = torch.cat(
+            [sequence, context[:, :, None, :].expand(-1, -1, nodes, -1)], dim=-1
+        )
+        # 원본 lag 순서를 보존하며 무효 시점을 뒤로 보낸다. 패킹에 앞서 노드마다 펼친다.
+        order = valid.long().argsort(dim=1, descending=True, stable=True)
+        sequence = sequence.gather(
+            1, order[:, :, None, None].expand(-1, -1, nodes, sequence.shape[-1])
+        )
+        sequence = sequence.permute(0, 2, 1, 3).reshape(batch * nodes, length, -1)
+        row_lengths = lengths.repeat_interleave(nodes)
+        active = (row_lengths > 0).nonzero(as_tuple=True)[0]
+        output = sequence.new_zeros(batch * nodes, self.lstm.hidden_size)
+        if active.numel():
+            packed = pack_padded_sequence(
+                sequence.index_select(0, active),
+                row_lengths.index_select(0, active).cpu(),
+                batch_first=True,
+                enforce_sorted=False,
+            )
+            _, (hidden, _) = self.lstm(packed)
+            output = output.index_copy(0, active, hidden[-1])
+        return output.reshape(batch, nodes, -1), lengths > 0
 
 
 class RetrievalViewEncoder(nn.Module):
@@ -659,27 +660,36 @@ class RetrievalViewEncoder(nn.Module):
 
 
 class ViewFusion(nn.Module):
-    """네 관점을 노드별로 하나의 벡터로 합친다.
-
-    합치는 방식(가중 평균 / 어텐션 / concat+MLP)은 아직 정하지 않았다. 확정된 것은
-    입출력 규약뿐이라, 관점 수 ``V``가 바뀌어도 이 블록의 시그니처는 그대로다.
-    """
+    """LSTM: concatenate three D-vectors; MA/EMA: directly predict demand."""
 
     def __init__(self, config: MergedDemandConfig, num_views: int) -> None:
         super().__init__()
-        self.num_views = num_views
+        self.mode = config.periodic_mode
+        if self.mode == 'lstm':
+            self.projection = nn.Linear(num_views * config.d_model, config.d_model)
+        elif self.mode in ('ma', 'ema'):
+            self.local_projection = nn.Linear(config.d_model, 1)
+            # 각각 [N] 노드별 스칼라 게이트; sigmoid(0)=0.5로 시작한다.
+            self.daily_gate = nn.Parameter(torch.zeros(config.num_nodes))
+            self.weekly_gate = nn.Parameter(torch.zeros(config.num_nodes))
 
-    def forward(self, views: Tensor) -> Tensor:
-        """
-        Args:
-            views: ``[B, N, V, D]`` 관점별 노드 임베딩.
-                V=4, 순서는 (local, daily, weekly, retrieval).
-
-        Returns:
-            ``[B, N, D]`` 융합된 노드 임베딩.
-        """
-
-        pass
+    def forward(
+        self, local: Tensor, daily: Tensor, weekly: Tensor,
+        daily_valid: Tensor, weekly_valid: Tensor, node_index: Tensor | None = None,
+    ) -> Tensor:
+        if self.mode == 'lstm':
+            daily = daily * daily_valid[:, None, None]
+            weekly = weekly * weekly_valid[:, None, None]
+            return self.projection(torch.cat([local, daily, weekly], dim=-1))
+        daily = daily * daily_valid[:, None]
+        weekly = weekly * weekly_valid[:, None]
+        daily_gate = self.daily_gate if node_index is None else self.daily_gate.index_select(0, node_index)
+        weekly_gate = self.weekly_gate if node_index is None else self.weekly_gate.index_select(0, node_index)
+        return F.softplus(
+            self.local_projection(local).squeeze(-1)
+            + daily_gate.sigmoid().unsqueeze(0) * daily
+            + weekly_gate.sigmoid().unsqueeze(0) * weekly
+        )
 
 
 class PredictionHead(nn.Module):
@@ -712,14 +722,13 @@ class PredictionHead(nn.Module):
 
 
 class MergedDemandModel(PreTrainedModel):
-    """네 관점(local / daily / weekly / retrieval)을 융합하는 수요 예측 모델."""
+    """Local demand predictor with optional daily/weekly periodic branches."""
 
     config_class = MergedDemandConfig
     base_model_prefix = 'merged_demand'
     main_input_name = 'demand_history'
 
-    # 융합에 들어가는 순서. ViewFusion의 V 축 의미를 여기 한 곳에서만 정의한다.
-    VIEW_NAMES = ('local', 'daily', 'weekly', 'retrieval')
+    VIEW_NAMES = ('local', 'daily', 'weekly')
 
     def __init__(self, config: MergedDemandConfig) -> None:
         super().__init__(config)
@@ -744,12 +753,15 @@ class MergedDemandModel(PreTrainedModel):
 
         self.context_encoder = ContextEncoder(config)
         self.local_view = LocalViewEncoder(config)
-        # daily/weekly는 같은 클래스의 별개 인스턴스 — 파라미터를 공유하지 않는다.
-        self.daily_view = PeriodicViewEncoder(config)
-        self.weekly_view = PeriodicViewEncoder(config)
+        self.periodic_mode = config.periodic_mode
+        # 기존 local-only의 파라미터·초기화 순서를 보존한다.
+        if self.periodic_mode != 'none':
+            self.daily_view = PeriodicViewEncoder(config)
+            self.weekly_view = PeriodicViewEncoder(config)
         self.retrieval_view = RetrievalViewEncoder(config)
         self.fusion = ViewFusion(config, num_views=len(self.VIEW_NAMES))
-        self.head = PredictionHead(config)
+        if self.periodic_mode not in ('ma', 'ema'):
+            self.head = PredictionHead(config)
 
         self.loss_fn: nn.Module
         self.configure_loss(config.loss_type)
@@ -848,30 +860,28 @@ class MergedDemandModel(PreTrainedModel):
             ``Trainer``는 ``loss``를 제외한 모든 키를 배치마다 gather하므로 디버그 텐서를
             여기 넣으면 안 된다 — 필요하면 :meth:`forward_views`를 쓴다.
 
-        **지금은 local 관점만 쓴다.** daily/weekly/retrieval 인자를 받기는 하지만 아직
-        읽지 않는다 — 그 세 인코더가 비어 있어서다. 인자 목록을 미리 맞춰 두면 관점을
-        채워 넣을 때 dataset/train.py 쪽을 건드릴 일이 없다.
+        periodic_mode='none'이면 기존 local-only 경로다. 'lstm'은 daily/weekly D벡터를
+        local과 융합하고, 'ma'/'ema'는 노드별 원 수요 평균을 직접 예측에 더한다.
+        retrieval 입력은 아직 사용하지 않는다.
         """
 
         views = self._encode_views(
             demand_history=demand_history,
+            daily_demand=daily_demand,
+            daily_mask=daily_mask,
+            weekly_demand=weekly_demand,
+            weekly_mask=weekly_mask,
             weather=weather,
             hour_of_day=hour_of_day,
             day_of_week=day_of_week,
+            daily_weather=daily_weather,
+            daily_hour=daily_hour,
+            daily_day_of_week=daily_day_of_week,
+            weekly_weather=weekly_weather,
+            weekly_hour=weekly_hour,
+            weekly_day_of_week=weekly_day_of_week,
         )
-        # [B, N_active] — 학습에서 뺀 노드가 있으면 그만큼 짧다.
-        predictions = self.head(views['fused'])
-        active = self.local_view.active_node_index(predictions.device)
-        if active is None:
-            logits = predictions.reshape(-1, self.height, self.width)
-        else:
-            # 뺀 노드 자리는 **정확히** 0이다. Softplus는 0에 점근할 뿐 0이 될 수 없으므로
-            # 계산해서 버리는 대신 아예 자리만 0으로 채운다. autograd가 두 경로의 gradient를
-            # 받아야 하므로 in-place 대입이 아니라 out-of-place index_copy를 쓴다.
-            full = predictions.new_zeros(len(predictions), self.height * self.width)
-            logits = full.index_copy(1, active, predictions).reshape(
-                -1, self.height, self.width
-            )
+        logits = self._predict_grid(views)
         keep = self.node_keep_mask(logits.device)
 
         output: dict[str, Tensor] = {'logits': logits}
@@ -897,38 +907,82 @@ class MergedDemandModel(PreTrainedModel):
                     output['loss'] = (elementwise * keep).sum() / (keep.sum() * len(elementwise))
         return output
 
+    def _predict_grid(self, views: dict[str, Tensor]) -> Tensor:
+        predictions = (
+            views['prediction'] if self.periodic_mode in ('ma', 'ema')
+            else self.head(views['fused'])
+        )
+        active = self.local_view.active_node_index(predictions.device)
+        if active is None:
+            return predictions.reshape(-1, self.height, self.width)
+        # 제외 노드는 Softplus 결과 대신 정확히 0으로 남긴다.
+        full = predictions.new_zeros(len(predictions), self.height * self.width)
+        return full.index_copy(1, active, predictions).reshape(-1, self.height, self.width)
+
     def _encode_views(
         self,
         *,
         demand_history: Tensor,
+        daily_demand: Tensor,
+        daily_mask: Tensor,
+        weekly_demand: Tensor,
+        weekly_mask: Tensor,
         weather: Tensor,
         hour_of_day: Tensor,
         day_of_week: Tensor,
+        daily_weather: Tensor,
+        daily_hour: Tensor,
+        daily_day_of_week: Tensor,
+        weekly_weather: Tensor,
+        weekly_hour: Tensor,
+        weekly_day_of_week: Tensor,
     ) -> dict[str, Tensor]:
-        """관점별 임베딩과 융합 결과. ``forward``와 ``forward_views``가 공유한다.
+        context = self.context_encoder(weather, hour_of_day, day_of_week)
+        local = self.local_view(demand_history, context)
+        if self.periodic_mode == 'none':
+            return {'local': local, 'fused': local}
 
-        관점이 하나뿐인 동안은 융합할 것이 없어 ``fused``가 ``local``과 같은 텐서다.
-        """
-
-        context = self.context_encoder(weather, hour_of_day, day_of_week)  # [B,k,C]
-        local = self.local_view(demand_history, context)  # [B,N,D]
-        return {'local': local, 'fused': local}
+        active = self.local_view.active_node_index(local.device)
+        if active is not None:
+            daily_demand = daily_demand.index_select(2, active)
+            weekly_demand = weekly_demand.index_select(2, active)
+        daily_context = weekly_context = None
+        if self.periodic_mode == 'lstm':
+            daily_context = self.context_encoder(daily_weather, daily_hour, daily_day_of_week)
+            weekly_context = self.context_encoder(weekly_weather, weekly_hour, weekly_day_of_week)
+        daily, daily_valid = self.daily_view(daily_demand, daily_mask, daily_context)
+        weekly, weekly_valid = self.weekly_view(weekly_demand, weekly_mask, weekly_context)
+        if not getattr(self.config, 'use_daily', True):
+            daily_valid = torch.zeros_like(daily_valid)
+        if not getattr(self.config, 'use_weekly', True):
+            weekly_valid = torch.zeros_like(weekly_valid)
+        combined = self.fusion(local, daily, weekly, daily_valid, weekly_valid, active)
+        views = {'local': local, 'daily': daily, 'weekly': weekly}
+        if self.periodic_mode == 'lstm':
+            views['fused'] = combined
+        else:
+            views['prediction'] = combined
+        return views
 
     def forward_views(self, **batch) -> dict[str, Tensor]:
-        """관점별 임베딩을 그대로 돌려준다(분석/디버깅용, 학습 경로에서 쓰지 않는다).
-
-        Returns:
-            ``{'local': [B, N, D], 'fused': [B, N, D], 'logits': [B, H, W]}``.
-            관점이 채워지면 ``'daily'``/``'weekly'``/``'retrieval'``이 함께 나온다.
-        """
-
+        """분석용 관점별 출력. 학습 경로에서는 추가 텐서를 반환하지 않는다."""
         views = self._encode_views(
             demand_history=batch['demand_history'],
+            daily_demand=batch['daily_demand'],
+            daily_mask=batch['daily_mask'],
+            weekly_demand=batch['weekly_demand'],
+            weekly_mask=batch['weekly_mask'],
             weather=batch['weather'],
             hour_of_day=batch['hour_of_day'],
             day_of_week=batch['day_of_week'],
+            daily_weather=batch['daily_weather'],
+            daily_hour=batch['daily_hour'],
+            daily_day_of_week=batch['daily_day_of_week'],
+            weekly_weather=batch['weekly_weather'],
+            weekly_hour=batch['weekly_hour'],
+            weekly_day_of_week=batch['weekly_day_of_week'],
         )
-        views['logits'] = self.head(views['fused']).reshape(-1, self.height, self.width)
+        views['logits'] = self._predict_grid(views)
         return views
 
 

@@ -31,8 +31,8 @@ class MergedDemandConfig(PretrainedConfig):
         retrieval_grid_path: str | None = None,
         retrieval_train_end: int | None = None,
         # --- 모델 폭 ---
-        # 네 관점(local/daily/weekly/retrieval)이 전부 노드당 d_model 벡터 하나로 수렴한다.
-        # 관점마다 폭을 따로 두지 않는 것이 이번 재설계의 핵심 단순화다.
+        # local 및 LSTM 주기 관점은 노드당 같은 d_model 폭을 쓴다.
+        # MA/EMA 주기 관점은 원 수요 스칼라를 직접 융합한다.
         d_model: int = 64,
         dropout: float = 0.1,
         # ①어텐션 가중치 dropout만 따로 뗀 값. nn.TransformerEncoderLayer는 dropout 하나를
@@ -56,6 +56,9 @@ class MergedDemandConfig(PretrainedConfig):
         transformer_layers: int = 2,
         transformer_heads: int = 4,
         transformer_ffn: int = 128,
+        # 'none' = 기존 local-only, 'lstm' = 주기 D벡터 융합,
+        # 'ma'/'ema' = 원 수요의 주기 평균을 노드 게이트로 직접 예측.
+        periodic_mode: str = 'none',
         # --- retrieval 관점 ---
         # 최근 k시간 패턴과 비슷한 과거 시점을 몇 개 가져올지.
         num_retrieval: int = 20,
@@ -119,6 +122,9 @@ class MergedDemandConfig(PretrainedConfig):
         self.transformer_layers = transformer_layers
         self.transformer_heads = transformer_heads
         self.transformer_ffn = transformer_ffn
+        if periodic_mode not in ('none', 'lstm', 'ma', 'ema'):
+            raise ValueError("periodic_mode는 'none' | 'lstm' | 'ma' | 'ema'여야 함")
+        self.periodic_mode = periodic_mode
         self.num_retrieval = num_retrieval
         self.retrieval_scope = retrieval_scope
         self.retrieval_chunk_size = retrieval_chunk_size

@@ -88,7 +88,7 @@ callbacks:
 ablation: full
 # smoke 테스트용: 각 split의 앞 N개 샘플만 쓴다(원본 --max-batches에 대응). null이면 전체.
 limit_samples: null
-# null이면 output/${project_name}/runs/<city>_<loss_type>_<ablation>_seed<seed>.json 에 쓴다.
+# null이면 output/${project_name}/runs/<city>_<loss>_<ablation>[_<periodic_mode>][_nodeadaptive]_seed<seed>.json.
 run_json: null
 
 hydra:
