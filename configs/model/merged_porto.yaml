@@ -9,6 +9,9 @@
 # 썼다. 근거가 사라진 128 대신 그 값으로 되돌린다 — porto 튜닝 스윕은 재실행이 필요하다.
 local_radius: 2
 d_model: 64
+# 245/6835/851 paired 비교에서 local MA가 이전 독립 sigmoid MA보다
+# MAE/RMSE/MAPE(+1)/MAPE(0 제외) 모두 3/3 개선해 채택했다.
+periodic_mode: ma
 num_fourier_bands: 8
 transformer_layers: 2
 transformer_heads: 4
@@ -22,28 +25,29 @@ dropout: 0.10
 # 격자의 74%가 0이라 정보를 가진 이웃이 몇 개 없어서 그 교란이 상대적으로 크므로 기본은 0이다.
 # 0이 아니면 PyTorch SDPA의 batch<=65535 제한이 살아나 train.py가 배치를 깎는다.
 attention_dropout: 0.0
-# --- retrieval 관점 ---
-# 질의(그 노드의 최근 k시간 수요)와 코사인 유사도가 가장 높은 과거 윈도우 top-k.
+# --- retrieval 설정 (현재 예측 경로에서는 미사용) ---
+# 검색 관점은 아직 구현되지 않아 num_retrieval/use_retrieval을 꺼도 ablation이 아니다.
 num_retrieval: 20
 # 검색 후보 범위. observed_past = tau < target_time(원본 기본값), train_prefix = train split까지만.
 retrieval_scope: observed_past
 # 후보를 몇 시점씩 끊어서 훑을지. 값이 클수록 한 번에 만드는 후보 텐서가 커진다.
 retrieval_chunk_size: 256
-# 요일/시간대 임베딩 차원. 날씨는 임베딩하지 않고 정규화한 3값을 그대로 concat하므로,
-# 세 LSTM에 붙는 보조 텐서는 3 + weekday_dim + hour_dim = 15차원이 된다.
+# 캘린더 임베딩 차원. 날씨는 2채널(기온, 강수+적설)을 min-max 정규화해
+# temporal LSTM 입력에 이어 붙인다.
 weekday_dim: 7
 hour_dim: 5
 
-# --- ablation 스위치 (기본값 = full, 아무것도 끄지 않은 모델) ---
-# ablation은 "0-치환" 방식이다 — 모듈을 없애지 않고 항상 생성·실행한 뒤 결과 텐서만 0으로
-# 바꾼다. 예외는 use_branch_attention으로, 어텐션은 출력이 아니라 선택 메커니즘이라
-# 0-치환이 성립하지 않아 균등 가중으로 대체한다.
-# CLI 오버라이드 예: python train.py --config-name config_porto model.use_retrieval=false
+# --- 모델 입력 ablation 스위치 (기본값 = full) ---
+# false는 해당 경로를 비활성화한다. use_softplus만 출력 활성을 제거한다.
+# local view는 공간+시간 인코더, local mean은 원 수요의 자기노드 평균
+# (periodic_mode=ma일 때만 사용)이다. retrieval / branch_attention /
+# weather_injection은 현재 예측 경로에 없으므로 끄지 않는다.
+use_local_view: true
+use_local_mean: true
 use_daily: true
 use_weekly: true
 use_retrieval: true
 use_weather: true
-# 'concat'(기본, 정규화 3값을 세 LSTM 입력에 붙임) | 'cls_add'(ir-weather 방식, CLS에 더함)
 weather_injection: concat
 use_calendar: true
 use_branch_attention: true

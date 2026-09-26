@@ -27,6 +27,7 @@ data:
   daily_lags: 6
   weekly_period: 168
   weekly_lags: 4
+  # periodic_window_weights 실험은 data.lag_radius=2로 override한다.
   lag_radius: 0
 
 train:
@@ -88,7 +89,7 @@ callbacks:
 ablation: full
 # smoke 테스트용: 각 split의 앞 N개 샘플만 쓴다(원본 --max-batches에 대응). null이면 전체.
 limit_samples: null
-# null이면 output/${project_name}/runs/<city>_<loss>_<ablation>[_<periodic_mode>][_nodeadaptive]_seed<seed>.json.
+# null이면 output/${project_name}/runs/<city>_<loss>_<ablation>[_<periodic_mode>][_localmix][_nodeadaptive]_seed<seed>.json.
 run_json: null
 
 hydra:

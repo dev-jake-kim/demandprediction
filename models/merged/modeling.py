@@ -2,8 +2,10 @@
 
 ``periodic_mode='none'`` preserves the local-only model. ``lstm`` encodes valid
 daily/weekly lags as D-vectors, concatenates them with the local D-vector and
-uses the existing prediction head. ``ma``/``ema`` average raw lag demand and
-predict directly from node-gated averages plus a linear local contribution.
+uses the existing prediction head. ``ma`` averages the raw center-node history
+alongside daily/weekly demand with a learned convex node-wise mixture; ``ema``
+averages periodic demand with independent node gates. ``lag_lstm`` replaces the
+periodic mean with an input-1 hidden-4 LSTM and scalar projection.
 The retrieval branch is not implemented or used in these experiments.
 """
 
@@ -78,6 +80,8 @@ class ContextEncoder(nn.Module):
         # 관점에서나 요일 3이다.
         self.weekday_embedding = nn.Embedding(7, config.weekday_dim)
         self.hour_embedding = nn.Embedding(24, config.hour_dim)
+        self.use_weather = getattr(config, 'use_weather', True)
+        self.use_calendar = getattr(config, 'use_calendar', True)
 
     def forward(self, weather: Tensor, hour_of_day: Tensor, day_of_week: Tensor) -> Tensor:
         """
@@ -90,25 +94,23 @@ class ContextEncoder(nn.Module):
             ``[B, L, C]`` 시점별 보조 정보.
         """
 
-        temperature, rainfall, snowfall = weather.unbind(dim=-1)
+        if self.use_weather:
+            temperature, rainfall, snowfall = weather.unbind(dim=-1)
+            # Train-only extrema; disabling weather removes the entire two-channel signal.
+            temperature_norm = (temperature - self.temperature_min) / self.temperature_range
+            precipitation = rainfall + self.snow_scale * snowfall
+            precipitation_norm = precipitation / self.precipitation_max
+            weather_features = torch.stack([temperature_norm, precipitation_norm], dim=-1)
+        else:
+            weather_features = weather.new_zeros(*weather.shape[:-1], 2)
 
-        # 정규화를 여기 한 곳에서만 한다 — 날것의 기온(수십 단위)이 log1p 수요를 압도하는
-        # 일이 없어야 한다.
-        temperature_norm = (temperature - self.temperature_min) / self.temperature_range
-
-        # 강수는 최소값이 0이라 (x - min)/(max - min)이 x/max로 줄어든다. 덕분에 "비도 눈도
-        # 안 왔다"가 정확히 0이 된다 — 정보 없음과 같은 값이다.
-        precipitation = rainfall + self.snow_scale * snowfall
-        precipitation_norm = precipitation / self.precipitation_max
-
-        return torch.cat(
-            [
-                torch.stack([temperature_norm, precipitation_norm], dim=-1),
-                self.weekday_embedding(day_of_week),
-                self.hour_embedding(hour_of_day),
-            ],
-            dim=-1,
-        )
+        if self.use_calendar:
+            weekday_features = self.weekday_embedding(day_of_week)
+            hour_features = self.hour_embedding(hour_of_day)
+        else:
+            weekday_features = weather.new_zeros(*weather.shape[:-1], self.weekday_embedding.embedding_dim)
+            hour_features = weather.new_zeros(*weather.shape[:-1], self.hour_embedding.embedding_dim)
+        return torch.cat([weather_features, weekday_features, hour_features], dim=-1)
 
 
 def crop_local_windows(demands: Tensor, radius: int) -> Tensor:
@@ -210,17 +212,18 @@ class LocalViewEncoder(nn.Module):
 
     유일하게 이웃 노드의 수요를 보는 관점이다. 나머지 세 관점은 노드별로 독립이다.
 
-    두 단계로 접는다::
+    시간축에 평활화를 켜면 노드별 공유 valid c탭 가중합을 crop 전에 적용해
+    ``k'=k-c+1``로 줄인다. 끄면 ``k'=k``. 이후 두 단계로 접는다::
 
-        [B,k,H,W] --crop-->  [B,k,N,P]      노드별 창
-                  --embed--> [B,k,N,1+P,D]  창 안의 각 칸이 토큰 하나, 맨 앞은 CLS
-                  --transformer + CLS -->   [B,k,N,D]   (공간 축을 접음)
-                  --LSTM -->                [B,N,D]     (시간 축을 접음)
+        [B,k,H,W] --valid smoothing--> [B,k',H,W]
+                  --crop--> [B,k',N,P]       노드별 창
+                  --embed--> [B,k',N,1+P,D] 창 안의 각 칸이 토큰 하나, 맨 앞은 CLS
+                  --transformer + CLS --> [B,k',N,D] (공간 축을 접음)
+                  --LSTM --> [B,N,D]        (시간 축을 접음)
 
     Transformer는 **창 하나**를 본다 — (배치, 시점, 노드)를 전부 batch 축으로 접으므로
-    ``B*k*N``개의 길이 ``1+P`` 시퀀스가 한 번에 들어간다. ulsan(B=8,k=24,N=168) 기준
-    32,256개다. 창 안의 공간 배치는 attention이 직접 알 수 없고 ``position_embedding``이
-    학습으로 담는다.
+    ``B*k'*N``개의 길이 ``1+P`` 시퀀스가 한 번에 들어간다. 창 안의 공간 배치는
+    attention이 직접 알 수 없고 ``position_embedding``이 학습으로 담는다.
 
     ``config.zero_node_indices``로 학습에서 뺀 노드가 있으면 **crop 직후 잘라낸다**. 이후
     모든 단계(토큰 임베딩/Transformer/LSTM)가 노드별로 독립이라 남은 노드의 결과는 전부
@@ -245,6 +248,7 @@ class LocalViewEncoder(nn.Module):
         self.local_radius = config.local_radius
         self.num_nodes = config.num_nodes
         self.num_neighbors = config.num_neighbors
+        self.use_neighbors = getattr(config, 'use_neighbors', True)
 
         # 결과를 내야 하는 노드 id. None이면 전부. 학습에서 뺀 노드를 crop 직후 잘라내는 데 쓴다.
         # 텐서가 아니라 파이썬 리스트로 들고 있는다 — from_pretrained가 meta device에서
@@ -266,6 +270,12 @@ class LocalViewEncoder(nn.Module):
             persistent=True,
         )
         self.scalar_embedding = FourierScalarEmbedding(d_model, config.num_fourier_bands)
+        # 양수·합 1 제약으로 학습 중에도 평균 역할을 유지한다. 설정이 없으면 기존
+        # 모델의 state_dict와 연산을 그대로 보존한다.
+        self.history_logits = (
+            nn.Parameter(torch.tensor([math.log(value) for value in config.history_weights]))
+            if config.history_weights is not None else None
+        )
         # 0 = CLS(요약을 모으는 자리), 1 = EDGE(격자 밖 = 값이 없음).
         self.special_embedding = nn.Embedding(2, d_model)
         # "몇 번 노드의 요약인지"를 창에 새겨 넣는다. transformer 경로는 CLS 토큰에,
@@ -488,7 +498,20 @@ class LocalViewEncoder(nn.Module):
             ``[B, N_active, D]`` 노드별 공간 관점 임베딩. 학습에서 뺀 노드가 없으면
             ``N_active == N``이고, 있으면 남은 노드만 ``active_node_ids`` 순서로 돌려준다.
         """
-
+        if self.history_logits is not None:
+            batch, steps, height, width = demand_history.shape
+            kernel_size = self.history_logits.numel()
+            if steps < kernel_size:
+                raise ValueError(f'history 길이 {steps}가 kernel 길이 {kernel_size}보다 짧음')
+            # conv1d는 cross-correlation: 오래된 값부터 최신 값까지 [w1,...,wc].
+            # 격자마다 동일한 kernel을 쓰고 패딩 없이 k-c+1 시점으로 줄인다.
+            series = demand_history.permute(0, 2, 3, 1).reshape(-1, 1, steps)
+            kernel = F.softmax(self.history_logits, dim=0).view(1, 1, kernel_size)
+            demand_history = F.conv1d(series, kernel).reshape(
+                batch, height, width, steps - kernel_size + 1
+            ).permute(0, 3, 1, 2)
+            # 각 합성 시점의 마지막 수요 시점에 해당하는 원래 context를 사용한다.
+            context = context[:, kernel_size - 1:]
         local_crop = crop_local_windows(demand_history, self.local_radius)
         # 여기서 자른다 — crop이 끝난 뒤라 뺀 노드도 남은 노드의 창 안에는 그대로 들어 있다.
         active = self.active_node_index(local_crop.device)
@@ -496,6 +519,12 @@ class LocalViewEncoder(nn.Module):
         if active is not None:
             local_crop = local_crop.index_select(2, active)
             neighbor_valid = neighbor_valid.index_select(0, active)
+        if not self.use_neighbors:
+            # Zero only other nodes' demand; the center and the spatial layout stay intact.
+            center = local_crop.shape[-1] // 2
+            local_crop = local_crop.clone()
+            local_crop[..., :center] = 0
+            local_crop[..., center + 1:] = 0
         batch, steps, nodes, neighbors = local_crop.shape
 
         # 수요는 꼬리가 긴 분포라 log1p로 압축한 뒤 토큰으로 만든다.
@@ -553,13 +582,28 @@ class LocalViewEncoder(nn.Module):
 
 
 class PeriodicViewEncoder(nn.Module):
-    """유효한 과거 일/주 lag를 D벡터(LSTM) 또는 원 수요 평균(MA/EMA)으로 접는다."""
+    """일/주 lag를 LSTM D벡터, MA/EMA 평균 또는 LSTM 스칼라로 접는다."""
 
     def __init__(self, config: MergedDemandConfig) -> None:
         super().__init__()
         self.mode = config.periodic_mode
+        if config.periodic_window_weights is not None:
+            # 두 encoder(daily/weekly)가 각자 학습한다. RNG를 보존해 다른 모듈의
+            # 같은 seed 초기화는 비평활화 기준선과 같게 유지한다.
+            with torch.random.fork_rng(devices=[]):
+                self.window_projection = nn.Linear(5, 1, bias=False)
+            with torch.no_grad():
+                self.window_projection.weight.copy_(
+                    torch.tensor(config.periodic_window_weights).unsqueeze(0)
+                )
+        else:
+            self.window_projection = None
         if self.mode == 'lstm':
             self.lstm = nn.LSTM(1 + config.context_dim, config.d_model, batch_first=True)
+        elif self.mode == 'lag_lstm':
+            # 각 관점별 5시간 창 결합 이후, lag 간 MA를 별도 소형 LSTM으로 대체한다.
+            self.lag_lstm = nn.LSTM(1, 4, batch_first=True)
+            self.lag_projection = nn.Linear(4, 1)
 
     def forward(self, lag_demand: Tensor, lag_mask: Tensor, context: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """[B,L,N,1], 무효=True인 [B,L] -> ([B,N,D] 또는 [B,N], 유효=[B])."""
@@ -568,9 +612,24 @@ class PeriodicViewEncoder(nn.Module):
         batch, length, nodes, _ = lag_demand.shape
         if lag_mask.shape != (batch, length):
             raise ValueError(f'lag_mask는 [B,L]이어야 함: {tuple(lag_mask.shape)}')
+        if self.window_projection is not None:
+            window_size = self.window_projection.in_features
+            if length % window_size:
+                raise ValueError(f'lag 길이 {length}가 window 크기 {window_size}의 배수가 아님')
+            groups = length // window_size
+            # _chronological_lags의 순서: 먼 쪽 2시간, 1시간, 중심, 가까운 쪽 1·2시간.
+            # 시작 전 데이터가 끼어 있는 묶음은 0으로 패딩해 기여시키지 않는다.
+            group_valid = (~lag_mask.bool()).reshape(batch, groups, window_size).all(-1)
+            windows = lag_demand.reshape(batch, groups, window_size, nodes).permute(0, 1, 3, 2)
+            lag_demand = self.window_projection(windows)
+            lag_mask = ~group_valid
+            lag_demand = lag_demand.masked_fill(lag_mask[:, :, None, None], 0)
+            if context is not None:
+                context = context[:, window_size // 2::window_size]
+            length = groups
         valid = ~lag_mask.bool()
         lengths = valid.sum(dim=1)
-        if self.mode in ('ma', 'ema'):
+        if self.mode in ('ma', 'ma_no_local', 'ema'):
             weights = valid.to(lag_demand.dtype)
             if self.mode == 'ema':
                 # 가장 가까운 lag가 마지막이다. 유효 lag만 다시 정규화해 상수 수요를 보존한다.
@@ -581,14 +640,20 @@ class PeriodicViewEncoder(nn.Module):
             average = average / weights.sum(dim=1).clamp_min(1e-12).unsqueeze(-1)
             return average, lengths > 0
 
-        if self.mode != 'lstm':
+        if self.mode == 'lag_lstm':
+            # MA와 동일한 raw 스칼라 입력; 날씨/캘린더, log1p는 추가하지 않는다.
+            sequence = lag_demand
+            recurrent = self.lag_lstm
+        elif self.mode == 'lstm':
+            if context is None or context.shape != (batch, length, self.lstm.input_size - 1):
+                raise ValueError(f'context는 [B,L,{self.lstm.input_size - 1}]이어야 함')
+            sequence = torch.log1p(torch.clamp_min(lag_demand, 0))
+            sequence = torch.cat(
+                [sequence, context[:, :, None, :].expand(-1, -1, nodes, -1)], dim=-1
+            )
+            recurrent = self.lstm
+        else:
             raise ValueError(f'구현되지 않은 periodic_mode: {self.mode}')
-        if context is None or context.shape != (batch, length, self.lstm.input_size - 1):
-            raise ValueError(f'context는 [B,L,{self.lstm.input_size - 1}]이어야 함')
-        sequence = torch.log1p(torch.clamp_min(lag_demand, 0))
-        sequence = torch.cat(
-            [sequence, context[:, :, None, :].expand(-1, -1, nodes, -1)], dim=-1
-        )
         # 원본 lag 순서를 보존하며 무효 시점을 뒤로 보낸다. 패킹에 앞서 노드마다 펼친다.
         order = valid.long().argsort(dim=1, descending=True, stable=True)
         sequence = sequence.gather(
@@ -597,7 +662,7 @@ class PeriodicViewEncoder(nn.Module):
         sequence = sequence.permute(0, 2, 1, 3).reshape(batch * nodes, length, -1)
         row_lengths = lengths.repeat_interleave(nodes)
         active = (row_lengths > 0).nonzero(as_tuple=True)[0]
-        output = sequence.new_zeros(batch * nodes, self.lstm.hidden_size)
+        output = sequence.new_zeros(batch * nodes, 1 if self.mode == 'lag_lstm' else recurrent.hidden_size)
         if active.numel():
             packed = pack_padded_sequence(
                 sequence.index_select(0, active),
@@ -605,8 +670,11 @@ class PeriodicViewEncoder(nn.Module):
                 batch_first=True,
                 enforce_sorted=False,
             )
-            _, (hidden, _) = self.lstm(packed)
-            output = output.index_copy(0, active, hidden[-1])
+            _, (hidden, _) = recurrent(packed)
+            encoded = self.lag_projection(hidden[-1]) if self.mode == 'lag_lstm' else hidden[-1]
+            output = output.index_copy(0, active, encoded)
+        if self.mode == 'lag_lstm':
+            return output.reshape(batch, nodes), lengths > 0
         return output.reshape(batch, nodes, -1), lengths > 0
 
 
@@ -660,22 +728,35 @@ class RetrievalViewEncoder(nn.Module):
 
 
 class ViewFusion(nn.Module):
-    """LSTM: concatenate three D-vectors; MA/EMA: directly predict demand."""
+    """LSTM: concatenate three D-vectors; scalar modes: directly predict demand."""
 
     def __init__(self, config: MergedDemandConfig, num_views: int) -> None:
         super().__init__()
         self.mode = config.periodic_mode
+        self.use_local_view = getattr(config, 'use_local_view', True)
+        self.use_local_mean = getattr(config, 'use_local_mean', True)
+        self.use_softplus = getattr(config, 'use_softplus', True)
         if self.mode == 'lstm':
             self.projection = nn.Linear(num_views * config.d_model, config.d_model)
-        elif self.mode in ('ma', 'ema'):
+        elif self.mode in ('ma', 'ma_no_local', 'ema', 'lag_lstm'):
             self.local_projection = nn.Linear(config.d_model, 1)
-            # 각각 [N] 노드별 스칼라 게이트; sigmoid(0)=0.5로 시작한다.
-            self.daily_gate = nn.Parameter(torch.zeros(config.num_nodes))
-            self.weekly_gate = nn.Parameter(torch.zeros(config.num_nodes))
+            if self.mode == 'ma':
+                # Local is the reference logit (0): softmax starts at 0.7/0.2/0.1.
+                self.daily_mix_logit = nn.Parameter(
+                    torch.full((config.num_nodes,), math.log(0.2 / 0.7))
+                )
+                self.weekly_mix_logit = nn.Parameter(
+                    torch.full((config.num_nodes,), math.log(0.1 / 0.7))
+                )
+            else:
+                # Unchanged scalar variants: two independent sigmoid gates.
+                self.daily_gate = nn.Parameter(torch.zeros(config.num_nodes))
+                self.weekly_gate = nn.Parameter(torch.zeros(config.num_nodes))
 
     def forward(
         self, local: Tensor, daily: Tensor, weekly: Tensor,
         daily_valid: Tensor, weekly_valid: Tensor, node_index: Tensor | None = None,
+        local_mean: Tensor | None = None,
     ) -> Tensor:
         if self.mode == 'lstm':
             daily = daily * daily_valid[:, None, None]
@@ -683,19 +764,43 @@ class ViewFusion(nn.Module):
             return self.projection(torch.cat([local, daily, weekly], dim=-1))
         daily = daily * daily_valid[:, None]
         weekly = weekly * weekly_valid[:, None]
-        daily_gate = self.daily_gate if node_index is None else self.daily_gate.index_select(0, node_index)
-        weekly_gate = self.weekly_gate if node_index is None else self.weekly_gate.index_select(0, node_index)
-        return F.softplus(
+        local_term = (
             self.local_projection(local).squeeze(-1)
-            + daily_gate.sigmoid().unsqueeze(0) * daily
-            + weekly_gate.sigmoid().unsqueeze(0) * weekly
+            if self.use_local_view else local.new_zeros(local.shape[:2])
         )
+        if self.mode == 'ma':
+            if self.use_local_mean and local_mean is None:
+                raise ValueError('MA 융합에는 중앙 노드 local 수요 평균이 필요함')
+            daily_logit = (
+                self.daily_mix_logit if node_index is None
+                else self.daily_mix_logit.index_select(0, node_index)
+            )
+            weekly_logit = (
+                self.weekly_mix_logit if node_index is None
+                else self.weekly_mix_logit.index_select(0, node_index)
+            )
+            local_gate, daily_gate, weekly_gate = torch.stack(
+                (torch.zeros_like(daily_logit), daily_logit, weekly_logit)
+            ).softmax(dim=0).unbind(0)
+            score = local_term
+            if self.use_local_mean:
+                score = score + local_gate * local_mean
+            score = score + daily_gate * daily + weekly_gate * weekly
+        else:
+            daily_gate = self.daily_gate if node_index is None else self.daily_gate.index_select(0, node_index)
+            weekly_gate = self.weekly_gate if node_index is None else self.weekly_gate.index_select(0, node_index)
+            score = (
+                local_term
+                + daily_gate.sigmoid().unsqueeze(0) * daily
+                + weekly_gate.sigmoid().unsqueeze(0) * weekly
+            )
+        return F.softplus(score) if self.use_softplus else score
 
 
 class PredictionHead(nn.Module):
     """융합된 노드 임베딩 -> 그 노드의 다음 1시간 수요(스칼라).
 
-    수요는 음수가 될 수 없으므로 마지막에 비음수 활성(Softplus 등)을 씌운다.
+    기본 설정은 비음수 Softplus 출력이며, use_softplus=false는 활성 없이 내보낸다.
     """
 
     def __init__(self, config: MergedDemandConfig) -> None:
@@ -706,6 +811,7 @@ class PredictionHead(nn.Module):
             nn.Dropout(config.dropout),
             nn.Linear(config.d_model, 1),
         )
+        self.use_softplus = getattr(config, 'use_softplus', True)
 
     def forward(self, fused: Tensor) -> Tensor:
         """
@@ -713,12 +819,13 @@ class PredictionHead(nn.Module):
             fused: ``[B, N, D]``
 
         Returns:
-            ``[B, N]`` 노드별 예측 수요(raw 스케일, >= 0).
+            ``[B, N]`` 노드별 예측 수요(raw 스케일). 기본은 >=0.
         """
 
-        # softplus(x) = log(1+exp(x)). 수요는 음수가 될 수 없고, ReLU와 달리 0 근처에서
-        # gradient가 죽지 않는다 — 셀의 74%가 0인 데이터라 이 차이가 중요하다.
-        return F.softplus(self.mlp(fused).squeeze(-1))
+        # 기본 Softplus는 0 근처에서도 gradient가 살아 있다(많은 수요 셀이 0).
+        # 출력 활성 ablation은 음수 예측도 허용한다.
+        prediction = self.mlp(fused).squeeze(-1)
+        return F.softplus(prediction) if self.use_softplus else prediction
 
 
 class MergedDemandModel(PreTrainedModel):
@@ -760,7 +867,7 @@ class MergedDemandModel(PreTrainedModel):
             self.weekly_view = PeriodicViewEncoder(config)
         self.retrieval_view = RetrievalViewEncoder(config)
         self.fusion = ViewFusion(config, num_views=len(self.VIEW_NAMES))
-        if self.periodic_mode not in ('ma', 'ema'):
+        if self.periodic_mode not in ('ma', 'ma_no_local', 'ema', 'lag_lstm'):
             self.head = PredictionHead(config)
 
         self.loss_fn: nn.Module
@@ -861,8 +968,11 @@ class MergedDemandModel(PreTrainedModel):
             여기 넣으면 안 된다 — 필요하면 :meth:`forward_views`를 쓴다.
 
         periodic_mode='none'이면 기존 local-only 경로다. 'lstm'은 daily/weekly D벡터를
-        local과 융합하고, 'ma'/'ema'는 노드별 원 수요 평균을 직접 예측에 더한다.
+        local과 융합한다. 'ma'는 local 원수요 평균까지 3-way 혼합하고
+        'ma_no_local'은 과거의 독립 daily/weekly sigmoid 경로를 재현한다.
+        'ema'/'lag_lstm'도 독립 sigmoid 게이트로 주기 출력을 예측에 더한다.
         retrieval 입력은 아직 사용하지 않는다.
+        use_softplus=false에서는 logits가 음수일 수 있다.
         """
 
         views = self._encode_views(
@@ -909,7 +1019,7 @@ class MergedDemandModel(PreTrainedModel):
 
     def _predict_grid(self, views: dict[str, Tensor]) -> Tensor:
         predictions = (
-            views['prediction'] if self.periodic_mode in ('ma', 'ema')
+            views['prediction'] if self.periodic_mode in ('ma', 'ma_no_local', 'ema', 'lag_lstm')
             else self.head(views['fused'])
         )
         active = self.local_view.active_node_index(predictions.device)
@@ -937,8 +1047,13 @@ class MergedDemandModel(PreTrainedModel):
         weekly_hour: Tensor,
         weekly_day_of_week: Tensor,
     ) -> dict[str, Tensor]:
-        context = self.context_encoder(weather, hour_of_day, day_of_week)
-        local = self.local_view(demand_history, context)
+        if getattr(self.config, 'use_local_view', True):
+            context = self.context_encoder(weather, hour_of_day, day_of_week)
+            local = self.local_view(demand_history, context)
+        else:
+            local = demand_history.new_zeros(
+                len(demand_history), self.local_view.num_active_nodes, self.config.d_model,
+            )
         if self.periodic_mode == 'none':
             return {'local': local, 'fused': local}
 
@@ -956,7 +1071,16 @@ class MergedDemandModel(PreTrainedModel):
             daily_valid = torch.zeros_like(daily_valid)
         if not getattr(self.config, 'use_weekly', True):
             weekly_valid = torch.zeros_like(weekly_valid)
-        combined = self.fusion(local, daily, weekly, daily_valid, weekly_valid, active)
+        local_mean = (
+            demand_history.mean(dim=1).flatten(1)
+            if self.periodic_mode == 'ma' and getattr(self.config, 'use_local_mean', True)
+            else None
+        )
+        if local_mean is not None and active is not None:
+            local_mean = local_mean.index_select(1, active)
+        combined = self.fusion(
+            local, daily, weekly, daily_valid, weekly_valid, active, local_mean,
+        )
         views = {'local': local, 'daily': daily, 'weekly': weekly}
         if self.periodic_mode == 'lstm':
             views['fused'] = combined

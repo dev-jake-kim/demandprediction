@@ -10,11 +10,24 @@
 local_radius: 2
 d_model: 16
 local_encoder: transformer
-# MA 채택: 노드별 daily/weekly 평균 게이트 + local 선형항이 직접 예측한다.
-# seed 245에서 local-only 대비 RMSE 0.724449 -> 0.722502, MAPE(+1)
-# 15.505391 -> 15.311199로 개선, MAE 0.320882 -> 0.322443으로 악화.
-# 단일 seed 결과다. 이전 local-only 비교는 model.periodic_mode=none.
+# 실험 옵션: model.history_weights=[0.1,0.2,0.7] (오래된 순서 -> 최근 순서).
+# raw 수요에 학습 가능한 양수·합 1의 3탭 valid 평균을 적용해 24 -> 22시점으로
+# 과거 sigmoid MA seed 245 비교에서 모든 test 지표가 악화해 raw로 유지.
+history_weights: null
+# MA: 자기노드 최근 24시간 raw 평균 + 유효 daily/weekly lag 평균을 노드별
+# 3-way softmax gate로 융합한다. 처음 local/daily/weekly = 0.7/0.2/0.1,
+# 여기에 기존 local view 출력의 선형항을 더해 Softplus로 예측한다.
+# 과거 seed 245 MA 결과(원자료: output/experiments/periodic_ma_d16_ulsan_seed245.json)는
+# local 평균 없이 독립 sigmoid 게이트를 사용한 이전 구조의 기록이다.
+# 현재 0.70/0.15 분할 3-seed 평균: local MA RMSE 0.722487,
+# 이전 sigmoid MA 0.723854. MAE/MAPE(+1)는 각각 +0.088%/+0.832% 악화;
+# RMSE 기준 기본값은 유지한다(결과: docs/ADFORMER_REFERENCE_RESULTS.md 표 11).
 periodic_mode: ma
+# 실험: data.lag_radius=2와 함께 model.periodic_window_weights=[0.05,0.1,0.7,0.1,0.05].
+# 각 주기 lag의 ±2시간을 bias 없는 별도 daily/weekly 선형 가중합으로 접는다.
+periodic_window_weights: null
+# 위 5시간 창은 유지하고 일/주 lag 간 MA만 input=1, hidden=4 LSTM→Linear(4,1)
+# 스칼라로 바꾸는 실험: model.periodic_mode=lag_lstm (기본 ma는 유지).
 num_fourier_bands: 8
 transformer_layers: 2
 transformer_heads: 4
@@ -28,28 +41,29 @@ dropout: 0.10
 # 격자의 74%가 0이라 정보를 가진 이웃이 몇 개 없어서 그 교란이 상대적으로 크므로 기본은 0이다.
 # 0이 아니면 PyTorch SDPA의 batch<=65535 제한이 살아나 train.py가 배치를 깎는다.
 attention_dropout: 0.0
-# --- retrieval 관점 ---
-# 질의(그 노드의 최근 k시간 수요)와 코사인 유사도가 가장 높은 과거 윈도우 top-k.
+# --- retrieval 설정 (현재 예측 경로에서는 미사용) ---
+# 검색 관점은 아직 구현되지 않아 num_retrieval/use_retrieval을 꺼도 ablation이 아니다.
 num_retrieval: 20
 # 검색 후보 범위. observed_past = tau < target_time(원본 기본값), train_prefix = train split까지만.
 retrieval_scope: observed_past
 # 후보를 몇 시점씩 끊어서 훑을지. 값이 클수록 한 번에 만드는 후보 텐서가 커진다.
 retrieval_chunk_size: 256
-# 요일/시간대 임베딩 차원. 날씨는 임베딩하지 않고 정규화한 3값을 그대로 concat하므로,
-# 세 LSTM에 붙는 보조 텐서는 3 + weekday_dim + hour_dim = 15차원이 된다.
+# 캘린더 임베딩 차원. 날씨는 2채널(기온, 강수+적설)을 min-max 정규화해
+# temporal LSTM 입력에 이어 붙인다.
 weekday_dim: 7
 hour_dim: 5
 
-# --- ablation 스위치 (기본값 = full, 아무것도 끄지 않은 모델) ---
-# ablation은 "0-치환" 방식이다 — 모듈을 없애지 않고 항상 생성·실행한 뒤 결과 텐서만 0으로
-# 바꾼다. 예외는 use_branch_attention으로, 어텐션은 출력이 아니라 선택 메커니즘이라
-# 0-치환이 성립하지 않아 균등 가중으로 대체한다.
-# CLI 오버라이드 예: python train.py --config-name config_ulsan model.use_retrieval=false
+# --- 모델 입력 ablation 스위치 (기본값 = full) ---
+# false는 해당 경로를 비활성화한다. use_softplus만 출력 활성을 제거한다.
+# local view는 공간+시간 인코더, local mean은 원 수요의 자기노드 평균이다.
+# retrieval / branch_attention / weather_injection은 현재 예측 경로에 없으므로
+# 이 구형 설정을 false로 바꾸어도 ablation이 되지 않는다.
+use_local_view: true
+use_local_mean: true
 use_daily: true
 use_weekly: true
 use_retrieval: true
 use_weather: true
-# 'concat'(기본, 정규화 3값을 세 LSTM 입력에 붙임) | 'cls_add'(ir-weather 방식, CLS에 더함)
 weather_injection: concat
 use_calendar: true
 use_branch_attention: true
@@ -62,7 +76,7 @@ use_softplus: true
 # -> 학습 시작 시점의 함수는 공유 LSTM과 정확히 같다). 적응 노드가 아닌 노드는 공유 W만
 # 쓰면서 외부 weight를 받는 torch._VF.lstm 경로를 그대로 탄다.
 #
-# ulsan 3-seed(2026/245/6835) 결과로 이 조합을 기본값으로 채택했다. baseline 대비 paired
+# 과거 0.80/0.10 분할의 ulsan 3-seed(2026/245/6835)로 이 조합을 채택했다. baseline 대비 paired
 # 평균 RMSE -1.613%(3/3 seed 개선), MAE -0.855%(3/3), MAPE(0 제외) -1.722%(3/3)이다.
 # 대신 MAPE(+1)은 평균 +1.456%로 악화한다(개선 1/3) — 그 지표가 주 기준이면 둘 다 꺼야 한다.
 # 파라미터는 121,907 -> 1,732,660(14.21배)로 늘고, 학습된 s는 0.8410 ± 0.0074로 세 seed 모두
@@ -71,7 +85,7 @@ use_softplus: true
 #
 # 주의: zero_node_max_demand와는 노드 축이 어긋나 동시에 켤 수 없다(modeling.py가 막는다).
 node_adaptive: true
-# ΔW를 받을 노드: train 구간 평균 수요가 이 값을 넘는 노드만. ulsan 기준 44/168 (26.2%).
+# ΔW 노드: train 구간 평균 수요가 이 값을 넘는 노드만. 현재 0.70/0.15 분할 Ulsan은 45/168 (26.8%).
 # 수요가 거의 0인 노드(ulsan 노드 중앙값 0.141)에 노드당 36,864개 파라미터를 주면
 # 신호가 아니라 노이즈를 외울 용량만 늘어난다.
 # 실제 노드 id 목록(node_adaptive_indices)은 train.py가 train 구간에서 계산해 주입한다.

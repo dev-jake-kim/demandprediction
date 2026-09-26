@@ -52,13 +52,22 @@ class MergedDemandConfig(PretrainedConfig):
         # 'conv' = 창을 (2a+1)x(2a+1) 이미지로 보고 residual 3x3 conv 블록을 쌓는다
         # (위치 임베딩 없음, 요약은 중앙 칸). 두 경로 모두 transformer_layers만큼 쌓는다.
         local_encoder: str = 'transformer',
+        # None = 기존 raw history; 리스트 = 오래된 시점부터 최근 시점 순서의
+        # 학습 가능한 valid temporal kernel 초기 가중치.
+        history_weights: list[float] | None = None,
         # 창 하나를 요약하는 블록 수.
         transformer_layers: int = 2,
         transformer_heads: int = 4,
         transformer_ffn: int = 128,
-        # 'none' = 기존 local-only, 'lstm' = 주기 D벡터 융합,
-        # 'ma'/'ema' = 원 수요의 주기 평균을 노드 게이트로 직접 예측.
+        # 'none' = local-only, 'lstm' = 주기 D벡터 융합,
+        # 'ma' = local 자기노드 이력/daily/weekly 평균을 노드별 3-way gate로 직접 예측,
+        # 'ma_no_local' = 이전 MA: local 원수요 평균 없이 daily/weekly 독립 sigmoid gate,
+        # 'ema' = 주기 지수평균을 독립 sigmoid gate로 직접 예측,
+        # 'lag_lstm' = 주기 lag를 input=1/hidden=4 LSTM→scalar로 접어 EMA와 같은 gate로 예측.
         periodic_mode: str = 'none',
+        # 5개 lag(중심의 ±2시간)를 bias 없는 선형 가중합으로 한 lag로 접는다.
+        # None이면 기존 정확한 일/주 시점만 쓴다. 데이터의 lag_radius=2와 함께 사용.
+        periodic_window_weights: list[float] | None = None,
         # --- retrieval 관점 ---
         # 최근 k시간 패턴과 비슷한 과거 시점을 몇 개 가져올지.
         num_retrieval: int = 20,
@@ -119,12 +128,29 @@ class MergedDemandConfig(PretrainedConfig):
         self.local_radius = local_radius
         self.num_fourier_bands = num_fourier_bands
         self.local_encoder = str(local_encoder)
+        if history_weights is not None:
+            if (not history_weights or len(history_weights) > time_step
+                    or any(value <= 0 for value in history_weights)):
+                raise ValueError('history_weights는 길이 1..time_step의 양수 목록이어야 함')
+            history_weights = [float(value) for value in history_weights]
+        self.history_weights = history_weights
         self.transformer_layers = transformer_layers
         self.transformer_heads = transformer_heads
         self.transformer_ffn = transformer_ffn
-        if periodic_mode not in ('none', 'lstm', 'ma', 'ema'):
-            raise ValueError("periodic_mode는 'none' | 'lstm' | 'ma' | 'ema'여야 함")
+        if periodic_mode not in ('none', 'lstm', 'ma', 'ma_no_local', 'ema', 'lag_lstm'):
+            raise ValueError(
+                "periodic_mode는 'none' | 'lstm' | 'ma' | 'ma_no_local' | 'ema' | 'lag_lstm'여야 함"
+            )
         self.periodic_mode = periodic_mode
+        if periodic_window_weights is not None:
+            if len(periodic_window_weights) != 5 or any(
+                value < 0 for value in periodic_window_weights
+            ):
+                raise ValueError('periodic_window_weights는 길이 5의 비음수 목록이어야 함')
+            if periodic_mode == 'none':
+                raise ValueError('periodic_window_weights는 periodic_mode=none에서 사용 불가')
+            periodic_window_weights = [float(value) for value in periodic_window_weights]
+        self.periodic_window_weights = periodic_window_weights
         self.num_retrieval = num_retrieval
         self.retrieval_scope = retrieval_scope
         self.retrieval_chunk_size = retrieval_chunk_size

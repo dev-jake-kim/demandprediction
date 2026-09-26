@@ -64,9 +64,9 @@ logger = logging.getLogger(__name__)
 # getBlocksGrid()가 dim3(ceil_div(num_queries, kQueriesPerBlock), num_heads, num_batches)라
 # num_batches가 blocks.z로 들어가는데 y/z 차원 상한이 65535다(x만 2^31-1).
 #
-# models/merged/modeling.py의 LocalViewEncoder는 (batch, time_step, H*W) 전체를
-# (batch*time_step*H*W, 1+neighbors, d_model)로 펼쳐 넣으므로 배치가 조금만 커도 한계를
-# 넘는다 — ulsan(14*12=168)은 batch 17부터, porto(10*20=200)는 batch 14부터다.
+# models/merged/modeling.py의 LocalViewEncoder는 (batch, local_steps, H*W) 전체를
+# (batch*local_steps*H*W, 1+neighbors, d_model)로 펼친다. local_steps는
+# 평활화하지 않으면 time_step, valid c탭이면 time_step-c+1이다.
 # "어텐션 하나가 크다"가 아니라 "26토큰짜리 작은 어텐션이 너무 많다"가 문제다.
 #
 # 이 백엔드를 끄는 우회는 쓰지 않는다 — fallback(math) 백엔드가 어텐션 행렬을 그대로 만들어
@@ -74,10 +74,10 @@ logger = logging.getLogger(__name__)
 # dropout이 켜져 있을 때만 배치 크기를 낮춘다. 꺼져 있으면 이 한계가 없으므로 한계는 VRAM이다.
 SDPA_BATCH_LIMIT = 65535
 
-# ablation 방식: 모듈을 지우지 않고, 그 모듈이 결과로 이어지는 텐서만 0으로 바꾼다.
-# 구조/파라미터 수/텐서 shape가 전부 보존되므로 측정된 차이가 "그 모듈의 정보" 때문임이
-# 분리된다. 예외는 no-branch-attn — 어텐션은 출력 텐서가 아니라 선택 메커니즘이라
-# 0-치환이 성립하지 않아 균등 가중으로 대체한다.
+# 정보 경로 ablation은 출력을 0으로 치환한다(기존 파라미터/차원 보존).
+# use_softplus=false는 출력 활성만 통과시키고, node_adaptive=false는 ΔW를
+# 생성하지 않으며, shared_weight_fp8=false는 fake 양자화를 제거한다.
+# retrieval/branch_attention/weather_injection은 현재 모델의 예측 경로에 없다.
 ABLATION_MODE = 'zero'
 
 
@@ -329,6 +329,15 @@ def select_zero_node_indices(train_ds: UnifiedDemandDataset, max_demand: float) 
 
 @hydra.main(config_path='configs', config_name='config_ulsan', version_base=None)
 def main(cfg: DictConfig) -> None:
+    periodic_window = cfg.model.get('periodic_window_weights')
+    if periodic_window is not None and (
+        int(cfg.data.lag_radius) != 2
+        or int(cfg.data.daily_period) <= 4
+        or int(cfg.data.weekly_period) <= 4
+    ):
+        raise ValueError(
+            'periodic_window_weights에는 lag_radius=2 및 4보다 긴 일/주 period가 필요함'
+        )
     data_path, dataset_kwargs, train_ds, val_ds, test_ds = build_datasets(cfg)
 
     # 날씨 정규화 통계는 train 구간에서만 계산한다(시간 리크 방지).
@@ -416,14 +425,16 @@ def main(cfg: DictConfig) -> None:
     # 배치를 근거 없이 버리게 된다(실측: attention_dropout=0이면 batch 70,000도 통과하고,
     # 0.1이면 거부된다). train/eval 배치를 같이 낮춰야 train 중간의 eval도 안전하다.
     nodes = train_ds.height * train_ds.width
-    per_sample = train_ds.time_step * nodes
+    history_weights = model_config.history_weights
+    local_steps = train_ds.time_step - (len(history_weights) - 1 if history_weights else 0)
+    per_sample = local_steps * nodes
     attention_dropout = float(model_config.attention_dropout)
     if attention_dropout > 0.0:
         max_batch = max(1, SDPA_BATCH_LIMIT // per_sample)
         for key in ('per_device_train_batch_size', 'per_device_eval_batch_size'):
             if train_cfg[key] > max_batch:
                 logger.warning(
-                    f'{key}={train_cfg[key]}는 time_step({train_ds.time_step}) * nodes({nodes})'
+                    f'{key}={train_cfg[key]}는 local_steps({local_steps}) * nodes({nodes})'
                     f'={per_sample}와 곱하면 SDPA_BATCH_LIMIT({SDPA_BATCH_LIMIT})을 넘어'
                     f'memory-efficient attention이 죽는다'
                     f'(model.attention_dropout={attention_dropout}>0)'
@@ -526,12 +537,28 @@ def main(cfg: DictConfig) -> None:
         # 학습 목적함수. 'objective'는 기존 78건 JSON과의 스키마 호환을 위해 남긴 이름이다.
         'objective': cfg.model.loss_type,
         'periodic_mode': cfg.model.get('periodic_mode', 'none'),
+        'lag_radius': int(cfg.data.lag_radius),
+        'periodic_window_weights_init': model_config.periodic_window_weights,
+        'periodic_window_weights_learned': (
+            {
+                'daily': model.daily_view.window_projection.weight.detach().cpu().flatten().tolist(),
+                'weekly': model.weekly_view.window_projection.weight.detach().cpu().flatten().tolist(),
+            }
+            if model_config.periodic_window_weights is not None else None
+        ),
+        'history_weights_init': history_weights,
+        'history_weights_learned': (
+            model.local_view.history_logits.softmax(dim=0).detach().cpu().tolist()
+            if model.local_view.history_logits is not None else None
+        ),
         'ablation': cfg.ablation,
         'ablation_mode': ABLATION_MODE,
         # 실제로 적용된 스위치. 라벨(cfg.ablation)이 아니라 이 값이 근거다.
         'ablation_flags': {
             key: model_kwargs[key]
             for key in (
+                'use_local_view',
+                'use_local_mean',
                 'use_daily',
                 'use_weekly',
                 'use_retrieval',
@@ -569,17 +596,19 @@ def main(cfg: DictConfig) -> None:
 
     run_json = cfg.get('run_json')
     if run_json is None:
-        # mode가 다르면 같은 (city, loss, ablation, seed)의 이전 결과를 덮어쓰지 않는다.
-        # none의 기존 파일명은 유지하고, 주기 변종에만 mode를 명시한다.
+        # none의 기존 파일명은 유지한다. 새 MA 융합은 옛 sigmoid MA와 결과를 분리한다.
         mode = cfg.model.get('periodic_mode', 'none')
         mode_suffix = f'_{mode}' if mode != 'none' else ''
+        mixture_suffix = '_localmix' if mode == 'ma' else ''
+        history_suffix = f'_history{len(history_weights)}' if history_weights else ''
+        window_suffix = '_window5' if periodic_window is not None else ''
         node_suffix = '_nodeadaptive' if node_adaptive else ''
         run_json = (
             Path('output')
             / cfg.project_name
             / 'runs'
             / f'{cfg.dataset.city}_{cfg.model.loss_type}_{cfg.ablation}'
-            f'{mode_suffix}{node_suffix}_seed{cfg.train.seed}.json'
+            f'{mode_suffix}{mixture_suffix}{history_suffix}{window_suffix}{node_suffix}_seed{cfg.train.seed}.json'
         )
     run_json = Path(run_json).expanduser()
     if not run_json.is_absolute():
