@@ -5,6 +5,24 @@
 daily/weekly lag는 오래된 순서에서 가까운 순서로 정렬되어 있고, mask의 `True`는
 데이터 시작 이전이라 유효하지 않은 시점이다. Retrieval 관점은 현재 구현되지 않았다.
 
+## 패치 이후 노드 간 Transformer 실험
+
+두 도시의 기본 `model.use_inter_node_transformer=false`는 기존 채택 `ma`의
+파라미터·출력을 유지한다. `true`면 각 시각의 5×5 패치를 기존 공간
+Transformer로 인코딩해 얻은 CLS `[B,k,N,D]`를 `[B*k,N,D]`로 바꿔,
+**N개 노드를 토큰으로 하는 1층 TransformerEncoder**에 통과시킨다.
+기존 CLS에는 노드 고유 임베딩이 포함된다. 출력은 `[B,k,N,D]`로 되돌려
+기존 시간 LSTM, 자기노드 MA·daily·weekly 융합 및 손실에 그대로 넘긴다.
+헤드 수 4, FFN 폭 128, dropout/attention dropout은 도시별 기존 설정을
+재사용하고 Ulsan/Porto의 D는 각각 16/64다. 추가 층의 초기화는 별도
+RNG 컨텍스트에서 실행해 같은 seed의 기존 층 초기화를 보존한다.
+이는 `tmp`나 `ir-weather`에 존재했던 층을 복원한 것이 아니라 **새 실험**이다.
+
+Ulsan/Porto seed `245/6835/851`의 채택 MA 대비 전체 재학습 결과는
+[`ADFORMER_REFERENCE_RESULTS.md`](ADFORMER_REFERENCE_RESULTS.md) 표 12,
+채택 MA에서 노드별 ΔW만 끈 실험은
+[`MERGED_ABLATION_RESULTS.md`](MERGED_ABLATION_RESULTS.md) 5절에 있다.
+
 ## 주기 관점 실험 (`model.periodic_mode`)
 
 Ulsan 기본값은 `ma`, `d_model=16`, `local_encoder=transformer`,

@@ -356,6 +356,23 @@ class LocalViewEncoder(nn.Module):
                 torch.zeros(num_adaptive, n_gates, d_model)
             )
             self.node_delta_bias = nn.Parameter(torch.zeros(num_adaptive, n_gates))
+        # 기존 파라미터의 시드별 초기화를 보존하도록 추가 층의 초기화 RNG를 격리한다.
+        self.inter_node_transformer: nn.TransformerEncoder | None = None
+        if config.use_inter_node_transformer:
+            with torch.random.fork_rng(devices=[]):
+                inter_node_layer = nn.TransformerEncoderLayer(
+                    d_model=d_model,
+                    nhead=config.transformer_heads,
+                    dim_feedforward=config.transformer_ffn,
+                    dropout=config.dropout,
+                    activation='gelu',
+                    batch_first=True,
+                    norm_first=True,
+                )
+                inter_node_layer.self_attn.dropout = config.attention_dropout
+                self.inter_node_transformer = nn.TransformerEncoder(
+                    inter_node_layer, num_layers=1, enable_nested_tensor=False,
+                )
 
     def node_adaptive_index(self, device: torch.device) -> Tensor:
         """ΔW를 받는 전역 노드 id 텐서. config 리스트를 device별로 캐시한다."""
@@ -558,6 +575,11 @@ class LocalViewEncoder(nn.Module):
                 tokens.reshape(batch * steps * nodes, neighbors, -1)
             )
             summary = encoded.reshape(batch, steps, nodes, -1)
+        if self.inter_node_transformer is not None:
+            # 같은 시각의 N개 패치 CLS를 토큰으로 사용한다. 시간축 LSTM과 이후 융합은 동일하다.
+            summary = self.inter_node_transformer(
+                summary.reshape(batch * steps, nodes, -1)
+            ).reshape(batch, steps, nodes, -1)
 
         # 시간 축을 접는다. 보조 정보는 노드에 무관하므로 노드 축으로 브로드캐스트해 붙인다.
         sequence = summary.permute(0, 2, 1, 3).reshape(batch * nodes, steps, -1)

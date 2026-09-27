@@ -537,6 +537,7 @@ def main(cfg: DictConfig) -> None:
         # 학습 목적함수. 'objective'는 기존 78건 JSON과의 스키마 호환을 위해 남긴 이름이다.
         'objective': cfg.model.loss_type,
         'periodic_mode': cfg.model.get('periodic_mode', 'none'),
+        'use_inter_node_transformer': model_config.use_inter_node_transformer,
         'lag_radius': int(cfg.data.lag_radius),
         'periodic_window_weights_init': model_config.periodic_window_weights,
         'periodic_window_weights_learned': (

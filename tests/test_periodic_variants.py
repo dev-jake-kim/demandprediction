@@ -257,6 +257,53 @@ def test_no_neighbors_keeps_center_history_while_removing_neighbor_signal():
     torch.testing.assert_close(a[:, 0], b[:, 0], atol=0, rtol=0)
 
 
+def test_inter_node_transformer_exchanges_information_beyond_local_patches():
+    kwargs = dict(
+        periodic_mode='ma', height=1, width=5, time_step=2, local_radius=1,
+        d_model=8, transformer_heads=2, transformer_ffn=16,
+        transformer_layers=1, dropout=0.0, attention_dropout=0.0,
+    )
+    base_config = MergedDemandConfig(**kwargs)
+    torch.manual_seed(90)
+    local_only = LocalViewEncoder(base_config).eval()
+    torch.manual_seed(90)
+    connected = LocalViewEncoder(
+        MergedDemandConfig(**kwargs, use_inter_node_transformer=True)
+    ).eval()
+    history = torch.tensor([[[[1., 2., 1., 0., 0.]], [[0., 3., 2., 1., 0.]]]])
+    changed = history.clone()
+    changed[:, :, :, 4] = 50.
+    context = torch.zeros(1, 2, base_config.context_dim)
+
+    with torch.no_grad():
+        isolated = local_only(history, context)[:, 0]
+        still_isolated = local_only(changed, context)[:, 0]
+        exchanged = connected(history, context)[:, 0]
+        changed_exchange = connected(changed, context)[:, 0]
+    torch.testing.assert_close(isolated, still_isolated, atol=0, rtol=0)
+    assert (changed_exchange - exchanged).abs().max() > 1e-6
+
+
+def test_inter_node_transformer_prediction_restores_from_checkpoint():
+    config = MergedDemandConfig(
+        periodic_mode='ma', use_inter_node_transformer=True,
+        height=1, width=5, time_step=2, local_radius=1,
+        d_model=8, transformer_heads=2, transformer_ffn=16, dropout=0.0,
+        temperature_min=0.0, temperature_max=1.0, precipitation_max=1.0,
+    )
+    model = MergedDemandModel(config).eval()
+    history = torch.rand(1, 2, 1, 5)
+    context = torch.zeros(1, 2, config.context_dim)
+    with torch.no_grad():
+        before = model.local_view(history, context)
+    with TemporaryDirectory() as path:
+        model.save_pretrained(path)
+        restored = MergedDemandModel.from_pretrained(path).eval()
+    with torch.no_grad():
+        after = restored.local_view(history, context)
+    torch.testing.assert_close(before, after)
+
+
 def test_no_softplus_ablation_keeps_signed_scalar_output():
     fusion = ViewFusion(
         MergedDemandConfig(periodic_mode='ma', d_model=4, height=1, width=1,

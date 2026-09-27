@@ -318,3 +318,74 @@ seed 245 포함, 실제 모듈 10종을 각각 한 번씩 끄고 재학습한 �
 [`MERGED_ABLATION_RESULTS.md`](MERGED_ABLATION_RESULTS.md) 표 4에 있다.
 1-seed ablation의 우열을 이 표의 3-seed 평균과 동일한 신뢰도로
 해석하지 않는다.
+
+## 표 12. 채택 MA + 패치 뒤 노드 간 1층 Transformer — 동일 seed 재학습
+
+각 시각의 `(2a+1)²` 지역 패치 인코딩 이후 `[B*k,N,D]`의 **전체 노드**를
+토큰으로 하는 1층 `TransformerEncoder`를 추가했다. 인코딩 결과는 원래의
+시간 LSTM에 넘기며 local 24시간 MA, daily/weekly, 3-way gate, 손실은
+그대로다. `model.use_inter_node_transformer=true`만 채택 `ma`에서 바꾼다.
+seed `245/6835/851`, 시간순 `0.70/0.15/0.15` 분할, MAE 손실,
+Ulsan batch 24 / Porto batch 8, 최대 120 epoch와 기존 val MAE 선택·
+early stopping을 그대로 사용했다. 모든 신규 학습은
+`CUDA_VISIBLE_DEVICES=1`(물리 GPU 1)로 실행했다. 아래 `MAPE(+1)`은
+`|오차|/(|실측|+1)`의 평균 ×100이고, ADFormer 원 MAPE와 동일한
+정의라고 가정하지 않는다.
+
+### Ulsan (14×12, D=16, seed별 paired 비교)
+
+| seed | 설정 | MAE | RMSE | MAPE(+1) % | MAPE(0 제외) % |
+|---:|---|---:|---:|---:|---:|
+| 245 | 채택 MA | 0.322653 | 0.720627 | 15.530688 | 59.594836 |
+| 245 | + 노드 간 1층 | 0.323000 | 0.723242 | 15.315415 | 60.216592 |
+| 6835 | 채택 MA | 0.323046 | 0.724833 | 15.253790 | 60.468116 |
+| 6835 | + 노드 간 1층 | 0.323152 | 0.725279 | 15.187903 | 60.280474 |
+| 851 | 채택 MA | 0.323649 | 0.722001 | 15.518695 | 60.668484 |
+| 851 | + 노드 간 1층 | 0.323136 | 0.722956 | 15.457522 | 60.592623 |
+| **평균 ± 표본 sd** | **채택 MA** | **0.323116 ± 0.000502** | **0.722487 ± 0.002145** | **15.434391 ± 0.156520** | **60.243812 ± 0.570889** |
+|  | **+ 노드 간 1층** | **0.323096 ± 0.000083** | **0.723826 ± 0.001267** | **15.320280 ± 0.134875** | **60.363230 ± 0.201212** |
+
+seed별 `(변형/채택−1)×100%`의 평균: MAE **-0.006%** (개선 1/3),
+RMSE **+0.186%** (개선 0/3), MAPE(+1) **-0.737%** (개선 3/3),
+MAPE(0 제외) **+0.203%** (개선 2/3). 채택 지표인 RMSE가 모든
+seed에서 악화하므로 Ulsan 기본값은 변경하지 않는다.
+원자료: `output/experiments/inter_node_3seed_ulsan_seed{245,6835,851}.json`;
+기준선: `output/experiments/ma_localmix_3seed_ulsan_seed{245,6835,851}.json`.
+체크포인트는 `output/experiments/checkpoints/` 아래 JSON과 동명 디렉터리.
+
+### Porto (10×20, D=64, seed별 paired 비교)
+
+| seed | 설정 | MAE | RMSE | MAPE(+1) % | MAPE(0 제외) % |
+|---:|---|---:|---:|---:|---:|
+| 245 | 채택 MA | 0.489788 | 1.784967 | 15.520057 | 60.650364 |
+| 245 | + 노드 간 1층 | 0.489433 | 1.770382 | 15.769723 | 60.050087 |
+| 6835 | 채택 MA | 0.488421 | 1.750618 | 15.468143 | 59.894078 |
+| 6835 | + 노드 간 1층 | 0.487151 | 1.774237 | 15.390452 | 60.343225 |
+| 851 | 채택 MA | 0.489957 | 1.781163 | 15.618069 | 60.615568 |
+| 851 | + 노드 간 1층 | 0.487663 | 1.779707 | 15.417640 | 61.243656 |
+| **평균 ± 표본 sd** | **채택 MA** | **0.489389 ± 0.000843** | **1.772249 ± 0.018829** | **15.535423 ± 0.076135** | **60.386670 ± 0.426952** |
+|  | **+ 노드 간 1층** | **0.488082 ± 0.001198** | **1.774775 ± 0.004685** | **15.525938 ± 0.211561** | **60.545656 ± 0.622001** |
+
+paired 변화율 평균: MAE **-0.267%** (개선 3/3), RMSE **+0.150%**
+(개선 2/3), MAPE(+1) **-0.059%** (개선 2/3), MAPE(0 제외)
+**+0.265%** (개선 1/3). MAE는 3개 seed에서 개선됐지만 RMSE
+평균과 MAPE(0 제외) 평균은 악화했다. 두 도시 모두 seed 3개만으로
+통계적 유의성은 주장하지 않으며 채택 기본 설정을 유지한다.
+원자료: `output/experiments/inter_node_3seed_porto_seed{245,6835,851}.json`;
+기준선: `output/experiments/ma_localmix_3seed_porto_seed{245,6835,851}.json`.
+체크포인트는 `output/experiments/checkpoints/` 아래 JSON과 동명 디렉터리.
+
+6개 변형 체크포인트의 유효 모델 설정을 같은 seed의 채택 MA와
+대조했다. 이전 체크포인트에 없던 `use_local_view=true`,
+`use_local_mean=true`, `use_inter_node_transformer=false` 기본값을
+적용하면 **새 1층 스위치 외에는 동일**하다. Ulsan seed 245의 변형
+체크포인트를 별도 `test.py`로 복원해 test 656개 샘플에서 기록된
+RMSE 0.7232, MAE 0.3230, MAPE(+1) 15.3154를 확인했다.
+재현 예시(다른 도시·seed는 경로와 `--config-name`만 교체):
+
+```bash
+CUDA_VISIBLE_DEVICES=1 conda run -n DA python train.py --config-name config_ulsan \
+  seed=245 model.use_inter_node_transformer=true \
+  hydra.run.dir=output/experiments/checkpoints/inter_node_3seed_ulsan_seed245 \
+  run_json=output/experiments/inter_node_3seed_ulsan_seed245.json
+```

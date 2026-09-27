@@ -32,6 +32,9 @@ num_fourier_bands: 8
 transformer_layers: 2
 transformer_heads: 4
 transformer_ffn: 128
+# 패치 인코딩 뒤 같은 시각의 전체 노드 임베딩을 1층 Transformer로 교환하는 실험.
+# 기본 false는 기존 채택 모델과 체크포인트를 그대로 유지한다.
+use_inter_node_transformer: false
 history_hidden: 64
 periodic_hidden: 64
 fusion_dim: 128

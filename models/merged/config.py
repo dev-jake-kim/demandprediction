@@ -59,6 +59,9 @@ class MergedDemandConfig(PretrainedConfig):
         transformer_layers: int = 2,
         transformer_heads: int = 4,
         transformer_ffn: int = 128,
+        # 패치별 CLS를 시각마다 전체 노드 토큰으로 묶어 한 층의 Transformer로 교환한다.
+        # 기본값 False는 기존 체크포인트와 계산 경로를 그대로 유지한다.
+        use_inter_node_transformer: bool = False,
         # 'none' = local-only, 'lstm' = 주기 D벡터 융합,
         # 'ma' = local 자기노드 이력/daily/weekly 평균을 노드별 3-way gate로 직접 예측,
         # 'ma_no_local' = 이전 MA: local 원수요 평균 없이 daily/weekly 독립 sigmoid gate,
@@ -137,6 +140,7 @@ class MergedDemandConfig(PretrainedConfig):
         self.transformer_layers = transformer_layers
         self.transformer_heads = transformer_heads
         self.transformer_ffn = transformer_ffn
+        self.use_inter_node_transformer = bool(use_inter_node_transformer)
         if periodic_mode not in ('none', 'lstm', 'ma', 'ma_no_local', 'ema', 'lag_lstm'):
             raise ValueError(
                 "periodic_mode는 'none' | 'lstm' | 'ma' | 'ma_no_local' | 'ema' | 'lag_lstm'여야 함"

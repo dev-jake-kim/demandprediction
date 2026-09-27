@@ -173,3 +173,76 @@ fake 양자화만 끄며, `no-softplus`는 부호 있는 출력을 허용한다.
 평가가 기록된 수치와 일치했다. 20개 전체 학습과 평가는
 `CUDA_VISIBLE_DEVICES=1`(물리 GPU 1)에서 진행했다. 결과 파일의
 `device=cuda:0`은 해당 장치의 프로세스 내부 번호다.
+
+## 5. 채택 MA 모델의 `no-node-adaptive` — 3-seed paired 재학습
+
+표 4의 seed 245 실험·체크포인트를 재사용하고 seed 6835/851을 같은
+train/val/test 분할 `0.70/0.15/0.15`, MAE 손실, 최대 120 epoch,
+도시별 batch 및 기존 val MAE 체크포인트 선택으로 **처음부터 재학습**했다.
+채택 모델 대비 `model.node_adaptive=false`만 적용해 노드별 LSTM ΔW를
+제거했다. `shared_weight_fp8=true`, 지역 패치 Transformer, local MA,
+daily/weekly 3-way gate는 유지했다. **새 노드 간 Transformer는 끈**
+채택 모델(`use_inter_node_transformer=false`)과 비교한다. 아래 변화율은
+동일 seed `(no-node-adaptive/채택 MA−1)×100%`의 평균이다.
+`MAPE(+1)`과 `MAPE(0 제외)`는 서로 다른 분모를 사용한다.
+
+### Ulsan (14×12, batch 24)
+
+| seed | 설정 | MAE | RMSE | MAPE(+1) % | MAPE(0 제외) % |
+|---:|---|---:|---:|---:|---:|
+| 245 | 채택 MA | 0.322653 | 0.720627 | 15.530688 | 59.594836 |
+| 245 | `no-node-adaptive` | 0.321362 | 0.722551 | 15.214317 | 59.069693 |
+| 6835 | 채택 MA | 0.323046 | 0.724833 | 15.253790 | 60.468116 |
+| 6835 | `no-node-adaptive` | 0.321361 | 0.723105 | 15.234762 | 59.155370 |
+| 851 | 채택 MA | 0.323649 | 0.722001 | 15.518695 | 60.668484 |
+| 851 | `no-node-adaptive` | 0.321578 | 0.721176 | 15.359558 | 59.357320 |
+| **평균 ± 표본 sd** | **채택 MA** | **0.323116 ± 0.000502** | **0.722487 ± 0.002145** | **15.434391 ± 0.156520** | **60.243812 ± 0.570889** |
+|  | **`no-node-adaptive`** | **0.321434 ± 0.000125** | **0.722277 ± 0.000993** | **15.269546 ± 0.078620** | **59.194127 ± 0.147678** |
+
+paired 변화율 평균: MAE **-0.521%** (개선 3/3), RMSE **-0.029%**
+(개선 2/3), MAPE(+1) **-1.062%** (개선 3/3), MAPE(0 제외)
+**-1.738%** (개선 3/3). RMSE 차이는 작고 seed 245에서는
+악화했다. 원자료: `output/experiments/ablation_ma_ulsan_seed{245,6835,851}_no-node-adaptive.json`;
+기준선: `output/experiments/ma_localmix_3seed_ulsan_seed{245,6835,851}.json`.
+
+### Porto (10×20, batch 8)
+
+| seed | 설정 | MAE | RMSE | MAPE(+1) % | MAPE(0 제외) % |
+|---:|---|---:|---:|---:|---:|
+| 245 | 채택 MA | 0.489788 | 1.784967 | 15.520057 | 60.650364 |
+| 245 | `no-node-adaptive` | 0.483109 | 1.706731 | 15.357696 | 59.682283 |
+| 6835 | 채택 MA | 0.488421 | 1.750618 | 15.468143 | 59.894078 |
+| 6835 | `no-node-adaptive` | 0.482453 | 1.657810 | 15.959830 | 59.525960 |
+| 851 | 채택 MA | 0.489957 | 1.781163 | 15.618069 | 60.615568 |
+| 851 | `no-node-adaptive` | 0.483064 | 1.703266 | 15.109446 | 60.311598 |
+| **평균 ± 표본 sd** | **채택 MA** | **0.489389 ± 0.000843** | **1.772249 ± 0.018829** | **15.535423 ± 0.076135** | **60.386670 ± 0.426952** |
+|  | **`no-node-adaptive`** | **0.482876 ± 0.000366** | **1.689269 ± 0.027300** | **15.475657 ± 0.437292** | **59.839947 ± 0.415873** |
+
+paired 변화율 평균: MAE **-1.331%** (개선 3/3), RMSE **-4.686%**
+(개선 3/3), MAPE(+1) **-0.375%** (개선 2/3), MAPE(0 제외)
+**-0.904%** (개선 3/3). RMSE/MAE 개선은 세 seed에서 일관되지만
+MAPE(+1)는 seed 6835에서 악화한다. seed 3개만으로 유의성이나
+다른 데이터로의 일반화를 주장하지 않는다. 기본값은 이번 비교에서
+자동 변경하지 않는다.
+
+원자료: `output/experiments/ablation_ma_porto_seed{245,6835,851}_no-node-adaptive.json`;
+기준선: `output/experiments/ma_localmix_3seed_porto_seed{245,6835,851}.json`.
+두 도시 체크포인트는 `output/experiments/checkpoints/` 아래 결과 JSON과
+동명 디렉터리다. seed 245는 표 4의 이전 전체 학습을 재사용하고
+seed 6835/851의 전체 학습은 `CUDA_VISIBLE_DEVICES=1`(물리 GPU 1)에서
+수행했다. 결과 JSON의 `device=cuda:0`은 가시 GPU 재번호다.
+6개 체크포인트를 같은 도시·seed의 채택 체크포인트와 대조했으며,
+오래된 설정 파일에 없는 기본값 `use_local_view=true`,
+`use_local_mean=true`, `use_inter_node_transformer=false`를 보정하면
+`node_adaptive`와 그에 따른 `node_adaptive_indices` 외 모델 설정이 같다.
+
+Porto seed 6835의 새 체크포인트를 별도 `test.py`로 복원해 test 1,314개
+샘플에서 RMSE 1.6578, MAE 0.4825, MAPE(+1) 15.9598을 다시 확인했다.
+새 seed 재현 예시(도시·seed에 맞게 config와 경로 변경):
+
+```bash
+CUDA_VISIBLE_DEVICES=1 conda run -n DA python train.py --config-name config_porto \
+  seed=6835 model.node_adaptive=false ablation=no-node-adaptive \
+  hydra.run.dir=output/experiments/checkpoints/ablation_ma_porto_seed6835_no-node-adaptive \
+  run_json=output/experiments/ablation_ma_porto_seed6835_no-node-adaptive.json
+```
