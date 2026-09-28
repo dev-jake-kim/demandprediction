@@ -29,7 +29,7 @@ from models.merged.modules import (
     LocalHistoryEncoder,
     PeriodicLSTMEncoder,
 )
-from train import build_dataset_kwargs
+from train import build_dataset_kwargs, select_node_adaptive_indices
 
 ROOT = Path(__file__).resolve().parent
 
@@ -52,6 +52,10 @@ def _check_dataset(city: str, device: torch.device) -> dict:
     train_weather = train_set.weather[train_set.time_step : train_set.train_end]
     weather_mean = train_weather.mean(axis=0)
     weather_std = train_weather.std(axis=0).clip(min=1e-6)
+    node_adaptive_indices = (
+        select_node_adaptive_indices(train_set, float(cfg.model.node_adaptive_min_demand))
+        if cfg.model.node_adaptive else None
+    )
     if not (train_set.train_end == val_set.train_end == test_set.train_end):
         raise AssertionError(f'{city}: split bounds differ between dataset views')
     if not (train_set.val_end == val_set.val_end == test_set.val_end):
@@ -67,6 +71,7 @@ def _check_dataset(city: str, device: torch.device) -> dict:
         retrieval_train_end=train_set.train_end,
         weather_mean=weather_mean.tolist(),
         weather_std=weather_std.tolist(),
+        node_adaptive_indices=node_adaptive_indices,
         **OmegaConf.to_container(cfg.model, resolve=True),
     )
     model = MergedDemandModel(model_config).to(device)
@@ -137,6 +142,7 @@ def _check_dataset(city: str, device: torch.device) -> dict:
         'data_path': str(path),
         'shape': [train_set.total_steps, train_set.height, train_set.width],
         'split': {'train_end': train_set.train_end, 'val_end': train_set.val_end},
+        'node_adaptive_nodes': len(node_adaptive_indices) if node_adaptive_indices else 0,
         'samples': {'train': len(train_set), 'val': len(val_set), 'test': len(test_set)},
         'target_time_probe': target_time,
         'attention_shape': list(weights.shape),

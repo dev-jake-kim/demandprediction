@@ -31,8 +31,8 @@ dataset or training loop.
 | `train.py` | Hydra + `Trainer` 학습 진입점, early stopping, 결과 JSON | training schedule or CLI |
 | `test.py` | 체크포인트 단독 평가 | 평가 지표/스플릿 |
 | `validate_merged.py` | structural, gradient, mask, and causal checks | regression checks |
-| `configs/config_ulsan.yaml` / `configs/config_porto.yaml` | 학습 하이퍼파라미터(원본 `training:` 블록과 1:1) + `stage2:` 블록 — 도시별 루트 config | 학습 스케줄, `--config-name` 선택, 2-stage 설정 |
-| `configs/model/merged_ulsan.yaml` / `configs/model/merged_porto.yaml` | 모델 하이퍼파라미터 + ablation 스위치 기본값 — 도시별 최적값(`docs/MERGED_TUNING_RESULTS.md`) | dimensions, lags, retrieval policy, `weekday_dim`, `hour_dim` |
+| `configs/config_ulsan.yaml` / `configs/config_porto.yaml` | 도시별 `optimizer_schedule`, `stage2:` 블록, 시간순 70/15/15 분할 | LR 스케줄, 배치, `--config-name` |
+| `configs/model/merged_ulsan.yaml` / `configs/model/merged_porto.yaml` | 모델 폭·dropout·ablation 스위치 — 종전 d_model 튜닝 기록은 `docs/MERGED_TUNING_RESULTS.md` | dimensions, retrieval policy, `weekday_dim`, `hour_dim` |
 | `run_ablation.sh` / `run_seeds.sh` | 큐/다중 시드 러너 (ablation 이름 → Hydra 오버라이드) | 실행 조합 |
 
 ## Directory layout
@@ -42,7 +42,7 @@ dataset_frame/unified_demand_dataset.py   # temporal-grid Dataset
 models/merged/
 ├── config.py               # MergedDemandConfig(PretrainedConfig)
 ├── modeling.py             # MergedDemandModel(PreTrainedModel) — one graph
-├── losses.py               # combined | mae objectives
+├── losses.py               # combined | mae | rmse_mape objectives
 ├── metrics.py              # RMSE / MAE / MAPE(+1) / MAPE(0제외)
 └── modules/                # independently maintainable model blocks
     ├── embeddings.py
@@ -98,9 +98,9 @@ reconstructed from the temporal grid when a model is created.
 ## 노드별 LSTM weight offset (`node_adaptive`)
 
 lora 브랜치의 node_adaptive(W + ΔW)를 이 모델의 **history LSTM 하나에만** 옮긴 것이다.
-`model.node_adaptive=true`일 때만 켜지며, 기본값은 `false`다 — 꺼져 있으면 delta 파라미터가
-아예 만들어지지 않아 `state_dict`가 이 기능 추가 이전과 정확히 같고, 기존 체크포인트와
-`tests/test_merged_parity.py`가 그대로 유지된다.
+`model.node_adaptive=true`일 때만 켜지며, 현재 도시별 모델 설정은 `true`다.
+꺼져 있으면 delta 파라미터가 아예 만들어지지 않아 `state_dict`가 기능 추가 이전과
+같고 기존 체크포인트 및 `tests/test_merged_parity.py`와 호환된다.
 
 ```text
 weight_ih = history_lstm.weight_ih_l0 + node_delta_weight_ih   # (A, 4h, d_model+extra_dim)
@@ -109,11 +109,11 @@ bias      = bias_ih_l0 + bias_hh_l0   + node_delta_bias        # (A, 4h)
 ```
 
 `A`는 전체 노드가 아니라 **train 구간 평균 수요가 `node_adaptive_min_demand`(기본 0.8)를
-넘는 노드** 수다 — ulsan 44/168(26.2%), porto 49/380(12.9%). 수요가 거의 0인 노드(porto는
-노드 중앙값이 0.009)에 노드당 36,864개 파라미터를 주면 노이즈를 외울 용량만 늘어나고,
-파라미터가 base의 25~53배로 불어난다. 선택 기준은 시간 리크를 막기 위해 train 구간에서만
-계산하며(`train.py: select_node_adaptive_indices`), 결과 노드 목록은 `config.node_adaptive_indices`에
-저장돼 `from_pretrained`가 같은 마스크를 복원한다.
+넘는 노드** 수다. 현재 격자는 Ulsan 14×12=168, Porto 10×20=200노드이고
+선택 노드 수는 새 70% 학습 구간에서 다시 계산한다. 노드당 delta 파라미터는 모델 폭에
+따라 달라지므로 결과 JSON의 `node_delta_params`를 확인한다. 선택 기준은 시간 리크를
+막기 위해 train 구간에서만 계산하며(`train.py: select_node_adaptive_indices`),
+결과 노드 목록은 `config.node_adaptive_indices`에 저장돼 같은 마스크를 복원한다.
 
 설계상 지켜야 할 것들:
 
@@ -140,7 +140,7 @@ bias      = bias_ih_l0 + bias_hh_l0   + node_delta_bias        # (A, 4h)
 | | stage 1 | stage 2 |
 |---|---|---|
 | ΔW | `requires_grad_(False)` (0 고정) | `requires_grad_(True)` |
-| loss | `model.loss_type` (기본 `combined`) | `stage2.loss` (기본 `rmse_mape`) |
+| loss | `model.loss_type` (Ulsan 기본 `mae`, Porto `combined`) | `stage2.loss` (기본 `rmse_mape`) |
 | lr | `train.learning_rate` | `stage2.learning_rate` (기본 1e-4) |
 | best 기준 | `eval_loss` | `rmse_mape_objective` |
 | output_dir | `<run>/stage1` | `<run>/stage2` |
@@ -160,6 +160,21 @@ bias      = bias_ih_l0 + bias_hh_l0   + node_delta_bias        # (A, 4h)
 - 결과 JSON은 `node_adaptive`/`node_adaptive_nodes`/`node_delta_params`/`stages`/`stage1`/
   `stage1_test`/`best_metric` 필드를 추가로 남기고, 파일 이름에 `_nodeadaptive`가 붙어
   기존 단일 stage 결과를 덮어쓰지 않는다.
+
+### 설정 이식 실험 (단일-stage 기록과 신규 2-stage 구분)
+
+`tmp-extracted`에서 검증한 학습 설정을 이식했다. Ulsan은 `d_model=16`,
+batch 24, stage 1 MAE 손실이고 Porto는 `d_model=64`, batch 8,
+stage 1 combined 손실이다. 두 도시 모두 AdamW lr=0.001·weight decay=0.05,
+warmup 5 epoch (1e-6→stage LR), cosine 60 epoch (stage LR→0.0001),
+이후 0.0001, 각 stage 최대 120 epoch를 사용한다. stage 2는 lr=0.0001,
+`10 * RMSE + MAPE(+1)` 손실이며 그 검증 지표로 best를 선택한다.
+출력/FFN dropout 0.1을 유지하고 **어텐션 가중치 dropout만 0**으로 설정한다.
+기존 체크포인트에 `attention_dropout`이 없으면 종전처럼 `dropout`을 따른다.
+이전 `output/experiments/tmp_settings_3seed_*`는 `node_adaptive=false`,
+80/10/10인 단일-stage 실험이다. 현재 도시별 설정은 `node_adaptive=true`,
+70/15/15로 2-stage를 실행한다. split 및 stage가 모두 바뀌었으므로 이전 테스트
+수치와 직접 비교하지 않는다. 자세한 기록은 `docs/MERGED_TUNING_RESULTS.md`를 참고한다.
 
 ## Maintenance rules
 

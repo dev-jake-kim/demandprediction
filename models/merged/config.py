@@ -33,6 +33,7 @@ class MergedDemandConfig(PretrainedConfig):
         periodic_hidden: int = 64,
         fusion_dim: int = 128,
         dropout: float = 0.1,
+        attention_dropout: float | None = None,
         retrieval_grid_path: str | None = None,
         retrieval_k: int = 20,
         retrieval_chunk_size: int = 256,
@@ -75,6 +76,8 @@ class MergedDemandConfig(PretrainedConfig):
         self.periodic_hidden = periodic_hidden
         self.fusion_dim = fusion_dim
         self.dropout = dropout
+        # 이전 체크포인트에 필드가 없으면 원래 Transformer의 dropout 하나를 재사용한다.
+        self.attention_dropout = dropout if attention_dropout is None else float(attention_dropout)
         # 검색 브랜치가 읽는 temporal grid(.npy)의 절대경로. train.py가 주입한다.
         self.retrieval_grid_path = retrieval_grid_path
         self.retrieval_k = retrieval_k

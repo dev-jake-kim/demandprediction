@@ -28,6 +28,7 @@ class LocalHistoryEncoder(nn.Module):
         transformer_ffn: int,
         history_hidden: int,
         dropout: float,
+        attention_dropout: float | None = None,
         extra_dim: int = 0,
         weather_cls_dim: int = 0,
         use_neighbors: bool = True,
@@ -73,6 +74,11 @@ class LocalHistoryEncoder(nn.Module):
             activation="gelu",
             batch_first=True,
             norm_first=True,
+        )
+        # SDPA 한계에 영향을 주는 어텐션 가중치 dropout만 별도로 제어한다.
+        # 출력/FFN dropout은 기존 dropout 값 그대로 유지한다.
+        encoder_layer.self_attn.dropout = (
+            dropout if attention_dropout is None else attention_dropout
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer,

@@ -1,11 +1,10 @@
 """merged 모델(로컬 히스토리 + daily/weekly 주기 + 인과적 검색 + 브랜치 어텐션) 학습 스크립트.
 
-원본 ``merged_model/train.py``의 수동 학습 루프를 이 저장소 공용 관례(Hydra + HF ``Trainer``)로
-옮긴 것이다. 학습 하이퍼파라미터(gradient clipping 5.0, 고정 LR, epochs 2000,
-num_workers 0, best = val loss 최소, torch_compile 없음)는 원본과 1:1로 맞춰 두었다.
-예외는 early stopping으로, 도시별 학습 기록을 시뮬레이션해 원본(min_epochs 0 / patience 20)과
-**같은 best_epoch를 내는 선에서** 줄였다 — ulsan은 min_epochs 13 / patience 8, porto는 줄일
-실익이 없어 원본 유지. 근거는 각 configs/config_*.yaml의 callbacks 블록 주석에 있다.
+원본 ``merged_model/train.py``의 계산 그래프를 이 저장소 공용 관례
+(Hydra + HF ``Trainer``)로 포팅했다. 이번 설정 실험은 원본 80/10/10
+분할을 유지하면서 d_model·배치·정규화 및 ADFormer의 epoch 단위
+warmup-cosine LR을 적용한다. 원래 고정 LR/2000 epoch의 기록과
+스케줄이 다르므로, 기존 early-stopping 단축값은 그대로 재사용하지 않는다.
 
 도시마다 최적 하이퍼파라미터가 달라 루트 config를 도시별로 분리했다 — 기본값은
 ``configs/config_ulsan.yaml``, porto는 ``--config-name config_porto``로 명시한다::
@@ -32,11 +31,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from pathlib import Path
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
+from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import Subset
 from transformers import EarlyStoppingCallback, Trainer, TrainerCallback, TrainingArguments, set_seed
 
@@ -60,15 +61,14 @@ logger = logging.getLogger(__name__)
 # getBlocksGrid()가 dim3(ceil_div(num_queries, kQueriesPerBlock), num_heads, num_batches)라
 # num_batches가 blocks.z로 들어가는데 y/z 차원 상한이 65535다(x만 2^31-1).
 #
-# models/merged/modules/history.py의 LocalHistoryEncoder는 (batch, time_step, H*W) 전체를
-# (batch*time_step*H*W, 1+neighbors, d_model)로 펼쳐 넣으므로, 노드 수가 많은 도시(예: porto
-# 19*20=380)는 batch_size=8만 돼도 8*24*380=72,960으로 한계를 넘는다(ulsan 14*12=168은
-# 32,256이라 안 넘음). "어텐션 하나가 크다"가 아니라 "26토큰짜리 작은 어텐션이 너무 많다"가
-# 문제다.
+# models/merged/modules/history.py의 LocalHistoryEncoder는 배치×시간×노드로 펼친다.
+# Ulsan의 batch=24이면 24*24*168=96,768행이므로 어텐션 가중치 dropout만 0으로
+# 설정한다. Porto의 batch=8은 8*24*200=38,400행이다. 출력/FFN dropout은
+# 여전히 0.1이며 batch 제한을 결정하는 것은 어텐션 가중치 dropout이다.
 #
 # 이 백엔드를 끄는 우회는 쓰지 않는다 — fallback(math) 백엔드가 어텐션 행렬을 그대로 만들어
-# 메모리를 훨씬 더 써서 d_model이 크면 오히려 OOM이 난다. 대신 아래 main()에서 dropout>0일
-# 때만 배치 크기를 낮춘다. dropout=0이면 이 한계가 없으므로 한계는 VRAM이 된다.
+# 메모리를 훨씬 더 써서 d_model이 크면 오히려 OOM이 난다. 아래에서는
+# 어텐션 가중치 dropout>0일 때만 배치를 낮춘다(출력/FFN dropout은 무관하다).
 SDPA_BATCH_LIMIT = 65535
 
 # ablation 방식: 모듈을 지우지 않고, 그 모듈이 결과로 이어지는 텐서만 0으로 바꾼다.
@@ -120,6 +120,79 @@ class MinEpochEarlyStoppingCallback(EarlyStoppingCallback):
         callback_state = super().state()
         callback_state['args']['min_epochs'] = self.min_epochs
         return callback_state
+
+
+class WarmupCosineAnnealingLR(LRScheduler):
+    """ADFormer와 같은 epoch 단위 warmup 5 + cosine 60 + eta_min 유지."""
+
+    def __init__(
+        self, optimizer, T_max, warmup_t=0, warmup_lr_init=1e-5, eta_min=0,
+        last_epoch=-1,
+    ) -> None:
+        self.T_max = T_max
+        self.warmup_t = warmup_t
+        self.warmup_lr_init = warmup_lr_init
+        self.eta_min = eta_min
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_t:
+            warmup_lr = (
+                self.warmup_lr_init
+                + (self.base_lrs[0] - self.warmup_lr_init) * self.last_epoch / self.warmup_t
+            )
+            return [warmup_lr for _ in self.base_lrs]
+        epoch_in_cosine_phase = self.last_epoch - self.warmup_t
+        if epoch_in_cosine_phase >= self.T_max:
+            return [self.eta_min for _ in self.base_lrs]
+        cosine_lr = (
+            self.eta_min + (self.base_lrs[0] - self.eta_min)
+            * (1 + math.cos(math.pi * epoch_in_cosine_phase / self.T_max)) / 2
+        )
+        return [cosine_lr for _ in self.base_lrs]
+
+
+class PerEpochWarmupCosineAnnealingLR(WarmupCosineAnnealingLR):
+    """HF Trainer의 optimizer-step 호출을 ADFormer의 epoch-step으로 묶는다."""
+
+    def __init__(self, optimizer, steps_per_epoch: int, **kwargs) -> None:
+        if steps_per_epoch < 1:
+            raise ValueError(f'steps_per_epoch는 1 이상이어야 함: got {steps_per_epoch}')
+        self.steps_per_epoch = steps_per_epoch
+        self._pending_steps = 0
+        self._initialized = False
+        super().__init__(optimizer, **kwargs)
+        self._initialized = True
+
+    def step(self, *args, **kwargs):
+        if not self._initialized:
+            return super().step(*args, **kwargs)
+        self._pending_steps += 1
+        if self._pending_steps < self.steps_per_epoch:
+            return None
+        self._pending_steps = 0
+        return super().step(*args, **kwargs)
+
+
+class WarmupCosineTrainer(Trainer):
+    """Trainer의 weight-decay 파라미터 그룹은 유지하고 스케줄러만 바꾼다."""
+
+    def __init__(self, *args, schedule: dict, steps_per_epoch: int, **kwargs) -> None:
+        self._schedule = schedule
+        self._steps_per_epoch = steps_per_epoch
+        super().__init__(*args, **kwargs)
+
+    def create_scheduler(self, num_training_steps: int, optimizer=None):
+        if self.lr_scheduler is None:
+            self.lr_scheduler = PerEpochWarmupCosineAnnealingLR(
+                optimizer if optimizer is not None else self.optimizer,
+                steps_per_epoch=self._steps_per_epoch,
+                T_max=int(self._schedule['cosine_epochs']),
+                warmup_t=int(self._schedule['warmup_epochs']),
+                warmup_lr_init=float(self._schedule['warmup_lr_init']),
+                eta_min=float(self._schedule['eta_min']),
+            )
+        return self.lr_scheduler
 
 
 def build_dataset_kwargs(cfg: DictConfig) -> dict:
@@ -303,29 +376,29 @@ def main(cfg: DictConfig) -> None:
     output_dir = HydraConfig.get().runtime.output_dir
     train_cfg = OmegaConf.to_container(cfg.train, resolve=True)
     early_stopping_cfg = cfg.callbacks.early_stopping
+    schedule_cfg = OmegaConf.to_container(cfg.optimizer_schedule, resolve=True)
+    schedule_name = schedule_cfg.get('name')
+    if schedule_name not in (None, 'warmup_cosine'):
+        raise ValueError(f"알 수 없는 optimizer_schedule.name: {schedule_name!r}")
 
-    # SDPA_BATCH_LIMIT 주석 참고. PyTorch의 검사는 dropout이 켜져 있을 때만 건다
-    # (attention.cu: `if (batch_size > MAX_BATCH_SIZE) TORCH_CHECK(dropout_p == 0.0, ...)`),
-    # 그래서 dropout=0이면 이 한계가 아예 적용되지 않는다 — 실측으로 porto batch 8
-    # (72,960행)이 forward/backward 모두 통과하는 것을 확인했다. dropout=0인데도 배치를
-    # 깎으면 쓸 수 있는 배치를 근거 없이 버리는 셈이라, 클램프는 dropout>0일 때만 건다.
-    # train/eval 배치 크기를 같이 낮춰야 train 중간의 eval도 안전하다.
+    # SDPA의 65,535행 제한은 어텐션 가중치 dropout만 검사한다.
+    # 출력/FFN dropout=0.1은 유지해도 된다. train/eval 배치를 같이 검사한다.
     nodes = train_ds.height * train_ds.width
     per_sample = train_ds.time_step * nodes
-    if float(cfg.model.dropout) > 0.0:
+    if model_config.attention_dropout > 0.0:
         max_batch = max(1, SDPA_BATCH_LIMIT // per_sample)
         for key in ('per_device_train_batch_size', 'per_device_eval_batch_size'):
             if train_cfg[key] > max_batch:
                 logger.warning(
                     f'{key}={train_cfg[key]}는 time_step({train_ds.time_step}) * nodes({nodes})'
                     f'={per_sample}와 곱하면 SDPA_BATCH_LIMIT({SDPA_BATCH_LIMIT})을 넘어'
-                    f'memory-efficient attention이 죽는다(dropout={cfg.model.dropout}>0)'
+                    f'memory-efficient attention이 죽는다(attention_dropout={model_config.attention_dropout}>0)'
                     f' -> {max_batch}로 낮춘다'
                 )
                 train_cfg[key] = max_batch
     else:
         logger.info(
-            f'[batch] dropout=0이라 SDPA_BATCH_LIMIT 클램프를 건너뛴다 '
+            f'[batch] attention_dropout=0이라 SDPA_BATCH_LIMIT 클램프를 건너뛴다 '
             f'(rows = batch * {per_sample} = '
             f'{train_cfg["per_device_train_batch_size"] * per_sample:,}). 이제 한계는 VRAM이다.'
         )
@@ -353,7 +426,7 @@ def main(cfg: DictConfig) -> None:
             output_dir=output_dir if stage_dir is None else str(Path(output_dir) / stage_dir),
             **stage_cfg,
         )
-        return Trainer(
+        trainer_kwargs = dict(
             model=model,
             args=stage_args,
             train_dataset=train_set,
@@ -366,6 +439,25 @@ def main(cfg: DictConfig) -> None:
                     early_stopping_patience=early_stopping_cfg.early_stopping_patience,
                 ),
             ],
+        )
+        if schedule_name is None:
+            return Trainer(**trainer_kwargs)
+        accumulation = int(stage_cfg.get('gradient_accumulation_steps', 1) or 1)
+        steps_per_epoch = max(
+            1, math.ceil(
+                math.ceil(len(train_set) / int(stage_cfg['per_device_train_batch_size']))
+                / accumulation
+            ),
+        )
+        logger.info(
+            f'[schedule] ADFormer warmup-cosine: warmup {schedule_cfg["warmup_epochs"]} '
+            f'epochs ({schedule_cfg["warmup_lr_init"]} -> {learning_rate}), '
+            f'cosine {schedule_cfg["cosine_epochs"]} epochs '
+            f'({learning_rate} -> {schedule_cfg["eta_min"]}), '
+            f'이후 {schedule_cfg["eta_min"]} | steps/epoch={steps_per_epoch}'
+        )
+        return WarmupCosineTrainer(
+            schedule=schedule_cfg, steps_per_epoch=steps_per_epoch, **trainer_kwargs
         )
 
     def trainable_count(trainer: Trainer) -> int:

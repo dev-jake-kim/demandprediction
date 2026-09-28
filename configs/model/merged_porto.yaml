@@ -17,6 +17,8 @@ history_hidden: 64
 periodic_hidden: 64
 fusion_dim: 128
 dropout: 0.10
+# 어텐션 가중치만 0으로 두며 출력/FFN dropout=0.1은 유지한다.
+attention_dropout: 0.0
 retrieval_k: 20
 retrieval_chunk_size: 256
 # 검색 후보 범위. observed_past = tau < target_time(원본 기본값), train_prefix = train split까지만.
@@ -43,14 +45,9 @@ use_neighbors: true
 use_softplus: true
 
 # --- 노드별 LSTM weight offset (lora 브랜치 node_adaptive와 같은 구조) ---
-# history LSTM의 weight/bias를 노드마다 다르게 쓴다(공유 W + node id별 ΔW, 0으로 초기화).
-# false면 이 필드가 없던 시절과 완전히 동일하게 동작한다 — 기존 ablation/튜닝 결과와의
-# 비교 기준이 유지되도록 기본값은 false다. 2-stage 학습(train.py)의 stage 2에서만 켠다.
-node_adaptive: false
-# ΔW를 받을 노드: train 구간 평균 수요가 이 값을 넘는 노드만. porto 기준 49/380 (12.9%).
-# porto는 노드 중앙값이 0.009로 절반 이상이 사실상 항상 0이라, 전 노드에 주면
-# (14.0M 파라미터, base의 53배) 노이즈를 외울 용량만 늘어난다. 이 기준으로 1.81M까지 준다.
-# 실제 노드 id 목록(node_adaptive_indices)은 train.py가 train 구간에서 계산해 주입한다.
+# history LSTM의 공유 W에 선택된 노드별 ΔW를 더한다. stage 1에서 0으로 고정한 뒤
+# stage 2에서 해제한다. 대상 노드는 70% train 구간의 평균 수요로만 선택한다.
+node_adaptive: true
 node_adaptive_min_demand: 0.8
 
 # 'combined'(저장소 공용 CombinedLoss, 다른 모든 브랜치와 동일한 목적함수) |

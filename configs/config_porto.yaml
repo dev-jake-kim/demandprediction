@@ -2,10 +2,9 @@
 # (기본값, --config-name 생략). 이 브랜치(tmp)의 유일한 모델이라 다른 model:/train.py는 없다
 # (models/config.py, models/modeling.py 부재 — models/__init__.py 참고).
 #
-# train: 블록의 값은 전부 원본 merged_model/train.py + merged_model/config.yaml의
-# training: 블록에서 그대로 가져온 것이다. TrainingArguments의 기본값과 다른 항목
-# (max_grad_norm, lr_scheduler_type, warmup_ratio, batch_size, num_workers, torch_compile,
-# metric_for_best_model)은 원본 수동 학습 루프와 정확히 일치시키기 위해 명시한다.
+# tmp의 계산 그래프에서 노드별 ΔW를 2-stage로 학습한다.
+# 이번 실험은 시간순 0.70/0.15/0.15 분할이다. 이전 80/10/10 결과와 직접 비교하지 않는다.
+# Porto에서는 batch=8·d_model=64, combined stage 1 손실을 유지한다.
 defaults:
   - dataset: porto
   - model: merged_porto
@@ -15,11 +14,10 @@ project_name: merged
 seed: 2026
 device: cuda
 
-# 이 모델은 다른 데이터셋 사용자와 다른 분할 비율(0.80/0.10/0.10)을 쓴다.
-# configs/dataset/*.yaml의 기본값(0.7/0.15)을 여기서 로컬 오버라이드한다.
+# 데이터셋 기본값을 명시적으로 고정해 train/val/test를 70/15/15로 분할한다.
 dataset:
-  train_ratio: 0.80
-  val_ratio: 0.10
+  train_ratio: 0.70
+  val_ratio: 0.15
 
 # UnifiedDemandDataset의 daily/weekly lag 구성. 원본 merged_model/config.yaml의 data: 블록.
 # time_step은 configs/dataset/*.yaml의 것을 쓴다.
@@ -31,27 +29,24 @@ data:
   lag_radius: 0
 
 train:
-  # 이전에는 4였다. porto를 19x20=380노드로 잘못 알고 있을 때 SDPA 한계
-  # (batch*time_step*nodes <= 65535)를 넘지 않으려고 낮춘 값이다.
-  # 정본 격자는 10x20=200노드라 8*24*200=38,400으로 한계에서 멀고, 포팅 전 merged_model도
-  # 원래 8을 썼다. ulsan과 같은 값이 되어 두 도시 비교의 교란 요인도 사라진다.
+  # 정본 10×20 격자에서 원형 모델과 같은 batch=8을 유지한다.
+  # Ulsan은 더 작은 d_model=16에서 batch=24를 별도 적용한다.
   per_device_train_batch_size: 8
   per_device_eval_batch_size: 8
   dataloader_num_workers: 0
   # 원본은 torch.compile을 쓰지 않는다.
   torch_compile: false
   disable_tqdm: true
-  # 원본: epochs 2000 / patience 20 (min_epochs 없음 -> callbacks.early_stopping.min_epochs: 0)
-  num_train_epochs: 2000
+  # 새 스케줄은 최대 120 epoch 동안 학습한다(조기 종료는 별도).
+  num_train_epochs: 120
   remove_unused_columns: false
   save_strategy: epoch
   save_total_limit: 1
   # 원본: torch.optim.AdamW(lr, weight_decay). betas/eps는 TrainingArguments 기본값과 동일.
   optim: adamw_torch
   learning_rate: 1e-3
-  weight_decay: 1e-4
-  # 원본에는 LR 스케줄러도 warmup도 없다(고정 lr). TrainingArguments 기본값은 linear+warmup이라
-  # 반드시 덮어써야 한다.
+  weight_decay: 0.05
+  # HF 기본 스케줄 대신 아래 epoch 단위 ADFormer warmup-cosine을 적용한다.
   lr_scheduler_type: constant
   warmup_ratio: 0.0
   # 원본: clip_grad_norm_(max_norm=5.0). TrainingArguments 기본값은 1.0.
@@ -61,15 +56,21 @@ train:
   logging_strategy: epoch
   eval_strategy: epoch
   load_best_model_at_end: true
-  # 원본: val loss(학습에 쓴 손실 자체) 최솟값으로 best 선택.
+  # stage 1은 val loss 최소; stage 2는 train.py에서 전체 val의 rmse_mape_objective로 교체한다.
   metric_for_best_model: loss
   greater_is_better: false
   seed: ${seed}
   full_determinism: false
 
-# 2-stage 학습의 stage 2(노드별 ΔW 해제 후 finetuning) 전용 설정.
-# 나머지는 train 블록을 그대로 재사용한다. model.node_adaptive=false면 쓰이지 않는다
-# (그 경우 지금까지와 동일한 단일 stage 학습이다). 도시마다 체크포인트가 다르므로
+optimizer_schedule:
+  name: warmup_cosine
+  warmup_epochs: 5
+  warmup_lr_init: 1.0e-06
+  cosine_epochs: 60
+  eta_min: 0.0001
+
+# node_adaptive=true에서 실행하는 stage 2(노드별 ΔW 해제 후 finetuning) 전용 설정.
+# 나머지는 train 블록을 그대로 재사용한다. 도시마다 체크포인트가 다르므로
 # init_from은 -m 멀티런으로 공유하지 말고 도시별로 따로 지정해야 한다.
 stage2:
   # stage 1의 1/10. 수렴한 공유 가중치에서 크게 이탈하지 않으면서 ΔW가 움직일 여지는 준다.
@@ -86,27 +87,8 @@ stage2:
   init_from: null
 
 callbacks:
+  # 70/15/15의 2-stage LR 궤적에는 기존 80/10/10 조기 종료 단축 기록을 적용하지 않는다.
   early_stopping:
-    # 원본은 무조건 patience를 센다(최소 epoch 제한 없음).
-    #
-    # **porto는 ulsan과 달리 이 값을 낮출 실익이 없어 원본값을 유지한다.**
-    # 모듈 ablation을 제외한 porto 학습 기록 26건을 (min_epochs, patience) 격자로
-    # 시뮬레이션한 결과:
-    #
-    #   min=0  pat=20  (원본)   총 801 epoch            여유 7
-    #   min=0  pat=13           총 675 epoch (-15.7%)   여유 0
-    #   min=28 pat=1            총 655 epoch (-18.2%)   여유 0
-    #   min=20 pat=8            결과 깨짐
-    #   min=18 pat=10           결과 깨짐
-    #
-    # ulsan은 긴 정체가 epoch 12~17에 몰려 있어 min_epochs로 잘라낼 수 있지만, porto는
-    # epoch 10~28에 넓게 퍼져 있어(G=12 @ep28, G=11 @ep24/20/14) 잘라낼 지점이 없다.
-    # 최선인 min=28/pat=1도 절감은 2.5%p 더일 뿐인데 개선이 한 번만 멈추면 바로 종료라
-    # 실전에서 위험하다. 절감 15.7%를 위해 여유 7 -> 0을 내주는 건 남는 장사가 아니다.
-    #
-    # 참고로 patience=8로 낮추면 4건이 깨진다. 특히 tune_porto_periodic128은 epoch 2에서
-    # 20 epoch 가까이 정체하다 22에서 갱신되는 패턴이라 best가 ep 2로 앞당겨지고 val이
-    # +5.12% 나빠진다 — porto 튜닝에서 RMSE를 가장 크게 개선했던(-4.0%) 변종이 이것이다.
     min_epochs: 0
     early_stopping_patience: 20
 

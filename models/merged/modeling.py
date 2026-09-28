@@ -148,6 +148,7 @@ class MergedDemandModel(PreTrainedModel):
             transformer_ffn=config.transformer_ffn,
             history_hidden=config.history_hidden,
             dropout=config.dropout,
+            attention_dropout=config.attention_dropout,
             extra_dim=self.extra_dim,
             weather_cls_dim=self.weather_cls_dim,
             use_neighbors=self.use_neighbors,
