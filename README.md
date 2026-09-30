@@ -1,8 +1,8 @@
 # gir
 
 grid 단위 택시 수요 예측. `preprocessing/{ulsan,porto}`가 원본 데이터를 `data/raw/{city}_temporal_grid.npy`로
-전처리하고, `dataset_frame`/`models`가 그 npy로 학습/평가한다. 구조는 `docs/STRUCTURE.md`, 모델 설계는
-`docs/MODEL_PLAN.md` 참고.
+전처리하고, `dataset_frame`/`models`가 그 npy로 학습/평가한다. 모델·데이터·학습 사양은
+[`docs/SPEC.md`](docs/SPEC.md)가 기준이다.
 
 ## 환경
 
@@ -13,17 +13,14 @@ conda activate DA
 ## 모델
 
 로컬 히스토리 인코더 + daily/weekly 주기 브랜치 + 브랜치 어텐션을
-`MergedDemandModel`로 합쳤다. 기본값에서는 tmp-extracted처럼 검색을
-pass하여 raw grid를 검색용으로 적재하지 않고 neural 예측만 사용한다.
+`MergedDemandModel`로 합쳤다. 기본값은 검색 pass(neural 예측만 사용)이고,
 `model.use_retrieval=true`를 명시하면 인과적 검색과 출력 게이트를 켠다.
-설계는 `docs/MERGED_ARCHITECTURE.md`, 실험은 `docs/MERGED_TUNING_RESULTS.md`.
 
 ## 학습 (train.py)
 
-Hydra로 설정을 관리한다. **도시마다 최적 하이퍼파라미터가 달라 루트 config가 도시별로 분리돼
-있다** (`configs/config_ulsan.yaml` + `configs/model/merged_ulsan.yaml`, `configs/config_porto.yaml`
-+ `configs/model/merged_porto.yaml`, 둘 다 `configs/dataset/*.yaml` 공유). 근거는
-`docs/MERGED_TUNING_RESULTS.md`.
+Hydra로 설정을 관리한다. 루트 config가 도시별로 분리돼 있다
+(`configs/config_ulsan.yaml` + `configs/model/merged_ulsan.yaml`, `configs/config_porto.yaml`
++ `configs/model/merged_porto.yaml`, 둘 다 `configs/dataset/*.yaml` 공유).
 
 ```bash
 python train.py                                            # ulsan, 검색 pass (기본값)
@@ -33,22 +30,17 @@ python validate_merged.py --device cpu                     # 학습 전 빠른 �
 ```
 
 - 결과(로그, 체크포인트)는 `output/${project_name}/{날짜}/{시간}/`에 저장된다 (`hydra.run.dir`).
-- 결과 요약 JSON은 `output/merged/runs/<city>_<loss_type>_<ablation>_seed<seed>.json`에도 남는다
-  (`run_ablation.sh`/`run_seeds.sh` 등 기존 도구가 존재 여부로 진행 상황을 판단하는 파일).
-- 학습이 끝나면 `trainer.save_model(output_dir)`로 `config.json`+가중치가 저장되어, test.py가
-  이 폴더 경로만으로 모델을 복원할 수 있다.
-- 9개 ablation 스위치(`use_daily`/`use_weekly`/`use_retrieval`/`use_weather`/`weather_injection`/
-  `use_calendar`/`use_branch_attention`/`use_neighbors`/`use_softplus`)는 전부 Hydra 오버라이드로
-  켜고 끈다. `run_ablation.sh`(큐 러너) / `run_seeds.sh`(다중 시드)가 그 매핑을 들고 있다.
+- 결과 요약 JSON 경로는 `run_json`, 없으면 `output/merged/runs/`. 이전 실험 기록은 `output/past/`.
+- 기능 스위치와 2-stage 학습은 `docs/SPEC.md` 4·8절 참고.
 - 포팅 충실도 검증: `python tests/test_merged_parity.py --device cuda`
-  (구현 교체 전후 forward/loss 일치, save/load 왕복, 짧은 학습 loss 궤적 비교).
 
 ## 평가 (test.py)
 
 학습 프로세스와 무관하게, 체크포인트 경로만 있으면 언제든 독립 실행된다.
 
 ```bash
-python test.py <checkpoint_path> --city ulsan --weather_csv_path data/raw/ulsan_meteorological_data.csv
+python test.py <checkpoint_path> --city ulsan --weather_csv_path data/raw/ulsan_meteorological_data.csv \
+  --train_ratio 0.70 --val_ratio 0.15
 ```
 
 - `<checkpoint_path>`: train.py가 저장한 `output/.../` 디렉토리 (`config.json` + `model.safetensors`가 있는 곳)

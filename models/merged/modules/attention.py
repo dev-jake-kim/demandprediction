@@ -19,8 +19,6 @@ class BranchAttention(nn.Module):
         use_attention: bool = True,
     ) -> None:
         super().__init__()
-        # use_attention=False는 ablation용 — 학습된 query/key 대신 유효 브랜치를 균등 평균한다.
-        # 브랜치 자체는 그대로 두고 "선택 메커니즘"만 제거해야 기여도가 분리된다.
         self.use_attention = use_attention
         self.neural_projection = nn.Linear(history_hidden, fusion_dim)
         self.daily_projection = nn.Linear(periodic_hidden, fusion_dim)

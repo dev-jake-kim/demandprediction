@@ -1,9 +1,6 @@
-"""merged 모델 단독 평가 스크립트.
+"""저장된 MergedDemandModel 체크포인트를 데이터 split에서 평가하는 스크립트.
 
-``train.py``가 ``save_pretrained``로 남긴 체크포인트 디렉터리만 주면 학습 프로세스와
-무관하게 돌아간다. RMSE / MAE / MAPE(+1) / MAPE(0제외)를 전부 낸다 — 원본
-``merged_model/train.py``의 ``run_epoch()``가 냈던 지표 집합과 같아야 기존 ablation 표의
-컬럼과 계속 비교할 수 있다.
+사용법과 평가 계약은 ``docs/SPEC.md`` §9를 참고한다.
 """
 
 from __future__ import annotations

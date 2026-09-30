@@ -1,16 +1,7 @@
-"""포팅 충실도 검증: 구 ``UnifiedDemandModel`` vs 신 ``MergedDemandModel``.
+"""Check forward/loss, checkpoint, and short-training parity against legacy code.
 
-1. forward-pass parity — 같은 seed로 두 모델을 만들고 state_dict를 그대로 옮긴 뒤, 실제
-   ulsan 배치 하나에서 ``prediction``/``logits``와 ``loss``가 ``torch.allclose(atol=1e-6)``.
-   ``full`` 외에 ``no-ir``, ``no-softplus`` ablation 조합도 각각 확인한다.
-2. save_pretrained -> from_pretrained 왕복에서 파라미터·버퍼(weather_mean/std 포함) 보존.
-3. 짧은 smoke 학습 A/B — 동일 seed, 동일 배치 순서(sequential)로 몇 스텝만 돌려 두 구현의
-   loss 궤적이 일치하는지.
-
-구 구현은 워킹 트리에 없다(포팅 직전 커밋에만 있음). ``git show <LEGACY_REF>:merged_model/<file>``로
-임시 디렉터리에 복원해 import한다. ``tmp`` 브랜치 이름 자체를 쓰지 않는 이유: 이 테스트가 옮겨간
-바로 그 브랜치(tmp)에서, 이 포팅 커밋 이후로 ``tmp``가 계속 전진하면 ``tmp:merged_model/...``가
-더 이상 legacy 코드를 가리키지 않게 된다 — 그래서 포팅 직전 커밋 해시를 고정해서 쓴다.
+Legacy files are restored with ``git show`` from a pinned commit: a branch tip can
+advance and stop identifying the reference files.
 
     conda run -n DA python tests/test_merged_parity.py --device cuda
 """
@@ -48,17 +39,16 @@ LEGACY_FILES = [
     'modules/retrieval.py',
 ]
 
-# merged_model/train.py의 ABLATIONS dict에서 검증 대상만 추린 것.
+# Ablation cases covered by the parity check.
 ABLATION_CASES = {
     'full': {},
     'no-ir': {'use_retrieval': False},
     'no-softplus': {'use_softplus': False},
     'no-neighbors': {'use_neighbors': False},
-    # extra_dim이 줄고 weather_projection이 새로 생기는 조합 — 구조까지 같은지 본다.
+    # Includes a branch-shape-changing weather injection case.
     'weather-cls-add': {'weather_injection': 'cls_add'},
 }
 
-# 원본 config.yaml의 model: 블록 값.
 MODEL_KWARGS = dict(
     local_radius=2,
     d_model=64,
@@ -88,13 +78,11 @@ DATA_KWARGS = dict(
 )
 
 
-# 포팅 커밋(models/merged로 이관 + merged_model/ 삭제) 바로 이전, legacy merged_model/이
-# 마지막으로 존재했던 커밋. tmp 브랜치가 그 뒤로 전진해도 이 해시는 그 시점의 파일을 그대로 가리킨다.
 LEGACY_REF = '81472a5'
 
 
 def restore_legacy_package(destination: Path) -> None:
-    """포팅 이전 커밋의 merged_model/을 ``merged_legacy`` 패키지로 복원한다."""
+    """Restore legacy package files from the pinned reference commit."""
 
     package = destination / 'merged_legacy'
     (package / 'modules').mkdir(parents=True, exist_ok=True)
@@ -122,8 +110,7 @@ def build_batch(device: torch.device, batch_size: int, start: int):
     weather_mean = train_weather.mean(axis=0).tolist()
     weather_std = train_weather.std(axis=0).clip(min=1e-6).tolist()
 
-    # 검색기가 실제로 후보를 도는 구간을 쓴다 — 앞쪽(target_time == time_step)은 후보가 없어
-    # ir_out이 무조건 0이라 검증이 헐거워진다.
+    # Use a time with retrieval candidates; the first target has none.
     subset = torch.utils.data.Subset(dataset, range(start, start + batch_size))
     batch = next(iter(DataLoader(subset, batch_size=batch_size, shuffle=False)))
     batch = {key: value.to(device) for key, value in batch.items()}
@@ -165,9 +152,7 @@ def make_models(legacy_module, dataset, weather_mean, weather_std, flags, seed=1
         )
     )
     missing, unexpected = new.load_state_dict(old.state_dict(), strict=False)
-    # 신 구현은 neighbor_valid를 persistent 버퍼로 저장한다(transformers 5.0의 meta-device
-    # from_pretrained 때문). 구 구현은 persistent=False라 state_dict에 없다. 값은 생성자가
-    # 이미 채웠으므로 이 키 하나만 missing인 것이 정상이다.
+    # Persistent buffer required by meta-device ``from_pretrained``; legacy state_dict lacks it.
     assert list(unexpected) == [], f'unexpected keys: {unexpected}'
     assert list(missing) == ['local_history.neighbor_valid'], f'missing keys: {missing}'
     return old, new
@@ -199,7 +184,6 @@ def check_parity(legacy_module, device: torch.device, batch_size: int, start: in
         assert ok_pred, f'{name}: prediction mismatch ({pred_diff:.3e})'
         assert ok_loss, f'{name}: loss mismatch ({loss_diff:.3e})'
 
-        # 슬림 forward가 디버그 경로와 같은 값을 내는지도 함께 확인한다.
         with torch.no_grad():
             slim = new(**batch)
         assert torch.equal(slim['logits'], new_out['logits'])
@@ -263,7 +247,7 @@ def check_roundtrip(device: torch.device) -> None:
 
 def _manual_train(model, batches, *, is_new: bool, lr: float, weight_decay: float, epochs: int,
                   seed: int) -> list[float]:
-    """원본 merged_model/train.py의 학습 스텝을 그대로 재현한 루프."""
+    """Run the training step used by the parity smoke check."""
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     losses: list[float] = []
@@ -290,10 +274,9 @@ def _manual_train(model, batches, *, is_new: bool, lr: float, weight_decay: floa
 
 
 def check_smoke(legacy_module, device: torch.device, epochs: int, steps: int, start: int) -> None:
-    """동일 seed·동일 배치 순서로 몇 스텝만 학습해 loss 궤적을 비교한다.
+    """Compare short loss trajectories with identical seeds and sequential batches.
 
-    원본의 ``--max-batches``와 같은 역할이다. 셔플을 끄고 배치 목록을 고정해야 두 구현의
-    데이터 순서가 같아져 비교가 의미를 가진다.
+    Fixed batch order ensures both implementations receive the same inputs.
     """
 
     dataset, _, weather_mean, weather_std = build_batch(device, 1, start)

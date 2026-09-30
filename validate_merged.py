@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Fast structural and causal checks for the merged model.
-
-원본 ``merged_model/validate.py``를 새 구조(``models.merged`` + ``dataset_frame`` + Hydra)에
-맞춰 갱신한 것이다. 실제 배치를 두 도시에서 한 번씩 흘리고 합성 검색 케이스를 하나 돌려서,
-shape / mask / gradient / 시간 경계 회귀를 2,000-epoch 학습 전에 잡는다.
+"""Run structural, gradient, and causality checks for the merged model.
 
     python validate_merged.py --device cpu
 """
@@ -35,9 +31,7 @@ ROOT = Path(__file__).resolve().parent
 
 
 def _compose(city: str):
-    # 도시마다 최적 하이퍼파라미터가 달라 루트 config가 도시별로 나뉘어 있다
-    # (configs/config_ulsan.yaml / configs/config_porto.yaml) — dataset= 오버라이드만으로는
-    # model: 그룹(따라서 하이퍼파라미터)이 안 바뀌므로 config_name 자체를 골라야 한다.
+    # Select the city-specific root config; dataset overrides do not change its model group.
     with initialize_config_dir(config_dir=str(ROOT / 'configs'), version_base=None):
         return compose(config_name=f'config_{city}')
 
@@ -87,8 +81,7 @@ def _check_dataset(city: str, device: torch.device) -> dict:
     if not torch.allclose(weights.sum(dim=-1), torch.ones_like(weights[..., 0]), atol=1e-5):
         raise AssertionError(f'{city}: branch attention weights do not sum to one')
 
-    # 두 번째 pass는 손실 그래프가 neural head와 브랜치 투영에 모두 닿는지 본다.
-    # 검색기는 의도적으로 미분 불가능하다.
+    # Retrieval is intentionally non-differentiable.
     model.train()
     model.zero_grad(set_to_none=True)
     model.forward_debug(**sample)['loss'].backward()
@@ -100,15 +93,14 @@ def _check_dataset(city: str, device: torch.device) -> dict:
         'neural_head': model.output_gate.neural_head.weight.grad is not None,
         'branch_attention': model.branch_attention.query_projection.weight.grad is not None,
         'local_history': model.local_history.scalar_embedding.projection.weight.grad is not None,
-        # 캘린더 임베딩이 세 LSTM 입력에 실제로 연결돼 있는지 — concat을 빠뜨리면 여기서 잡힌다.
+        # Verify calendar embeddings reach the LSTM inputs.
         'weekday_embedding': _has_gradient(model.weekday_embedding.weight),
         'hour_embedding': _has_gradient(model.hour_embedding.weight),
     }
     if not all(gradient_checks.values()):
         raise AssertionError(f'{city}: end-to-end gradient check failed: {gradient_checks}')
 
-    # 날씨는 임베딩 층이 없어 gradient로 연결을 확인할 수 없다(정규화 후 그대로 concat되는 상수 입력).
-    # 대신 날씨만 흔들어 출력이 실제로 달라지는지 본다 — concat을 빠뜨리면 출력이 그대로다.
+    # Weather is a constant input, so verify its effect directly.
     model.eval()
     with torch.no_grad():
         baseline = model(**{k: v for k, v in sample.items() if k != 'labels'})['logits']
@@ -174,12 +166,7 @@ def _check_invalid_mask() -> dict:
 
 
 def _check_periodic_extra_channels() -> dict:
-    """concat한 날씨/캘린더 채널이 compaction(gather+pack)을 그대로 통과하는지 확인한다.
-
-    ``PeriodicLSTMEncoder``는 유효 lag만 앞으로 당겨 packing하는데, gather의 feature 폭을
-    하드코딩하면 예외 없이 첫 채널만 남고 나머지가 조용히 사라진다. 여기서는 같은 입력을
-    직접 compaction해 LSTM에 넣은 결과와 비교해서 전 채널 보존을 증명한다.
-    """
+    """Verify weather/calendar channels survive invalid-lag compaction."""
 
     torch.manual_seed(0)
     extra_dim = 15
@@ -194,7 +181,7 @@ def _check_periodic_extra_channels() -> dict:
     with torch.no_grad():
         hidden, valid = encoder(values, invalid, extra)
 
-        # 참조 구현: 유효 위치(0,2,3)만 순서대로 모아 직접 LSTM에 통과시킨다.
+        # Reference: compact valid positions before the LSTM.
         keep = [0, 2, 3]
         sequence = torch.log1p(torch.clamp(values, min=0.0))
         sequence = sequence.permute(0, 2, 1, 3).reshape(nodes, length, 1)
@@ -221,15 +208,7 @@ def _check_periodic_extra_channels() -> dict:
 
 
 def _check_node_adaptive_identity() -> dict:
-    """ΔW=0인 노드별 LSTM 경로가 nn.LSTM(cuDNN fused)과 같은 값을 내는지 확인한다.
-
-    이게 깨지면 "baseline에 노드별 offset만 추가"라는 node_adaptive 실험의 전제가 무너진다 —
-    stage 1(ΔW 고정)의 결과가 node_adaptive를 끈 학습과 달라져서, 측정된 차이가 ΔW 때문인지
-    수동 셀 루프 때문인지 분리되지 않는다. 게이트 순서(i,f,g,o)나 bias_ih+bias_hh 합산을
-    틀리면 여기서 잡힌다.
-
-    선택되지 않은 노드는 nn.LSTM 결과를 그대로 써야 하므로 그쪽도 함께 확인한다.
-    """
+    """Verify zero node offsets match ``nn.LSTM`` and untouched nodes remain identical."""
 
     torch.manual_seed(0)
     height, width, time_step = 4, 3, 6
@@ -250,14 +229,14 @@ def _check_node_adaptive_identity() -> dict:
         node_adaptive_indices=adaptive,
     )
     encoder.eval()
-    # delta는 0으로 시작해야 한다 — LocalHistoryEncoder 생성자의 계약.
+    # Node offsets are initialized at zero.
     if any(float(param.detach().abs().sum()) != 0.0 for param in encoder.node_delta_parameters()):
         raise AssertionError('node_delta 파라미터가 0으로 초기화되지 않음')
 
     demands = torch.rand(2, time_step, height, width) * 5
     with torch.no_grad():
         _, adaptive_hidden = encoder(demands)
-        encoder.node_adaptive = False  # 같은 가중치로 nn.LSTM 경로만 태운다
+        encoder.node_adaptive = False  # Run the shared nn.LSTM path with identical weights.
         _, reference_hidden = encoder(demands)
         encoder.node_adaptive = True
 
@@ -265,7 +244,7 @@ def _check_node_adaptive_identity() -> dict:
     if gap > 1e-5:
         raise AssertionError(f'ΔW=0인데 nn.LSTM과 결과가 다름: max|diff|={gap:.3e}')
 
-    # 선택되지 않은 노드는 정확히 동일해야 한다(수동 루프를 아예 타지 않으므로).
+    # Unselected nodes must remain bit-identical.
     others = [node for node in range(num_nodes) if node not in adaptive]
     untouched = float(
         (adaptive_hidden[:, others] - reference_hidden[:, others]).abs().max()
@@ -317,6 +296,47 @@ def _check_retrieval_boundary() -> dict:
         if not torch.equal(before, after):
             raise AssertionError('retrieval used target or future values')
     return {'retrieval_candidate_boundary': 'tau < target_time'}
+
+
+def _check_independent_retrieval_radius() -> dict:
+    """Verify retrieval radius is independent of the Transformer radius."""
+    with tempfile.TemporaryDirectory(prefix='merged_window_') as temp_dir:
+        path = Path(temp_dir) / 'grid.npy'
+        grid = (np.arange(12 * 3 * 3, dtype=np.float32) % 11).reshape(12, 3, 3)
+        np.save(path, grid, allow_pickle=False)
+        history = torch.from_numpy(grid[5:7].copy()).unsqueeze(0)
+        zeros = torch.zeros(1, 2, 9, 1)
+        mask = torch.zeros(1, 2, dtype=torch.bool)
+        weather = torch.zeros(1, 2, 3)
+        time = torch.zeros(1, 2, dtype=torch.long)
+        sample_idx = torch.tensor([7])
+        for radius in (1, 2):
+            config = MergedDemandConfig(
+                height=3, width=3, time_step=2, local_radius=1, retrieval_local_radius=radius,
+                d_model=8, transformer_heads=2, transformer_layers=1,
+                retrieval_grid_path=str(path), retrieval_k=2,
+                weather_mean=[0.0] * 3, weather_std=[1.0] * 3,
+            )
+            model = MergedDemandModel(config).eval()
+            with torch.no_grad():
+                output = model._compute(
+                    demand_history=history, daily_demand=zeros, daily_mask=mask,
+                    weekly_demand=zeros, weekly_mask=mask, sample_idx=sample_idx,
+                    weather=weather, hour_of_day=time, day_of_week=time,
+                    daily_weather=weather, daily_hour=time, daily_day_of_week=time,
+                    weekly_weather=weather, weekly_hour=time, weekly_day_of_week=time,
+                )
+                model.retrieval._cache.fill_(float('nan'))
+                expected = model.retrieval(
+                    model.local_history.crop(history, radius=radius), sample_idx
+                )
+            if model.local_history.crop(history).shape[-1] != 9:
+                raise AssertionError('Transformer window is not 3×3')
+            if model.retrieval._crops.shape[-1] != (2 * radius + 1) ** 2:
+                raise AssertionError(f'Retrieval candidates do not use radius {radius}')
+            if not torch.equal(output['ir_out'], expected):
+                raise AssertionError(f'Retrieval query does not use radius {radius}')
+    return {'transformer_neighbors': 9, 'retrieval_neighbors_checked': [9, 25]}
 
 
 def _check_retrieval_pass() -> dict:
@@ -377,6 +397,7 @@ def main() -> None:
     results.append(_check_periodic_extra_channels())
     results.append(_check_node_adaptive_identity())
     results.append(_check_retrieval_boundary())
+    results.append(_check_independent_retrieval_radius())
     results.append(_check_retrieval_pass())
     report = {'device': str(device), 'all_pass': True, 'checks': results}
     print(json.dumps(report, ensure_ascii=False, indent=2))

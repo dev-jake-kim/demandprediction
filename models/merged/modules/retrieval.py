@@ -62,9 +62,7 @@ class CausalRetrieval(nn.Module):
         padded = F.pad(grid_tensor.unsqueeze(1), (self.local_radius,) * 4)
         patches = F.unfold(padded, kernel_size=self.window_size)
         self._crops = patches.transpose(1, 2).contiguous()
-        # torch.full 대신 new_full: from_pretrained가 meta device 컨텍스트에서 __init__을
-        # 도는데, 팩토리 함수는 그 컨텍스트를 따라가 meta 텐서가 되어버린다. grid_tensor는
-        # from_numpy로 만든 실제 CPU 텐서라 여기서 device가 CPU로 고정된다.
+        # Keep the cache on CPU during meta-device initialization.
         self._cache = grid_tensor.new_full((grid_tensor.shape[0], self.num_nodes), float("nan"))
         self.grid_path = str(path)
 

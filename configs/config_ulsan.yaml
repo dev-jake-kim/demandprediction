@@ -1,10 +1,4 @@
-# merged 모델(train.py) — ulsan 루트 설정. porto는 configs/config_porto.yaml 참고
-# (python train.py --config-name config_porto). 이 브랜치(tmp)의 유일한 모델이라 다른
-# model:/train.py는 없다(models/config.py, models/modeling.py 부재 — models/__init__.py 참고).
-#
-# tmp의 계산 그래프를 유지하며 노드별 ΔW를 2-stage로 학습한다.
-# 이번 실험은 시간순 0.70/0.15/0.15 분할이다. 이전 80/10/10 결과와 직접 비교하지 않는다.
-# scheduler는 아래 optimizer_schedule이 Trainer에서 적용한다.
+# Ulsan merged 모델 루트 설정.
 defaults:
   - dataset: ulsan
   - model: merged_ulsan
@@ -14,13 +8,12 @@ project_name: merged
 seed: 2026
 device: cuda
 
-# 데이터셋 기본값을 명시적으로 고정해 train/val/test를 70/15/15로 분할한다.
+
 dataset:
   train_ratio: 0.70
   val_ratio: 0.15
 
-# UnifiedDemandDataset의 daily/weekly lag 구성. 원본 merged_model/config.yaml의 data: 블록.
-# time_step은 configs/dataset/*.yaml의 것을 쓴다.
+# time_step은 dataset 설정에서 읽는다.
 data:
   daily_period: 24
   daily_lags: 6
@@ -29,33 +22,32 @@ data:
   lag_radius: 0
 
 train:
-  # Ulsan d_model=16 및 attention_dropout=0에서 사용한 채택 배치.
+
   per_device_train_batch_size: 24
   per_device_eval_batch_size: 24
   dataloader_num_workers: 0
-  # 원본은 torch.compile을 쓰지 않는다.
+
   torch_compile: false
   disable_tqdm: true
-  # 새 스케줄은 최대 120 epoch 동안 학습한다(조기 종료는 별도).
+
   num_train_epochs: 120
   remove_unused_columns: false
   save_strategy: epoch
   save_total_limit: 1
-  # 원본: torch.optim.AdamW(lr, weight_decay). betas/eps는 TrainingArguments 기본값과 동일.
+
   optim: adamw_torch
   learning_rate: 1e-3
   weight_decay: 0.05
-  # HF 기본 스케줄 대신 아래 epoch 단위 ADFormer warmup-cosine을 적용한다.
+  # optimizer_schedule이 실제 epoch 스케줄을 정의한다.
   lr_scheduler_type: constant
   warmup_ratio: 0.0
-  # 원본: clip_grad_norm_(max_norm=5.0). TrainingArguments 기본값은 1.0.
+
   max_grad_norm: 5.0
-  # 원본은 epoch마다 train/val 지표를 한 줄씩 남겼다. 결과 JSON의 history를 같은 모양으로
-  # 유지하려면 step 단위가 아니라 epoch 단위로 로깅해야 한다.
+
   logging_strategy: epoch
   eval_strategy: epoch
   load_best_model_at_end: true
-  # stage 1은 val loss 최소; stage 2는 train.py에서 전체 val의 rmse_mape_objective로 교체한다.
+
   metric_for_best_model: loss
   greater_is_better: false
   seed: ${seed}
@@ -68,32 +60,26 @@ optimizer_schedule:
   cosine_epochs: 60
   eta_min: 0.0001
 
-# node_adaptive=true에서 실행하는 stage 2(노드별 ΔW 해제 후 finetuning) 전용 설정.
-# 나머지는 train 블록을 그대로 재사용한다.
+# stage2는 node_adaptive 가중치 해제 후 적용한다.
 stage2:
-  # stage 1의 1/10. 수렴한 공유 가중치에서 크게 이탈하지 않으면서 ΔW가 움직일 여지는 준다.
+
   learning_rate: 1e-4
-  # 'rmse_mape'(rmse_weight*RMSE + MAPE(+1)) 또는 'combined'(stage 1과 동일한 CombinedLoss).
-  # rmse_mape의 두 항은 models/metrics.py의 보고 지표와 같은 식이라 최적화 대상과 평가가 일치한다.
-  loss: rmse_mape
+
+  loss: mae
   rmse_weight: 10.0
-  # stage 1을 새로 학습하지 않고 이 체크포인트의 가중치에서 stage 2를 시작한다.
-  # optimizer/scheduler/global step을 복구하는 중단 재개(resume)가 아니라 weights-only warm start다.
-  # node_adaptive를 끄고 학습한 단일 stage 체크포인트를 그대로 쓰면 된다 — ΔW 키가 없으면
-  # _init_weights가 0으로 채운다(models/merged/modeling.py 참고).
+  # init_from은 optimizer 상태 없이 가중치만 이어받는다.
   # null이면 stage 1부터 학습한다.
   init_from: null
 
 callbacks:
   early_stopping:
-    # 기존 min=13/pat=8은 고정 LR·다른 batch에서만 검증됐다.
-    # 새 LR 궤적에서는 긴 정체 뒤 개선을 자르지 않도록 원래의 인내값으로 복원한다.
+
     min_epochs: 0
     early_stopping_patience: 20
 
 # 실행 설정 라벨(모델 스위치가 아님). 기본 검색 pass와 일치시킨다.
 ablation: no-ir
-# smoke 테스트용: 각 split의 앞 N개 샘플만 쓴다(원본 --max-batches에 대응). null이면 전체.
+# limit_samples는 각 split에서 사용할 앞쪽 샘플 수이며 null이면 전체다.
 limit_samples: null
 # null이면 output/${project_name}/runs/<city>_<loss_type>_<ablation>_seed<seed>.json 에 쓴다.
 run_json: null

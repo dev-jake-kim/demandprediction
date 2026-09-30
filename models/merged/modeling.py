@@ -1,17 +1,10 @@
-"""HuggingFace ``PreTrainedModel`` port of ``merged_model``'s ``UnifiedDemandModel``.
+"""HuggingFace ``PreTrainedModel`` for merged demand forecasting.
 
-Branch-specific code lives in :mod:`models.merged.modules`; this file intentionally
-contains only model construction, data flow, and the final loss calculation.
+Branch-specific code lives in :mod:`models.merged.modules`; this module assembles the
+model data flow and computes training loss.
 
-**계산 그래프는 원본과 동일하다.** 바뀐 것은 껍데기뿐이다:
-
-* 생성자 인자 -> :class:`MergedDemandConfig` (``PretrainedConfig``)
-* ``target`` -> ``labels`` (HF ``Trainer``의 ``label_names`` 기본값)
-* ``forward``의 반환 dict를 ``{'loss', 'logits'}``로 슬림화. ``Trainer``의 eval loop는
-  ``loss``를 제외한 모든 키를 배치마다 gather하므로, 원본이 돌려주던 디버그 텐서
-  (``neural_pred``/``ir_out``/``lambda_weight``/``attention_weights``/``h_attn`` 등)를
-  그대로 두면 메모리가 폭증하고 shape가 균일하지 않은 키에서 깨진다. 그 텐서들은
-  :meth:`MergedDemandModel.forward_debug`로 옮겼다 — 예측/손실 계산 경로는 완전히 동일하다.
+``forward`` returns the compact ``{'loss', 'logits'}`` interface for ``Trainer``.
+Use :meth:`MergedDemandModel.forward_debug` for intermediate outputs.
 """
 
 from __future__ import annotations
@@ -50,6 +43,12 @@ class MergedDemandModel(PreTrainedModel):
             raise ValueError('time_step must be positive')
         if config.local_radius < 0:
             raise ValueError('local_radius must be non-negative')
+        retrieval_radius = (
+            config.local_radius if config.retrieval_local_radius is None
+            else config.retrieval_local_radius
+        )
+        if retrieval_radius < 0:
+            raise ValueError('retrieval_local_radius must be non-negative')
         if config.fusion_dim <= 0 or config.retrieval_k <= 0 or config.retrieval_chunk_size <= 0:
             raise ValueError('fusion_dim, retrieval_k, and retrieval_chunk_size must be positive')
         if config.transformer_heads <= 0 or config.d_model % config.transformer_heads != 0:
@@ -61,8 +60,7 @@ class MergedDemandModel(PreTrainedModel):
                 'weather_mean/weather_std(각 3개, train split 통계)가 필요함 — '
                 '시간 리크를 막으려면 train.py가 train 구간에서만 계산해 넘겨야 한다'
             )
-        # 값 검사는 파이썬 리스트에서 한다. from_pretrained가 meta device에서 __init__을
-        # 돌기 때문에, 텐서로 만든 뒤 검사하면 meta 텐서에 bool()을 부르게 되어 깨진다.
+        # 설정값은 Python 리스트에서 검사한다. ``from_pretrained``의 meta-device 초기화와 호환된다.
         weather_mean_list = [float(value) for value in config.weather_mean]
         weather_std_list = [float(value) for value in config.weather_std]
         if len(weather_mean_list) != NUM_WEATHER_FEATURES:
@@ -76,17 +74,12 @@ class MergedDemandModel(PreTrainedModel):
         self.width = width
         self.num_nodes = height * width
         self.time_step = config.time_step
+        self.retrieval_radius = retrieval_radius
 
-        # --- ablation 스위치 ---
-        # 각 모듈을 끄고 켜면서 기여도를 재기 위한 것. 전부 True면 기본 모델과 동일하다.
         self.use_daily = config.use_daily
         self.use_weekly = config.use_weekly
         self.use_retrieval = config.use_retrieval
         self.use_weather = config.use_weather
-        # 'concat': 정규화 3값을 세 LSTM 입력에 그대로 붙인다(기본).
-        # 'cls_add': ir-weather 방식 — d_model로 투영해 history의 CLS 토큰에 더한다.
-        #   이 경우 주기 브랜치에는 날씨가 들어가지 않는다(CLS가 거기엔 없다). 즉 주입 지점과
-        #   커버리지가 함께 바뀌는 변형이며, 그건 ir-weather 설계의 본질적 성질이다.
         if config.weather_injection not in ('concat', 'cls_add'):
             raise ValueError(
                 f"weather_injection은 'concat'|'cls_add' (받음: {config.weather_injection!r})"
@@ -97,11 +90,6 @@ class MergedDemandModel(PreTrainedModel):
         self.use_neighbors = config.use_neighbors
         self.use_softplus = config.use_softplus
 
-        # --- 노드별 LSTM weight offset ---
-        # 켜져 있으면 train.py가 config.node_adaptive_indices에 대상 노드 id를 채워 준다
-        # (train 구간 평균 수요 > node_adaptive_min_demand). 꺼져 있으면 None을 넘겨
-        # LocalHistoryEncoder가 delta 파라미터를 아예 만들지 않는다 — 이 필드가 없던 시절과
-        # state_dict가 정확히 같아야 기존 체크포인트/parity 테스트가 유지된다.
         self.node_adaptive = config.node_adaptive
         node_adaptive_indices = None
         if self.node_adaptive:
@@ -112,14 +100,8 @@ class MergedDemandModel(PreTrainedModel):
                 )
             node_adaptive_indices = [int(value) for value in config.node_adaptive_indices]
 
-        # 날씨는 임베딩하지 않고 정규화한 3값을 그대로 LSTM 입력에 concat한다. 요일/시간대만
-        # 임베딩 테이블을 쓰며, 세 브랜치가 같은 테이블을 공유한다(요일 3은 어느 브랜치에서나 요일 3).
         self.weekday_embedding = nn.Embedding(7, config.weekday_dim)
-        # ir-weather는 nn.Embedding(1440, d_model)에 hour*60 인덱스를 넣지만 실제로 학습되는 행은
-        # 24개뿐인 분(minute) 해상도 잔재다 — 동일 효과의 24행으로 단순화한다.
         self.hour_embedding = nn.Embedding(24, config.hour_dim)
-        # 폭은 끄든 켜든 15로 고정 — 값만 0이 된다. 폭이 바뀌면 LSTM 파라미터 수가 달라져
-        # 정보 제거 효과와 용량 감소 효과가 섞인다.
         self.weather_cls_dim = (
             NUM_WEATHER_FEATURES if self.weather_injection == 'cls_add' else 0
         )
@@ -155,8 +137,6 @@ class MergedDemandModel(PreTrainedModel):
             node_adaptive_indices=node_adaptive_indices,
         )
         self.periodic_hidden = config.periodic_hidden
-        # 주기 브랜치는 0-치환으로 정보만 제거한다. 검색은 tmp-extracted처럼
-        # 사용하지 않을 때 아예 실행하지 않으며 raw grid도 적재하지 않는다.
         self.daily_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim)
         self.weekly_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim)
         self.branch_attention = BranchAttention(
@@ -165,14 +145,12 @@ class MergedDemandModel(PreTrainedModel):
             config.fusion_dim,
             use_attention=self.use_branch_attention,
         )
-        # 검색이 꺼지면 검색기와 corpus/crop/cache를 만들지 않는다. neural head는
-        # 기존 no-ir 체크포인트와 동일한 output_gate에 남기고 lambda만 bypass한다.
         self.retrieval = (
             CausalRetrieval(
                 height=height,
                 width=width,
                 time_step=config.time_step,
-                local_radius=config.local_radius,
+                local_radius=retrieval_radius,
                 retrieval_grid_path=config.retrieval_grid_path,
                 retrieval_k=config.retrieval_k,
                 retrieval_chunk_size=config.retrieval_chunk_size,
@@ -182,20 +160,13 @@ class MergedDemandModel(PreTrainedModel):
             if self.use_retrieval else None
         )
         self.output_gate = NeuralRetrievalGate(config.fusion_dim, use_softplus=self.use_softplus)
-        # 이 저장소의 다른 모델들과 목적함수를 맞추려면 'combined'(CombinedLoss)를 쓴다.
-        # 'mae'는 merged_model이 원래 쓰던 raw 스케일 L1이며, 두 경우 모두 reduction='none'
-        # 이라 아래 forward에서 mean/sum을 각각 뽑는다.
         self.loss_fn: nn.Module
         self.configure_loss(config.loss_type)
 
         self.post_init()
 
     def configure_loss(self, loss_type: str, *, rmse_weight: float | None = None) -> None:
-        """학습 loss를 교체하고 선택값을 HF config에도 동기화한다.
-
-        config를 함께 갱신해야 stage 2 체크포인트를 ``from_pretrained``로 다시 열었을 때
-        런타임에 선택했던 loss가 조용히 되돌아가지 않는다(lora 브랜치와 같은 관례).
-        """
+        """학습 손실을 교체하고 ``config``의 손실 설정을 동기화한다."""
 
         if rmse_weight is not None:
             self.config.rmse_weight = float(rmse_weight)
@@ -207,10 +178,8 @@ class MergedDemandModel(PreTrainedModel):
             split_threshold=self.config.split_threshold,
             split_high_weight=self.config.split_high_weight,
         )
-        # rmse_mape처럼 요소별로 분해되지 않는 손실은 _compute가 다르게 집계해야 한다.
         self.loss_is_scalar = loss_type in SCALAR_LOSS_TYPES
-        # ``PreTrainedModel.__init__``도 같은 이름의 속성을 쓰므로 property로 만들면 안 된다
-        # (setter가 없어 super().__init__에서 AttributeError가 난다). 평범한 속성으로 둔다.
+        # property 금지: PreTrainedModel.__init__이 같은 이름에 대입한다.
         self.loss_type = loss_type
         self.config.loss_type = loss_type
 
@@ -220,20 +189,10 @@ class MergedDemandModel(PreTrainedModel):
         return self.local_history.node_delta_parameters()
 
     def _init_weights(self, module: nn.Module) -> None:
-        """PyTorch 기본 초기화를 그대로 쓰고, 노드별 delta만 0으로 만든다.
+        """PyTorch 기본 초기화를 유지하고 초기화되지 않은 노드 delta만 0으로 만든다.
 
-        ``PreTrainedModel._init_weights``는 Linear/Embedding/LayerNorm을 std=0.02 정규분포로
-        다시 초기화한다. 그걸 상속하면 원본 ``UnifiedDemandModel``(순수 ``nn.Module``, 즉
-        PyTorch 기본 초기화)과 출발점이 달라져 포팅 자체가 다른 실험이 된다. 이 포팅의 성공
-        기준은 "계산이 바뀌지 않았음"이므로 **``super()._init_weights(module)``를 부르면 안 된다**
-        — lora 브랜치의 같은 이름 메서드는 정반대로 반드시 부르라고 돼 있으니 그쪽 코드를
-        그대로 복사해 오면 지금까지의 ablation/튜닝 결과와 출발점이 달라진다.
-
-        delta는 여기서 명시적으로 0을 넣어야 한다. transformers 5.0은 meta device에서 모델을
-        만든 뒤 체크포인트에 없는 키를 ``torch.empty``로 실체화하므로, 생성자의
-        ``torch.zeros(...)``가 delta 키 없는 체크포인트(node_adaptive를 끄고 학습한 stage 1)를
-        로드할 때는 적용되지 않는다. 체크포인트에서 값을 받은 파라미터에는
-        ``_is_hf_initialized``가 붙으므로 건너뛴다 — 학습된 delta를 0으로 덮어쓰면 안 된다.
+        HF가 meta device에서 누락된 체크포인트 키를 실체화할 수 있으므로, 체크포인트에서
+        복원된 delta에는 다시 0을 쓰지 않는다.
         """
 
         if module is not self.local_history:
@@ -244,16 +203,14 @@ class MergedDemandModel(PreTrainedModel):
 
 
     def _temporal_extra(self, weather: Tensor, hour: Tensor, day_of_week: Tensor) -> Tensor:
-        """(정규화 날씨 3) ⊕ (요일 임베딩) ⊕ (시간대 임베딩) -> ``[B, L, extra_dim]``.
+        """한 브랜치의 시간 context를 만들고 ``[B, L, extra_dim]``을 반환한다.
 
-        세 브랜치가 같은 방식으로 만든다 — recent는 L=time_step, daily/weekly는 L=lag 개수.
-        정규화를 여기 한 곳에서만 하므로 날것의 기온(수십 단위)이 log1p 수요를 압도하는 일이 없다.
+        날씨는 ``concat``에서만 정규화해 포함하고, 요일·시간 임베딩은 브랜치 간 공유한다.
         """
 
         parts: list[Tensor] = []
         if self.weather_injection == 'concat':
             weather_norm = (weather - self.weather_mean) / self.weather_std
-            # 정규화 후의 0은 train split 평균에 해당한다 — "정보 없음"의 자연스러운 대체값.
             parts.append(weather_norm if self.use_weather else torch.zeros_like(weather_norm))
         weekday = self.weekday_embedding(day_of_week)
         hour_vec = self.hour_embedding(hour)
@@ -283,7 +240,7 @@ class MergedDemandModel(PreTrainedModel):
         weekly_day_of_week: Tensor,
         labels: Tensor | None = None,
     ) -> dict[str, Tensor | None]:
-        """원본 ``UnifiedDemandModel.forward``와 완전히 동일한 계산. 전체 dict를 돌려준다."""
+        """모델 계산을 수행하고 예측·중간 결과·선택적 손실을 반환한다."""
 
         recent_extra = self._temporal_extra(weather, hour_of_day, day_of_week)
         daily_extra = self._temporal_extra(daily_weather, daily_hour, daily_day_of_week)
@@ -295,8 +252,7 @@ class MergedDemandModel(PreTrainedModel):
             if not self.use_weather:
                 weather_cls = torch.zeros_like(weather_cls)
         local_crop, h_neural = self.local_history(demand_history, recent_extra, weather_cls)
-        # 브랜치는 항상 실행하고, 끈 경우 출력 텐서만 0으로 바꾼다. valid 마스크는 원래 값을
-        # 그대로 둬서 attention 후보 개수가 변하지 않게 한다(구조 교란 제거).
+        # Ablation은 브랜치 출력을 0으로 바꾸되 valid mask와 모듈 shape은 유지한다.
         h_daily, daily_valid = self.daily_branch(daily_demand, daily_mask, daily_extra)
         if not self.use_daily:
             h_daily = torch.zeros_like(h_daily)
@@ -307,13 +263,16 @@ class MergedDemandModel(PreTrainedModel):
             h_neural, h_daily, h_weekly, daily_valid, weekly_valid
         )
 
-        if self.use_retrieval:
-            ir_out = self.retrieval(local_crop, sample_idx)
+        if self.retrieval is not None:
+            # 검색 반지름이 Transformer와 다르면 query용 crop을 별도로 만든다.
+            retrieval_crop = (
+                local_crop if self.retrieval_radius == self.local_history.local_radius
+                else self.local_history.crop(demand_history, radius=self.retrieval_radius)
+            )
+            ir_out = self.retrieval(retrieval_crop, sample_idx)
             neural_pred, lambda_weight, prediction = self.output_gate(h_attn, ir_out)
         else:
-            # 검색기를 아예 호출하지 않는다 — 0으로 치환한 ir_out을 게이트에 흘려보내면
-            # lambda가 0으로 무너지는 죽음의 함정이 생긴다(modules/fusion.py 참고).
-            # bypass_gate=True로 게이트 자체를 건너뛰어 그 함정을 구조적으로 없앤다.
+            # 검색 pass에서는 zero retrieval을 gate에 넣지 않고 우회한다.
             ir_out = None
             neural_pred, lambda_weight, prediction = self.output_gate(h_attn, None, bypass_gate=True)
         prediction_grid = prediction.reshape(-1, self.height, self.width)
@@ -333,14 +292,9 @@ class MergedDemandModel(PreTrainedModel):
         }
         if labels is not None:
             if self.loss_is_scalar:
-                # rmse_mape는 전체 원소에 걸친 하나의 sqrt(mean(...))이라 요소별로 분해되지
-                # 않는다. loss_sum(에폭 집계용)도 정의되지 않으므로 내보내지 않는다 —
-                # 이 손실을 쓰는 stage 2의 best 선택은 train.py가 전체 validation 예측으로
-                # 다시 계산한 동일 목적함수(rmse_mape_objective)를 쓴다.
+                # 스칼라 손실은 원소별 loss_sum을 정의할 수 없다.
                 output['loss'] = self.loss_fn(prediction_grid, labels)
             else:
-                # reduction='none'으로 한 번만 계산하고 mean(역전파용)과 sum(에폭 집계용)을 함께 낸다.
-                # 배치 크기가 균일하지 않아(drop_last=False) 배치 평균의 평균은 원소 평균과 다르다.
                 elementwise = self.loss_fn(prediction_grid, labels)
                 output['loss'] = elementwise.mean()
                 output['loss_sum'] = elementwise.detach().sum()
@@ -365,10 +319,9 @@ class MergedDemandModel(PreTrainedModel):
         weekly_day_of_week: Tensor,
         labels: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        """``Trainer``용 슬림 반환: ``{'loss', 'logits'}``.
+        """``Trainer``용으로 ``{'loss', 'logits'}``만 반환한다.
 
-        ``GridDemandModel.forward``와 정확히 같은 관례다. 디버그 텐서가 필요하면
-        :meth:`forward_debug`를 쓴다.
+        중간 결과가 필요하면 ``forward_debug``를 사용한다.
         """
 
         output = self._compute(
@@ -395,11 +348,7 @@ class MergedDemandModel(PreTrainedModel):
         return slim
 
     def forward_debug(self, **batch) -> dict[str, Tensor | None]:
-        """원본이 돌려주던 전체 dict(``neural_pred``/``lambda_weight``/``attention_weights`` 등).
-
-        검증 스크립트(``validate_merged.py``, parity 테스트)만 쓴다. ``Trainer``는 이 dict의
-        모든 키를 배치마다 gather하려 들기 때문에 학습 경로에서 쓰면 안 된다.
-        """
+        """검증과 분석을 위한 전체 예측·중간 결과·선택적 손실을 반환한다."""
 
         return self._compute(**batch)
 

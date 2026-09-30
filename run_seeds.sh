@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # merged 모델 다중 시드 실행기.
-#
+
 #   ./run_seeds.sh <dataset> <loss_type> [seed ...]
-#
 # GPU는 CUDA_VISIBLE_DEVICES로 고른다.
 set -euo pipefail
 
@@ -10,7 +9,7 @@ DATASET="${1:?dataset(ulsan|porto)이 필요함}"
 LOSS_TYPE="${2:?loss_type(combined|mae)이 필요함}"
 shift 2
 if [ "$#" -eq 0 ]; then
-  SEEDS=(245 6835 851 5123 535)  # 저장소 공용 5시드
+  SEEDS=(245 6835 851 5123 535)
 else
   SEEDS=("$@")
 fi
@@ -27,8 +26,7 @@ for seed in "${SEEDS[@]}"; do
   fi
   mkdir -p output/merged/runs output/merged/logs
   echo "[run ] dataset=$DATASET loss=$LOSS_TYPE seed=$seed -> $out"
-  # 도시마다 최적 하이퍼파라미터가 달라 루트 config가 나뉘어 있다(config_ulsan/config_porto)
-  # — dataset="$DATASET" 오버라이드만으로는 model: 그룹이 안 바뀌므로 --config-name을 쓴다.
+  # 도시별 model 그룹을 선택하려면 --config-name이 필요하다.
   PYTHONUNBUFFERED=1 conda run --no-capture-output -n DA \
     python train.py --config-name "config_${DATASET}" \
       train.seed="$seed" model.loss_type="$LOSS_TYPE" model.use_retrieval=true \

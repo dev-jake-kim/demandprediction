@@ -1,12 +1,6 @@
-# MergedDemandConfig 하이퍼파라미터 — porto.
-# height/width/time_step/retrieval_grid_path/retrieval_train_end/weather_mean/weather_std는
-# 데이터에서 파생되므로 train.py가 채운다.
-#
-# **history_hidden은 128이었다가 64로 되돌렸다.** 128은 2026-09-10-11 튜닝 스윕에서
-# 채택한 값인데, 그 스윕이 잘못된 격자(19x20=380노드)로 돌아간 것이라 무효다.
-# porto의 정본 격자는 10x20=200노드이고(preprocessing/porto/create_graph.py가 생성,
-# landuse_grid.npy와 같은 shape), 그 격자로 돌았던 포팅 전 merged_model은 history_hidden=64를
-# 썼다. 근거가 사라진 128 대신 그 값으로 되돌린다 — porto 튜닝 스윕은 재실행이 필요하다.
+# Porto merged 모델 설정.
+# height/width/time_step/retrieval_grid_path/retrieval_train_end/weather_mean/weather_std는 train.py가 데이터에서 채운다.
+
 local_radius: 2
 d_model: 64
 num_fourier_bands: 8
@@ -17,53 +11,39 @@ history_hidden: 64
 periodic_hidden: 64
 fusion_dim: 128
 dropout: 0.10
-# 어텐션 가중치만 0으로 두며 출력/FFN dropout=0.1은 유지한다.
+
 attention_dropout: 0.0
 retrieval_k: 20
 retrieval_chunk_size: 256
-# 검색 후보 범위. observed_past = tau < target_time(원본 기본값), train_prefix = train split까지만.
+# observed_past는 target_time 이전 관측값만 후보로 삼는다.
 retrieval_scope: observed_past
-# 요일/시간대 임베딩 차원. 날씨는 임베딩하지 않고 정규화한 3값을 그대로 concat하므로,
-# 세 LSTM에 붙는 보조 텐서는 3 + weekday_dim + hour_dim = 15차원이 된다.
+# 날씨 특성은 임베딩 없이 3개 채널로 주입한다.
 weekday_dim: 7
 hour_dim: 5
 
-# --- ablation 스위치 (기본값: 검색 pass, 나머지 관점 켬) ---
-# use_retrieval=false는 tmp-extracted처럼 검색 객체·corpus·게이트의 lambda 경로를
-# 사용하지 않는다. 검색을 켜는 대조군은 model.use_retrieval=true로 명시한다.
-# 그 밖의 관점 ablation은 출력 0-치환(브랜치 attention은 균등 가중 대체)이다.
+# 모델 ablation 스위치.
 use_daily: true
 use_weekly: true
 use_retrieval: false
 use_weather: true
-# 'concat'(기본, 정규화 3값을 세 LSTM 입력에 붙임) | 'cls_add'(ir-weather 방식, CLS에 더함)
+# weather_injection은 날씨 특성의 주입 위치를 선택한다.
 weather_injection: concat
 use_calendar: true
 use_branch_attention: true
 use_neighbors: true
 use_softplus: true
 
-# --- 노드별 LSTM weight offset (lora 브랜치 node_adaptive와 같은 구조) ---
-# history LSTM의 공유 W에 선택된 노드별 ΔW를 더한다. stage 1에서 0으로 고정한 뒤
-# stage 2에서 해제한다. 대상 노드는 70% train 구간의 평균 수요로만 선택한다.
+# node_adaptive는 stage 1에서 ΔW를 고정하고 stage 2에서 학습한다.
 node_adaptive: true
-node_adaptive_min_demand: 0.8
+node_adaptive_min_demand: 0.1
 
-# 'combined'(저장소 공용 CombinedLoss, 다른 모든 브랜치와 동일한 목적함수) |
-# 'mae'(merged_model이 원래 쓰던 raw 스케일 L1) |
-# 'rmse_mape'(rmse_weight*RMSE + MAPE(+1), 2-stage의 stage 2용).
-loss_type: combined
+
+loss_type: mae
 loss_gamma: 1.0
 loss_eps: 0.5
-# loss_type='rmse_mape'에서만 쓰인다. 10이면 두 항이 (RMSE 1.12 -> 11.2) vs (MAPE 8.0)로
-# 비슷한 크기가 된다.
+# rmse_weight는 loss_type='rmse_mape'에서만 사용한다.
 rmse_weight: 10.0
 
-# loss_type='demand_split'에서만 쓰인다. 수요가 낮은 셀과 높은 셀에 서로 다른 오차를 준다:
-#   실제 수요 <= split_threshold : |오차| / (|y|+1)              <- MAPE(+1)이 보는 것
-#   실제 수요 >  split_threshold : split_high_weight * 오차^2    <- RMSE가 보는 것
-# rmse_mape(선형 결합)는 모든 셀이 두 항에 동시에 기여해서 "예측을 전반적으로 쪼그라뜨려
-# 0셀 MAPE를 벌고 고수요 셀 RMSE를 잃는" 거래가 이득이 된다. 셀을 한 항에만 넣어 그 교차
-# 압력을 없앤 것이 이 손실이다. 근거와 w 선택 기준은 models/losses.py의 DemandSplitLoss 참고.
+# split_*은 loss_type='demand_split'에서만 사용한다.
 split_threshold: 1.0
 split_high_weight: 1.0

@@ -33,7 +33,6 @@ class PeriodicLSTMEncoder(nn.Module):
         sequence = torch.log1p(torch.clamp(values, min=0.0))
         sequence = sequence.permute(0, 2, 1, 3).reshape(batch * nodes, length, 1)
 
-        # 날씨/캘린더는 노드에 무관하므로 [B,L,E]를 노드 축으로 브로드캐스트해 붙인다.
         if self.extra_dim > 0:
             if extra is None:
                 raise ValueError(f"extra_dim={self.extra_dim}인데 extra가 None임")
@@ -58,7 +57,7 @@ class PeriodicLSTMEncoder(nn.Module):
             valid_sequence = sequence[row_valid]
             valid_positions = expanded_valid[row_valid]
             order = valid_positions.to(dtype=torch.long).argsort(dim=1, descending=True, stable=True)
-            # feature 차원을 하드코딩하면 concat한 채널이 조용히 잘려나간다 — 반드시 실제 폭을 쓴다.
+            # Use the actual feature width after concatenating extra context.
             compact = valid_sequence.gather(1, order.unsqueeze(-1).expand(-1, -1, feature_dim))
             compact_lengths = row_lengths[row_valid]
             packed = pack_padded_sequence(

@@ -1,30 +1,11 @@
-"""merged 모델(로컬 히스토리 + daily/weekly 주기 + 인과적 검색 + 브랜치 어텐션) 학습 스크립트.
+"""MergedDemandModel 학습 스크립트.
 
-원본 ``merged_model/train.py``의 계산 그래프를 이 저장소 공용 관례
-(Hydra + HF ``Trainer``)로 포팅했다. 이번 설정 실험은 원본 80/10/10
-분할을 유지하면서 d_model·배치·정규화 및 ADFormer의 epoch 단위
-warmup-cosine LR을 적용한다. 원래 고정 LR/2000 epoch의 기록과
-스케줄이 다르므로, 기존 early-stopping 단축값은 그대로 재사용하지 않는다.
+사용법과 학습 계약은 ``docs/SPEC.md`` §8을 참고한다.
 
-도시마다 최적 하이퍼파라미터가 달라 루트 config를 도시별로 분리했다 — 기본값은
-``configs/config_ulsan.yaml``, porto는 ``--config-name config_porto``로 명시한다::
+사용 예::
 
-    python train.py                                    # ulsan, 검색 pass
-    python train.py --config-name config_porto          # porto, 검색 pass
-    python train.py model.use_retrieval=true ablation=full   # 검색 켬 (ulsan)
-
-``model.node_adaptive=true``면 history LSTM에 노드별 weight offset(ΔW)을 붙이고 학습을
-2-stage로 나눈다(stage 1: ΔW 고정 = 지금까지와 동일한 학습 / stage 2: ΔW 해제 + ``stage2.loss``).
-꺼져 있으면(기본값) 단일 stage이며 이 기능 추가 이전과 완전히 동일하게 동작한다::
-
-    python train.py model.node_adaptive=true
-    # stage 1을 새로 학습하지 않고 기존 단일 stage 체크포인트에서 이어받기
-    python train.py model.node_adaptive=true stage2.init_from=output/merged/<날짜>/<시각>
-
-자세한 설계/제약은 ``docs/MERGED_ARCHITECTURE.md``의 "노드별 LSTM weight offset" 절 참고.
-
-이 브랜치(tmp)에는 다른 모델 구현이 없다(models/config.py, models/modeling.py 부재 —
-models/__init__.py 참고) — train.py는 이 모델 하나만 학습하는 단일 진입점이다.
+    python train.py --config-name config_<city> [seed=...] [model.<key>=...]
+    python train.py --config-name config_porto
 """
 
 from __future__ import annotations
@@ -35,6 +16,7 @@ import math
 from pathlib import Path
 
 import hydra
+import torch
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from torch.optim.lr_scheduler import LRScheduler
@@ -46,41 +28,13 @@ from models.merged import MergedDemandConfig, MergedDemandModel, compute_merged_
 
 logger = logging.getLogger(__name__)
 
-# PyTorch의 memory-efficient SDPA 백엔드가 거는 한계다. VRAM과는 무관하다 — 실제 코드는
-# aten/src/ATen/native/transformers/cuda/attention.cu의 이 검사다:
-#
-#     constexpr int64_t MAX_BATCH_SIZE = (1LL << 16) - 1;   // = 65535
-#     if (batch_size > MAX_BATCH_SIZE) {
-#       TORCH_CHECK(dropout_p == 0.0,
-#                   "Efficient attention cannot produce valid seed and offset outputs when "
-#                   "the batch size exceeds (", MAX_BATCH_SIZE, ").");
-#     }
-#
-# 즉 **dropout>0일 때만** 걸린다. dropout의 RNG 상태(philox seed/offset)를 backward용으로
-# 배치마다 기록하는 경로의 제약이고, 근본 원인은 CUDA 그리드 차원 상한이다 — cutlass 커널의
-# getBlocksGrid()가 dim3(ceil_div(num_queries, kQueriesPerBlock), num_heads, num_batches)라
-# num_batches가 blocks.z로 들어가는데 y/z 차원 상한이 65535다(x만 2^31-1).
-#
-# models/merged/modules/history.py의 LocalHistoryEncoder는 배치×시간×노드로 펼친다.
-# Ulsan의 batch=24이면 24*24*168=96,768행이므로 어텐션 가중치 dropout만 0으로
-# 설정한다. Porto의 batch=8은 8*24*200=38,400행이다. 출력/FFN dropout은
-# 여전히 0.1이며 batch 제한을 결정하는 것은 어텐션 가중치 dropout이다.
-#
-# 이 백엔드를 끄는 우회는 쓰지 않는다 — fallback(math) 백엔드가 어텐션 행렬을 그대로 만들어
-# 메모리를 훨씬 더 써서 d_model이 크면 오히려 OOM이 난다. 아래에서는
-# 어텐션 가중치 dropout>0일 때만 배치를 낮춘다(출력/FFN dropout은 무관하다).
 SDPA_BATCH_LIMIT = 65535
 
-# ablation 방식: 모듈을 지우지 않고, 그 모듈이 결과로 이어지는 텐서만 0으로 바꾼다.
-# 구조/파라미터 수/텐서 shape가 전부 보존되므로 측정된 차이가 "그 모듈의 정보" 때문임이
-# 분리된다. 예외는 no-branch-attn — 어텐션은 출력 텐서가 아니라 선택 메커니즘이라
-# 0-치환이 성립하지 않아 균등 가중으로 대체한다.
 ABLATION_MODE = 'zero'
 
 
 class LoggingCallback(TrainerCallback):
-    """Trainer의 기본 콜백은 step/eval 지표를 print()로만 찍어서 Hydra가 관리하는
-    로그 파일(${hydra.run.dir}/train.log)에 안 남는다. logging 모듈을 거치도록 감싼다."""
+    """Trainer 로그를 모듈 logger로 전달한다."""
 
     def on_log(self, args, state, control, logs=None, **kwargs) -> None:
         if logs is not None:
@@ -88,10 +42,7 @@ class LoggingCallback(TrainerCallback):
 
 
 class MinEpochEarlyStoppingCallback(EarlyStoppingCallback):
-    """최소 학습 epoch 이후부터 patience를 세는 early stopping callback.
-
-    ``min_epochs=0``이면 원본 merged_model의 무조건 patience와 동치다.
-    """
+    """설정된 최소 epoch 이후부터 patience를 세는 콜백."""
 
     def __init__(
         self,
@@ -123,7 +74,7 @@ class MinEpochEarlyStoppingCallback(EarlyStoppingCallback):
 
 
 class WarmupCosineAnnealingLR(LRScheduler):
-    """ADFormer와 같은 epoch 단위 warmup 5 + cosine 60 + eta_min 유지."""
+    """epoch 단위 warmup/cosine 스케줄러와 최저 학습률."""
 
     def __init__(
         self, optimizer, T_max, warmup_t=0, warmup_lr_init=1e-5, eta_min=0,
@@ -153,7 +104,7 @@ class WarmupCosineAnnealingLR(LRScheduler):
 
 
 class PerEpochWarmupCosineAnnealingLR(WarmupCosineAnnealingLR):
-    """HF Trainer의 optimizer-step 호출을 ADFormer의 epoch-step으로 묶는다."""
+    """HF Trainer의 optimizer step을 epoch 단위 scheduler step으로 묶는다."""
 
     def __init__(self, optimizer, steps_per_epoch: int, **kwargs) -> None:
         if steps_per_epoch < 1:
@@ -196,7 +147,7 @@ class WarmupCosineTrainer(Trainer):
 
 
 def build_dataset_kwargs(cfg: DictConfig) -> dict:
-    """UnifiedDemandDataset 생성 인자. 원본 merged_model/train.py와 같은 값 집합."""
+    """UnifiedDemandDataset 생성 인자를 만든다."""
 
     weather_csv_path = Path(cfg.dataset.weather_csv_path).expanduser()
     if not weather_csv_path.is_absolute():
@@ -235,12 +186,7 @@ def compute_metrics(eval_pred) -> dict[str, float]:
 
 
 def make_rmse_mape_metrics(rmse_weight: float):
-    """``rmse_weight * RMSE + MAPE(+1)``을 지표로 추가한 compute_metrics를 만든다.
-
-    stage 2가 쓰는 ``RmseMapeLoss``의 학습 중 RMSE는 미니배치 단위 surrogate라 batch size에
-    영향을 받는다. best checkpoint 선택은 이 함수가 **전체 validation 예측**으로 다시 계산한
-    같은 목적함수를 쓴다(lora 브랜치와 같은 관례).
-    """
+    """전체 validation 예측에서 목적함수를 계산하는 metric callback을 만든다."""
 
     def compute_stage2_metrics(eval_pred) -> dict[str, float]:
         metrics = compute_merged_metrics(eval_pred.predictions, eval_pred.label_ids)
@@ -251,11 +197,9 @@ def make_rmse_mape_metrics(rmse_weight: float):
 
 
 def select_node_adaptive_indices(train_ds: UnifiedDemandDataset, min_demand: float) -> list[int]:
-    """train 구간 평균 수요가 ``min_demand``를 넘는 노드 id 목록.
+    """train 구간 평균 수요가 ``min_demand``를 넘는 노드를 선택한다.
 
-    **train 구간에서만 계산해야 한다** — 전체 기간으로 고르면 어떤 노드가 ΔW를 받을지가
-    test 구간 정보에 의존하게 되어 시간 리크가 된다. 날씨 정규화 통계와 같은 이유로 같은
-    구간(``[time_step, train_end)``)을 쓴다.
+    선택은 시간 리크를 막기 위해 ``[time_step, train_end)``만 사용한다.
     """
 
     window = train_ds.grid[train_ds.time_step : train_ds.train_end]
@@ -272,11 +216,7 @@ def select_node_adaptive_indices(train_ds: UnifiedDemandDataset, min_demand: flo
 def _summarize_history(
     log_history: list[dict], best_metric_key: str = 'loss'
 ) -> tuple[list[dict], int, float]:
-    """Trainer의 log_history를 원본 result JSON의 ``history`` 형태로 압축한다.
-
-    원본은 epoch마다 {"epoch", "train": {...}, "val": {...}}를 남겼다. Trainer는 train 로그와
-    eval 로그를 따로 남기므로 epoch을 키로 합친다.
-    """
+    """Trainer 로그를 epoch별로 합치고 최적 validation 지표를 반환한다."""
 
     per_epoch: dict[int, dict] = {}
     for entry in log_history:
@@ -294,8 +234,6 @@ def _summarize_history(
             }
     history = [per_epoch[key] for key in sorted(per_epoch)]
 
-    # best 선택 기준은 stage마다 다르다 — stage 1은 val loss, rmse_mape를 쓰는 stage 2는
-    # 전체 validation 예측으로 다시 계산한 rmse_mape_objective다.
     best_epoch, best_val = 0, float('inf')
     for record in history:
         val = record.get('val', {}).get(best_metric_key)
@@ -304,18 +242,68 @@ def _summarize_history(
     return history, best_epoch, best_val
 
 
+def load_stage1_with_new_nodes(init_from: str, config: MergedDemandConfig) -> MergedDemandModel:
+    """공유 stage-1 가중치를 불러오고 노드 ΔW를 0으로 초기화한다."""
+    source_config = MergedDemandConfig.from_pretrained(init_from)
+    # 체크포인트를 다시 지정하기 전에 저장된 목적함수와 구조를 검증한다.
+    ignored = {
+        'node_adaptive_indices', 'node_adaptive_min_demand', 'node_adaptive',
+        'architectures', 'dtype',
+    }
+    saved = source_config.to_dict()
+    requested = config.to_dict()
+    differing = [
+        key for key in saved.keys() | requested.keys()
+        if key not in ignored and saved.get(key) != requested.get(key)
+    ]
+    if differing:
+        raise ValueError(
+            f'stage2.init_from={init_from}은 현재 stage 1 설정과 다름: '
+            f'{[(key, saved.get(key), requested.get(key)) for key in sorted(differing)]}'
+        )
+
+    source = MergedDemandModel.from_pretrained(init_from)
+    nonzero = [
+        name for name, param in source.named_parameters()
+        if 'node_delta_' in name and torch.count_nonzero(param.detach()).item()
+    ]
+    if nonzero:
+        raise ValueError(
+            f'stage2.init_from은 ΔW=0인 stage1 체크포인트여야 함 — 0이 아닌 항목: {nonzero}'
+        )
+
+    model = MergedDemandModel(config)
+    source_weights = {
+        name: value for name, value in source.state_dict().items()
+        if 'node_delta_' not in name
+    }
+    expected = {
+        name for name in model.state_dict() if 'node_delta_' in name
+    }
+    loaded = model.load_state_dict(source_weights, strict=False)
+    if set(loaded.missing_keys) != expected or loaded.unexpected_keys:
+        raise ValueError(
+            f'stage2.init_from 공유 가중치 불일치: '
+            f'missing={loaded.missing_keys}, unexpected={loaded.unexpected_keys}'
+        )
+    logger.info(
+        f'[stage2] stage1 공유 가중치 {len(source_weights)}개 복원; '
+        f'ΔW 노드 {len(source_config.node_adaptive_indices or [])}'
+        f' -> {len(config.node_adaptive_indices or [])} (0으로 재초기화)'
+    )
+    return model
+
+
 @hydra.main(config_path='configs', config_name='config_ulsan', version_base=None)
 def main(cfg: DictConfig) -> None:
     data_path, dataset_kwargs, train_ds, val_ds, test_ds = build_datasets(cfg)
 
-    # 날씨 정규화 통계는 train 구간에서만 계산한다(시간 리크 방지).
-    # 적설처럼 train 내내 값이 고정(분산 0)인 피처가 있어 std에 하한을 둔다(porto 적설이 실제로 그렇다).
+    # train 구간에서 날씨 통계를 계산하고 분산 0인 피처의 표준편차를 제한한다.
     train_weather = train_ds.weather[train_ds.time_step : train_ds.train_end]
     weather_mean = train_weather.mean(axis=0)
     weather_std = train_weather.std(axis=0).clip(min=1e-6)
     logger.info(f'weather_mean={weather_mean.tolist()}, weather_std={weather_std.tolist()}')
 
-    # smoke 테스트용. null이면 전체를 쓴다(원본 --max-batches에 대응).
     limit = cfg.get('limit_samples')
     train_set, val_set, eval_test_set = train_ds, val_ds, test_ds
     if limit:
@@ -327,9 +315,7 @@ def main(cfg: DictConfig) -> None:
 
     model_kwargs = OmegaConf.to_container(cfg.model, resolve=True)
 
-    # 노드별 ΔW를 받을 노드를 train 구간에서만 고른다(시간 리크 방지). 꺼져 있으면 None을
-    # 넘겨 모델이 delta 파라미터를 아예 만들지 않게 한다 — 그래야 state_dict가 이 기능이
-    # 없던 시절과 정확히 같아서 기존 체크포인트/parity 테스트가 유지된다.
+    # train 구간에서만 노드별 ΔW 대상을 고르고, None이면 해당 파라미터를 만들지 않는다.
     node_adaptive = bool(model_kwargs.get('node_adaptive', False))
     node_adaptive_indices = None
     if node_adaptive:
@@ -354,21 +340,18 @@ def main(cfg: DictConfig) -> None:
         node_adaptive_indices=node_adaptive_indices,
         **model_kwargs,
     )
-    # Trainer는 __init__에서 seed를 설정하는데 그건 모델이 만들어진 뒤다 — 그대로 두면
-    # 초기 가중치가 프로세스마다 달라져 같은 seed로도 재현되지 않는다. 여기서 먼저 고정한다.
+    # Trainer 초기화보다 먼저 seed를 고정해 모델 초기화를 재현한다.
     set_seed(cfg.train.seed)
 
-    # stage2.init_from이 있으면 그 체크포인트의 가중치에서 시작하고 stage 1을 건너뛴다.
     configured_init_from = cfg.get('stage2', {}).get('init_from')
     init_from = configured_init_from if node_adaptive else None
     if configured_init_from and not node_adaptive:
-        # 조용히 무시하면 "이어받아 학습했다"고 오해한 채 처음부터 학습한 결과를 얻게 된다.
         logger.warning(
             f'stage2.init_from={configured_init_from}이 주어졌지만 model.node_adaptive=false라 '
             '2-stage 학습을 하지 않는다 — 무시한다'
         )
     if init_from:
-        model = MergedDemandModel.from_pretrained(init_from, config=model_config)
+        model = load_stage1_with_new_nodes(init_from, model_config)
         logger.info(f'[stage2] stage1 체크포인트에서 이어받음: {init_from}')
     else:
         model = MergedDemandModel(model_config)
@@ -381,8 +364,7 @@ def main(cfg: DictConfig) -> None:
     if schedule_name not in (None, 'warmup_cosine'):
         raise ValueError(f"알 수 없는 optimizer_schedule.name: {schedule_name!r}")
 
-    # SDPA의 65,535행 제한은 어텐션 가중치 dropout만 검사한다.
-    # 출력/FFN dropout=0.1은 유지해도 된다. train/eval 배치를 같이 검사한다.
+    # SDPA 제한은 attention 가중치 dropout이 켜진 경우에만 적용된다.
     nodes = train_ds.height * train_ds.width
     per_sample = train_ds.time_step * nodes
     if model_config.attention_dropout > 0.0:
@@ -410,13 +392,9 @@ def main(cfg: DictConfig) -> None:
         metrics_fn=compute_metrics,
         metric_for_best_model: str = 'loss',
     ) -> Trainer:
-        """stage마다 Trainer를 새로 만든다.
+        """각 학습 stage마다 독립된 Trainer를 만든다.
 
-        optimizer / LR 스케줄러 / early stopping 상태가 stage 경계에서 초기화돼야 하고,
-        stage 1의 optimizer에는 얼어 있는 ΔW가 들어있지 않기 때문이다. output_dir도 분리해야
-        한다 — 같은 디렉터리를 쓰면 ``save_total_limit``이 앞 stage의 체크포인트를 지운다.
-        ``stage_dir=None``은 2-stage를 쓰지 않는 경우로, 체크포인트 경로가 이 기능 추가
-        이전과 동일하다.
+        optimizer, scheduler, early stopping, checkpoint 상태는 stage 사이에 공유하지 않는다.
         """
 
         stage_cfg = dict(train_cfg)
@@ -468,15 +446,12 @@ def main(cfg: DictConfig) -> None:
     stage1_metrics: dict[str, float] | None = None
 
     if not deltas:
-        # --- node_adaptive를 쓰지 않는 경우: 이 기능 추가 이전과 완전히 동일한 단일 stage ---
         trainer = build_trainer(None, train_cfg['learning_rate'])
         trainer.train()
         best_metric_key = 'loss'
     else:
         if init_from:
-            # stage 1은 이미 끝난 것을 불러왔다. 이 옵션은 weights-only warm start이므로,
-            # 학습된 stage2 체크포인트를 실수로 stage1 시작점에 넣지 않도록 ΔW가 정확히
-            # 0인지 확인한다.
+            # stage 2 전에 weights-only 초기화를 검증한다.
             nonzero = [
                 name
                 for name, param in model.named_parameters()
@@ -486,7 +461,7 @@ def main(cfg: DictConfig) -> None:
                 raise ValueError(
                     f'stage2.init_from은 ΔW=0인 stage1 체크포인트여야 함 — 0이 아닌 항목: {nonzero}'
                 )
-            # 그 시점의 성능을 stage 1 결과와 같은 기준으로 남겨둔다.
+            # 같은 목적함수 기준의 stage 1 test 지표를 기록한다.
             model.configure_loss(str(cfg.model.loss_type))
             for param in deltas:
                 param.requires_grad_(False)
@@ -497,7 +472,6 @@ def main(cfg: DictConfig) -> None:
             logger.info(f'[stage1] Test metrics: {stage1_metrics}')
             del probe
         else:
-            # --- stage 1: ΔW를 0으로 고정 -> node_adaptive를 끈 것과 동일한 학습 ---
             model.configure_loss(str(cfg.model.loss_type))
             for param in deltas:
                 param.requires_grad_(False)
@@ -522,8 +496,6 @@ def main(cfg: DictConfig) -> None:
             # stage 1 Trainer가 optimizer와 모델 wrapper를 계속 붙들고 있지 않게 놓아준다.
             del stage1
 
-        # --- stage 2: ΔW 해제 후 finetuning ---
-        # load_best_model_at_end=true라 model에는 stage 1의 best 가중치가 들어있다.
         for param in deltas:
             param.requires_grad_(True)
         stage2_loss = str(cfg.stage2.loss)
@@ -558,8 +530,6 @@ def main(cfg: DictConfig) -> None:
     logger.info(f'Test metrics: {test_metrics}')
 
     if deltas:
-        # ΔW가 실제로 얼마나 움직였는지 남긴다 — 전부 0에 가까우면 stage 2가 아무것도
-        # 배우지 못한 것이라 결과 해석이 달라진다.
         for name, param in model.named_parameters():
             if 'node_delta' in name:
                 logger.info(
@@ -576,16 +546,13 @@ def main(cfg: DictConfig) -> None:
         'weather_std': weather_std.tolist(),
         'device': str(trainer.args.device),
         'retrieval_scope': cfg.model.retrieval_scope,
-        # stage1(=model.loss_type)과 stage2의 목적함수를 따로 남긴다. 2-stage 런의
-        # 결과 JSON에서 'objective'만 보면 stage1 값이라 최종 학습 loss로 오해하기 쉽다.
-        # 'objective'는 기존 78건 JSON과의 스키마 호환을 위해 그대로 두고, 최종 loss는
-        # 'final_loss'를 본다.
+        # stage별 목적함수를 별도로 기록한다.
         'objective': cfg.model.loss_type,
         'stage1_loss': cfg.model.loss_type,
         'final_loss': str(cfg.stage2.loss) if deltas else cfg.model.loss_type,
         'ablation': cfg.ablation,
         'ablation_mode': ABLATION_MODE,
-        # 실제로 적용된 스위치. 라벨(cfg.ablation)이 아니라 이 값이 근거다.
+        # ablation 라벨이 아닌 실제 적용된 스위치를 기록한다.
         'ablation_flags': {
             key: model_kwargs[key]
             for key in (
@@ -601,8 +568,7 @@ def main(cfg: DictConfig) -> None:
             )
         },
         'seed': int(cfg.train.seed),
-        # 노드별 ΔW 실험의 근거. node_adaptive=false면 단일 stage이고 이 기능 추가 이전과
-        # 동일한 학습이다.
+        # node-adaptive 설정과 stage 메타데이터를 기록한다.
         'node_adaptive': node_adaptive,
         'node_adaptive_min_demand': (
             float(model_kwargs['node_adaptive_min_demand']) if node_adaptive else None
@@ -612,12 +578,12 @@ def main(cfg: DictConfig) -> None:
         'node_delta_params': sum(p.numel() for p in deltas),
         'stages': ['stage1', 'stage2'] if deltas else ['single'],
         'stage2_loss': str(cfg.stage2.loss) if deltas else None,
+        'stage1_init_from': str(init_from) if init_from else None,
         'stage1': stage_records.get('stage1'),
         'stage1_test': stage1_metrics,
         'best_metric': best_metric_key,
         'best_epoch': best_epoch,
         'best_val_loss': best_val,
-        # 원본 스키마의 "checkpoint"는 .pt 파일이었다. 이제 save_pretrained 디렉터리다.
         'checkpoint': str(output_dir),
         'test': {
             'loss': test_metrics.get('test_loss'),
@@ -631,8 +597,7 @@ def main(cfg: DictConfig) -> None:
 
     run_json = cfg.get('run_json')
     if run_json is None:
-        # node_adaptive 런은 파일 이름을 달리한다 — 안 그러면 같은 (city, loss, ablation, seed)의
-        # 기존 단일 stage 결과를 덮어써서 비교 기준 자체가 사라진다.
+        # node-adaptive 실행을 구분하는 접미사를 사용한다.
         suffix = '_nodeadaptive' if node_adaptive else ''
         run_json = (
             Path('output')

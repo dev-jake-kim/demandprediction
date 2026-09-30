@@ -8,17 +8,7 @@ from torch.utils.data import Dataset
 
 
 class GridDemandDataset(Dataset):
-    """전처리 파이프라인(`preprocessing/*/create_graph.py`)이 저장한
-    `temporal_grid.npy`((T, X, Y), 시간대별 격자 수요)를 읽어,
-    직전 `time_step`시간(t-k ~ t-1)의 전체 격자 수요로 t시점의 전체 격자(X*Y개 노드) 수요를
-    한 번에 예측하는 샘플을 만든다. 샘플 하나 = 시간 t 하나 (노드별로 나누지 않음 —
-    노드별 forward/backward는 `GridDemandModel`이 배치 차원을 늘려서 벡터화로 처리한다).
-
-    반환 형식은 HuggingFace `Trainer`에서 바로 쓸 수 있도록
-    `{'demands', 'labels', 'sample_idx'}` 딕셔너리로 고정한다
-    (configs/config.yaml의 `remove_unused_columns: false`와 짝을 맞춤 —
-    `sample_idx`는 모델 forward에 안 쓰여도 collate 단계에서 제거되지 않음).
-    """
+    """Load a temporal demand grid and return history/label samples per target time."""
 
     def __init__(
         self,

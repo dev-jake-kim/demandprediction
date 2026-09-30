@@ -1,18 +1,33 @@
 #!/usr/bin/env python3
-"""merged 모델 체크포인트들의 노드별 test 지표를 격자 위에 그린다.
+"""Plot per-node test metrics for merged-model checkpoints.
 
-lora 브랜치의 ``visualize_node_metrics.py``와 같은 형식이다 — 지표 3개(RMSE / MAE / MAPE(+1))를
-행으로, [기준 / 변형 / 차이]를 열로 놓는다. 차이 열은 0을 중심으로 한 발산 컬러맵이라
-초록이 개선(감소), 빨강이 악화(증가)다.
-
-전체 지표 하나(예: "RMSE +2%")로는 모델이 **어느 노드에서** 이득을 보고 잃었는지 알 수 없다.
-수요 분포가 심하게 치우친 격자(ulsan은 노드 중앙값 0.141)에서는 그 구분이 결정적이다.
+Rows contain RMSE, MAE, and MAPE(+1); columns contain the baseline, variant,
+and their difference.
 
     python visualize_merged_node_metrics.py \\
-        --baseline output/merged/2026-09-12/00-48-02 \\
-        --variant  output/merged/2026-09-12/16-18-35 \\
+        --baseline output/past/merged/2026-09-12/00-48-02 \\
+        --variant output/past/merged/2026-09-12/16-18-35 \\
         --variant-label "stage2 (combined)" \\
-        --out docs/merged_node_metrics/ulsan_lossC.png
+        --out output/merged_node_metrics/ulsan_lossC.png
+
+    CUDA_VISIBLE_DEVICES=1 python visualize_merged_node_metrics.py \\
+        --city porto --adformer-dir output/past/ADFormer \\
+        --variant output/past/experiments/checkpoints/tmp_node01_mae_porto_seed245 \\
+        --baseline-label "ADFormer (5-seed mean)" --variant-label "stage2 (seed=245)" \\
+        --out output/node_metric_comparison/porto_seed245_vs_adformer.png
+
+    CUDA_VISIBLE_DEVICES=1 python visualize_merged_node_metrics.py \\
+        --city porto --adformer-dir output/past/ADFormer \\
+        --variant output/past/experiments/checkpoints/tmp_node01_mae_porto_seed245 \\
+                  output/past/experiments/checkpoints/tmp_node01_mae_porto_seed6835 \\
+                  output/past/experiments/checkpoints/tmp_node01_mae_porto_seed851 \\
+        --baseline-label "ADFormer (5-seed mean)" \\
+        --variant-label "stage2 (3-seed mean)" \\
+        --out output/node_metric_comparison/porto_stage2_mean_vs_adformer.png
+
+Multiple variants are averaged per node and metric after each variant's metrics
+are computed; predictions are not averaged first. ADFormer maps are aggregate
+node metrics, not values from a matched seed.
 """
 
 from __future__ import annotations
@@ -40,6 +55,8 @@ METRIC_LABELS = {'rmse': 'RMSE', 'mae': 'MAE', 'mape_plus1': 'MAPE(+1) [%]'}
 
 def predict(checkpoint: Path, dataset: UnifiedDemandDataset, device: torch.device,
             batch_size: int) -> tuple[np.ndarray, np.ndarray]:
+    if device.type == 'cuda':
+        torch.cuda.init()  # cuDNN LSTM 가중치를 GPU로 옮기기 전에 CUDA device를 확정한다.
     model = MergedDemandModel.from_pretrained(str(checkpoint)).to(device).eval()
     preds, labels = [], []
     with torch.no_grad():
@@ -49,7 +66,8 @@ def predict(checkpoint: Path, dataset: UnifiedDemandDataset, device: torch.devic
             preds.append(model(**batch)['logits'].cpu().numpy())
             labels.append(target.numpy())
     del model
-    torch.cuda.empty_cache()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
     return np.concatenate(preds), np.concatenate(labels)
 
 
@@ -61,6 +79,23 @@ def node_metrics(predictions: np.ndarray, labels: np.ndarray) -> dict[str, np.nd
         'mae': np.mean(np.abs(error), axis=0),
         'mape_plus1': np.mean(np.abs(error) / (np.abs(labels) + 1.0), axis=0) * 100.0,
     }
+
+
+def load_adformer_node_metrics(directory: Path, city: str,
+                               shape: tuple[int, int]) -> dict[str, np.ndarray]:
+    """Load the supplied ADFormer node maps; its ``mape`` uses the +1 denominator."""
+    prefix = city.upper()
+    filenames = {'rmse': 'rmse', 'mae': 'mae', 'mape_plus1': 'mape'}
+    metrics = {}
+    for name, suffix in filenames.items():
+        path = directory / f'{prefix}_{suffix}.npy'
+        values = np.load(path, allow_pickle=False)
+        if values.shape != shape or not np.issubdtype(values.dtype, np.number):
+            raise ValueError(f'{path}: expected numeric grid {shape}, got {values.shape} {values.dtype}')
+        if not np.isfinite(values).all() or (values < 0).any():
+            raise ValueError(f'{path}: node metrics must be finite and nonnegative')
+        metrics[name] = values
+    return metrics
 
 
 def annotate_delta(axis: plt.Axes, values: np.ndarray) -> None:
@@ -96,13 +131,12 @@ def plot(city: str, baseline: dict, variant: dict, demand: np.ndarray,
             norm=TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit), origin='upper')
         improved = int(np.count_nonzero(delta < 0))
         degraded = int(np.count_nonzero(delta > 0))
-        # 수요가 높은 노드에서의 변화가 전체 지표를 좌우하므로 따로 센다.
         high = demand > np.median(demand)
         high_delta = float(delta[high].mean())
         delta_axis.set_title(
             f'{var_label} - {base_label} — {METRIC_LABELS[metric]}\n'
-            f'green: decreased ({improved}), red: increased ({degraded})  |  '
-            f'수요 상위 절반 노드 평균 Δ = {high_delta:+.3f}')
+            f'green/lower: {improved}, red/higher: {degraded}; '
+            f'high-demand mean Δ: {high_delta:+.3f}')
         annotate_delta(delta_axis, delta)
         fig.colorbar(delta_image, ax=delta_axis, fraction=0.046, pad=0.04)
 
@@ -123,8 +157,11 @@ def plot(city: str, baseline: dict, variant: dict, demand: np.ndarray,
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--city', default='ulsan', choices=('ulsan', 'porto'))
-    parser.add_argument('--baseline', required=True, help='기준 체크포인트 디렉터리')
-    parser.add_argument('--variant', required=True, help='비교할 체크포인트 디렉터리')
+    baseline = parser.add_mutually_exclusive_group(required=True)
+    baseline.add_argument('--baseline', help='기준 체크포인트 디렉터리')
+    baseline.add_argument('--adformer-dir', help='도시별 *_rmse/mae/mape.npy가 있는 디렉터리')
+    parser.add_argument('--variant', required=True, nargs='+',
+                        help='변형 체크포인트 디렉터리(여러 개면 노드별 지표 평균)')
     parser.add_argument('--baseline-label', default='stage1')
     parser.add_argument('--variant-label', default='stage2')
     parser.add_argument('--out', required=True)
@@ -139,19 +176,52 @@ def main() -> None:
         resolve_dataset_path(args.city, cfg.dataset.npy_path), 'test',
         **build_dataset_kwargs(cfg))
 
-    base_pred, labels = predict(Path(args.baseline), dataset, device, args.batch_size)
-    var_pred, _ = predict(Path(args.variant), dataset, device, args.batch_size)
-    demand = labels.astype(np.float64).mean(axis=0)   # 노드별 평균 실제 수요
+    if args.adformer_dir:
+        base_metrics = load_adformer_node_metrics(
+            Path(args.adformer_dir), args.city, (dataset.height, dataset.width))
+    else:
+        base_pred, base_labels = predict(Path(args.baseline), dataset, device, args.batch_size)
+        base_metrics = node_metrics(base_pred, base_labels)
 
-    plot(args.city, node_metrics(base_pred, labels), node_metrics(var_pred, labels),
+    variant_maps = []
+    variant_global = []
+    for checkpoint in args.variant:
+        prediction, labels = predict(Path(checkpoint), dataset, device, args.batch_size)
+        variant_maps.append(node_metrics(prediction, labels))
+        error = labels - prediction
+        variant_global.append((
+            Path(checkpoint).name,
+            float(np.sqrt((error ** 2).mean())),
+            float(np.abs(error).mean()),
+            float((np.abs(error) / (np.abs(labels) + 1)).mean() * 100),
+        ))
+
+    # Average per-node metrics, not predictions.
+    var_metrics = (
+        variant_maps[0] if len(variant_maps) == 1 else
+        {name: np.mean([maps[name] for maps in variant_maps], axis=0) for name in METRICS}
+    )
+    demand = labels.astype(np.float64).mean(axis=0)
+    plot(args.city, base_metrics, var_metrics,
          demand, args.baseline_label, args.variant_label, Path(args.out))
 
-    # 전체 지표도 같이 찍어 그림과 숫자가 어긋나지 않게 한다.
-    for label, pred in ((args.baseline_label, base_pred), (args.variant_label, var_pred)):
-        err = labels - pred
-        print(f'  {label:24s} RMSE={np.sqrt((err**2).mean()):.5f} '
-              f'MAE={np.abs(err).mean():.5f} '
-              f'MAPE+1={(np.abs(err)/(np.abs(labels)+1)).mean()*100:.3f}')
+    if args.adformer_dir:
+        print(f'  {args.baseline_label:24s} RMSE={np.sqrt(np.mean(base_metrics["rmse"] ** 2)):.5f} '
+              f'MAE={base_metrics["mae"].mean():.5f} '
+              f'MAPE+1={base_metrics["mape_plus1"].mean():.3f} '
+              '(aggregated node maps, not a matched seed)')
+    else:
+        error = base_labels - base_pred
+        print(f'  {args.baseline_label:24s} RMSE={np.sqrt((error ** 2).mean()):.5f} '
+              f'MAE={np.abs(error).mean():.5f} '
+              f'MAPE+1={(np.abs(error)/(np.abs(base_labels)+1)).mean()*100:.3f}')
+    for checkpoint, rmse, mae, mape in variant_global:
+        label = args.variant_label if len(variant_global) == 1 else checkpoint
+        print(f'  {label:24s} RMSE={rmse:.5f} MAE={mae:.5f} MAPE+1={mape:.3f}')
+    if len(variant_global) > 1:
+        print(f'  {args.variant_label:24s} mean of node RMSE={var_metrics["rmse"].mean():.5f} '
+              f'MAE={var_metrics["mae"].mean():.5f} '
+              f'MAPE+1={var_metrics["mape_plus1"].mean():.3f}')
 
 
 if __name__ == '__main__':
