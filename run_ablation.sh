@@ -3,7 +3,8 @@
 
 
 #   ./run_ablation.sh build      # 큐 파일 생성(우선순위 순)
-#   ./run_ablation.sh worker <gpu> <slot>
+#   DESCRIPTION='실험 설명' ./run_ablation.sh worker <gpu> <slot>
+# DESCRIPTION에는 작은따옴표를 쓰지 않는다.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,6 +52,7 @@ case "${1:-}" in
     ;;
   worker)
     GPU="${2:?gpu 번호 필요}"; SLOT="${3:?slot 번호 필요}"
+    DESCRIPTION="${DESCRIPTION:?DESCRIPTION(실험 설명)이 필요함}"
     mkdir -p output/merged/runs output/merged/logs
     while true; do
       # 큐에서 첫 줄을 원자적으로 꺼낸다.
@@ -69,6 +71,7 @@ case "${1:-}" in
       # 도시별 model 그룹을 선택하려면 --config-name이 필요하다.
       PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="$GPU" conda run --no-capture-output -n DA \
         python train.py --config-name "config_${city}" train.seed="$seed" \
+          "description='${DESCRIPTION} (${ab} ${city} seed ${seed})'" \
           model.loss_type=mae ablation="$ab" run_json="$out" $overrides > "$log" 2>&1
       if [ -f "$out" ]; then
         echo "[w$GPU-$SLOT] $(date +%H:%M:%S) 완료 $ab/$city/$seed $(python3 -c "

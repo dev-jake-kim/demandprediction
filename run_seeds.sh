@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # merged 모델 다중 시드 실행기.
 
-#   ./run_seeds.sh <dataset> <loss_type> [seed ...]
-# GPU는 CUDA_VISIBLE_DEVICES로 고른다.
+#   DESCRIPTION='실험 설명' ./run_seeds.sh <dataset> <loss_type> [seed ...]
+# GPU는 CUDA_VISIBLE_DEVICES로 고른다. DESCRIPTION에는 작은따옴표를 쓰지 않는다.
 set -euo pipefail
 
 DATASET="${1:?dataset(ulsan|porto)이 필요함}"
 LOSS_TYPE="${2:?loss_type(combined|mae)이 필요함}"
+DESCRIPTION="${DESCRIPTION:?DESCRIPTION(실험 설명)이 필요함}"
 shift 2
 if [ "$#" -eq 0 ]; then
   SEEDS=(245 6835 851 5123 535)
@@ -30,6 +31,7 @@ for seed in "${SEEDS[@]}"; do
   PYTHONUNBUFFERED=1 conda run --no-capture-output -n DA \
     python train.py --config-name "config_${DATASET}" \
       train.seed="$seed" model.loss_type="$LOSS_TYPE" model.use_retrieval=true \
+      "description='${DESCRIPTION}'" \
       ablation=full run_json="$out" > "$log" 2>&1
   echo "[done] seed=$seed $(python3 -c "
 import json;d=json.load(open('$out'));t=d['test']

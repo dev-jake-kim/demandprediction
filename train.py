@@ -4,8 +4,8 @@
 
 사용 예::
 
-    python train.py --config-name config_<city> [seed=...] [model.<key>=...]
-    python train.py --config-name config_porto
+    python train.py --config-name config_<city> "description='실험 설명'" [seed=...] [model.<key>=...]
+    python train.py --config-name config_porto "description='실험 설명'"
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import subprocess
 from pathlib import Path
 
 import hydra
@@ -294,8 +295,27 @@ def load_stage1_with_new_nodes(init_from: str, config: MergedDemandConfig) -> Me
     return model
 
 
+def git_commit() -> str:
+    """저장소 HEAD 해시. 추적 파일에 커밋되지 않은 변경이 있으면 ``(dirty)``를 붙인다."""
+
+    root = Path(__file__).resolve().parent
+    try:
+        head = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'], cwd=root, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ['git', 'status', '--porcelain', '--untracked-files=no'],
+            cwd=root, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return 'unknown'
+    return f'{head} (dirty)' if dirty else head
+
+
 @hydra.main(config_path='configs', config_name='config_ulsan', version_base=None)
 def main(cfg: DictConfig) -> None:
+    logger.info(f'[Description] {cfg.description}')
+    logger.info(f'[Commit] {git_commit()}')
     data_path, dataset_kwargs, train_ds, val_ds, test_ds = build_datasets(cfg)
 
     # train 구간에서 날씨 통계를 계산하고 분산 0인 피처의 표준편차를 제한한다.

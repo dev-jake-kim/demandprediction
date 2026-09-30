@@ -23,11 +23,14 @@ Hydra로 설정을 관리한다. 루트 config가 도시별로 분리돼 있다
 + `configs/model/merged_porto.yaml`, 둘 다 `configs/dataset/*.yaml` 공유).
 
 ```bash
-python train.py                                            # ulsan, 검색 pass (기본값)
-python train.py --config-name config_porto                  # porto, 검색 pass
-python train.py model.use_retrieval=true ablation=full     # 검색 켬 (ulsan)
+python train.py "description='실험 설명'"                                  # ulsan, 검색 pass (기본값)
+python train.py --config-name config_porto "description='실험 설명'"      # porto, 검색 pass
+python train.py "description='실험 설명'" model.use_retrieval=true ablation=full   # 검색 켬
 python validate_merged.py --device cpu                     # 학습 전 빠른 구조/인과 검사
 ```
+
+`description`은 필수이며, 로그 맨 위에 `[Description]`과 `[Commit]`(HEAD 해시, 미커밋 변경 시
+`(dirty)`)이 출력된다. 실험은 커밋 후 실행한다.
 
 - 결과(로그, 체크포인트)는 `output/${project_name}/{날짜}/{시간}/`에 저장된다 (`hydra.run.dir`).
 - 결과 요약 JSON 경로는 `run_json`, 없으면 `output/merged/runs/`. 이전 실험 기록은 `output/past/`.

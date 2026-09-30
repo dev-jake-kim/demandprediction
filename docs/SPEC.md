@@ -263,7 +263,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
   `cosine_epochs=60`, `eta_min=1e-4`.
 - `stage2`: `learning_rate=1e-4`, `loss=mae`, `rmse_weight=10.0`, `init_from=null`.
 - `callbacks.early_stopping`: `min_epochs=0`, `early_stopping_patience=20`.
-- `limit_samples=null`, `run_json=null`.
+- `description=???` (필수, 실험 설명), `limit_samples=null`, `run_json=null`.
 - Hydra 실행 디렉터리 `output/${project_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}`.
 
 </details>
@@ -475,9 +475,18 @@ b(n)    = b_ih + b_hh + Δb[n]   Δb: [A, 4h]
 ## 8. 학습 `train.py`
 
 ```bash
-python train.py --config-name config_<city> [seed=...] [model.<key>=...] \
-  [hydra.run.dir=...] [run_json=...]
+python train.py --config-name config_<city> "description='실험 설명'" \
+  [seed=...] [model.<key>=...] [hydra.run.dir=...] [run_json=...]
 ```
+
+- `description`은 필수다. 값에 공백·쉼표·괄호가 있으면 위처럼 작은따옴표로 감싼다.
+- 실험은 변경 사항을 **커밋한 뒤** 실행한다. 로그 맨 위 두 줄은 다음과 같고, 커밋되지 않은
+  추적 파일 변경이 있으면 해시 뒤에 `(dirty)`가 붙는다.
+
+  ```text
+  [Description] <description>
+  [Commit] <HEAD 해시>[ (dirty)]
+  ```
 
 1. 세 split의 `UnifiedDemandDataset`을 만든다.
 2. train 구간에서 날씨 통계와 적응 노드를 계산해 `MergedDemandConfig`에 주입하고,
@@ -568,10 +577,11 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
 
 | 스크립트 | 동작 | 출력 |
 |---|---|---|
-| `run_seeds.sh <city> <loss> [seeds]` | 기본 5시드 `245 6835 851 5123 535`, 검색 켬(`model.use_retrieval=true`) | `output/merged/runs/<city>_<loss>_seed<seed>.json`, `output/merged/logs/` |
-| `run_ablation.sh build` / `worker <gpu> <slot>` | 3시드 `245 6835 851`, ablation 큐. `no-ir` 외에는 검색 켬 기준 | `output/merged/runs/<city>_mae_<ab>_zero_seed<seed>.json` |
+| `DESCRIPTION=... run_seeds.sh <city> <loss> [seeds]` | 기본 5시드 `245 6835 851 5123 535`, 검색 켬(`model.use_retrieval=true`) | `output/merged/runs/<city>_<loss>_seed<seed>.json`, `output/merged/logs/` |
+| `run_ablation.sh build` / `DESCRIPTION=... run_ablation.sh worker <gpu> <slot>` | 3시드 `245 6835 851`, ablation 큐. `no-ir` 외에는 검색 켬 기준. description에 ablation·도시·시드를 덧붙임 | `output/merged/runs/<city>_mae_<ab>_zero_seed<seed>.json` |
 
-- `output/`은 git 추적 대상이 아니다(과거 `output/past/merged_model/runs/*.json` 제외).
+- `output`은 외장 디스크 `/mnt/hdd/jinsu_extention_disk/gir`을 가리키는 symlink이며
+  git 추적 대상이 아니다.
 - 이전 실험 기록은 모두 `output/past/`에 있다.
 
 ---
