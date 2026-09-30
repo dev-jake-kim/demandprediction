@@ -68,8 +68,8 @@ flowchart TD
     C2 -->|"최근 context"| L5
 
     subgraph PER["PeriodicLSTMEncoder ×2"]
-        P1["daily: log1p lag + context<br/>유효 lag만 packed LSTM"]
-        P2["weekly: log1p lag + context<br/>유효 lag만 packed LSTM"]
+        P1["daily: log1p lag + context<br/>유효 lag 압축 → LSTM"]
+        P2["weekly: log1p lag + context<br/>유효 lag 압축 → LSTM"]
         HD["h_daily [B,N,periodic_hidden]<br/>daily_valid [B]"]
         HW["h_weekly [B,N,periodic_hidden]<br/>weekly_valid [B]"]
         P1 --> HD
@@ -374,9 +374,11 @@ attention mask로 표현한다.
 <summary>세부</summary>
 
 - 입력 `log1p(max(x,0)) ⊕ extra`를 노드별 시퀀스 `[B·N, L, 1+E]`로 만든다.
-- 무효 lag를 뒤로 보내도록 안정 정렬해 유효 lag만 원래 순서대로 압축하고,
-  `pack_padded_sequence`로 LSTM(`1+E → periodic_hidden`)에 넣어 마지막 hidden을 쓴다.
-- 유효 lag가 없는 행의 출력은 0이다.
+- 무효 lag를 뒤로 보내도록 안정 정렬해 유효 lag만 원래 순서대로 앞에 모은 뒤, LSTM
+  (`1+E → periodic_hidden`)을 전체 길이로 돌리고 각 행의 마지막 유효 시점(`길이−1`) 출력을
+  쓴다. 이는 유효 lag만 넣은 LSTM의 마지막 hidden과 같다. bool index·packing을 쓰지 않아
+  GPU→CPU 동기화가 없다.
+- 유효 lag가 없는 행의 출력은 0이다(곱셈으로 0을 만들어 gradient도 0).
 
 </details>
 

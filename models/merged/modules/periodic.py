@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
-from torch.nn.utils.rnn import pack_padded_sequence
 
 
 class PeriodicLSTMEncoder(nn.Module):
@@ -28,10 +27,7 @@ class PeriodicLSTMEncoder(nn.Module):
         batch, length, nodes, _ = values.shape
         valid_mask = ~invalid_mask.bool()
         lengths = valid_mask.sum(dim=1)
-        row_lengths = lengths.repeat_interleave(nodes)
-        row_valid = row_lengths > 0
         sequence = torch.log1p(torch.clamp(values, min=0.0))
-        sequence = sequence.permute(0, 2, 1, 3).reshape(batch * nodes, length, 1)
 
         if self.extra_dim > 0:
             if extra is None:
@@ -40,34 +36,26 @@ class PeriodicLSTMEncoder(nn.Module):
                 raise ValueError(
                     f"extra must be [B,L,{self.extra_dim}], got {tuple(extra.shape)}"
                 )
-            expanded_extra = (
-                extra[:, None, :, :]
-                .expand(batch, nodes, length, self.extra_dim)
-                .reshape(batch * nodes, length, self.extra_dim)
+            sequence = torch.cat(
+                [sequence, extra[:, :, None, :].expand(batch, length, nodes, self.extra_dim)],
+                dim=-1,
             )
-            sequence = torch.cat([sequence, expanded_extra], dim=-1)
         elif extra is not None:
             raise ValueError("extra_dim=0인데 extra가 주어짐")
 
+        # 유효 lag를 원래 순서대로 앞에 모은다. lag 유효성은 샘플 단위라 노드 축에 공유된다.
+        order = valid_mask.to(torch.long).argsort(dim=1, descending=True, stable=True)
         feature_dim = sequence.shape[-1]
-        expanded_valid = valid_mask[:, None, :].expand(batch, nodes, length).reshape(batch * nodes, length)
-        output = sequence.new_zeros((batch * nodes, self.lstm.hidden_size))
-
-        if row_valid.any():
-            valid_sequence = sequence[row_valid]
-            valid_positions = expanded_valid[row_valid]
-            order = valid_positions.to(dtype=torch.long).argsort(dim=1, descending=True, stable=True)
-            # Use the actual feature width after concatenating extra context.
-            compact = valid_sequence.gather(1, order.unsqueeze(-1).expand(-1, -1, feature_dim))
-            compact_lengths = row_lengths[row_valid]
-            packed = pack_padded_sequence(
-                compact,
-                compact_lengths.detach().cpu(),
-                batch_first=True,
-                enforce_sorted=False,
-            )
-            _, (hidden, _) = self.lstm(packed)
-            output[row_valid] = hidden[-1]
+        compact = sequence.gather(1, order[:, :, None, None].expand(-1, -1, nodes, feature_dim))
+        compact = compact.permute(0, 2, 1, 3).reshape(batch * nodes, length, feature_dim)
+        # 전체 길이로 돌리고 각 행의 마지막 유효 시점 출력을 읽는다(packed LSTM의 마지막 hidden과
+        # 같다). host 동기화가 필요한 bool index·packing을 쓰지 않는다.
+        steps, _ = self.lstm(compact)
+        last = (lengths.clamp_min(1) - 1).repeat_interleave(nodes)
+        index = last[:, None, None].expand(-1, 1, steps.shape[-1])
+        hidden = steps.gather(1, index).squeeze(1)
+        row_valid = (lengths > 0).repeat_interleave(nodes)
+        output = hidden * row_valid[:, None].to(hidden.dtype)
         return output.reshape(batch, nodes, -1), lengths > 0
 
 
