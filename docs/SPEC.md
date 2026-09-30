@@ -256,11 +256,15 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 - `data`: `daily_period=24`, `daily_lags=6`, `weekly_period=168`, `weekly_lags=4`,
   `lag_radius=0`.
 - `train`: batch Ulsan 24 / Porto 8 (train·eval 동일), `num_train_epochs=120`,
-  `optim=adamw_torch`, `learning_rate=1e-3`, `weight_decay=0.05`, `max_grad_norm=5.0`,
+  `optim=adamw_torch_fused`, `learning_rate=1e-3`, `weight_decay=0.05`, `max_grad_norm=5.0`,
   `lr_scheduler_type=constant`, `warmup_ratio=0`, epoch 단위 log/eval/save,
   `save_total_limit=1`, `load_best_model_at_end=true`, `metric_for_best_model=loss`,
-  `greater_is_better=false`, `dataloader_num_workers=0`, `torch_compile=false`,
-  `remove_unused_columns=false`, `full_determinism=false`.
+  `greater_is_better=false`, `torch_compile=false`, `remove_unused_columns=false`,
+  `full_determinism=false`.
+- 처리량 설정(계산 결과 불변): `dataloader_num_workers=4`,
+  `dataloader_persistent_workers=true`, `accelerator_config.non_blocking=true`(pinned memory
+  비동기 복사), `logging_nan_inf_filter=false`(스텝별 NaN/Inf 검사 동기화 제거, 로그 집계에만
+  영향), `save_only_model=true`(epoch 체크포인트에 optimizer·scheduler 미저장, 학습 재개 불가).
 - `optimizer_schedule`: `warmup_cosine`, `warmup_epochs=5`, `warmup_lr_init=1e-6`,
   `cosine_epochs=60`, `eta_min=1e-4`.
 - `stage2`: `learning_rate=1e-4`, `loss=mae`, `rmse_weight=10.0`, `init_from=null`.

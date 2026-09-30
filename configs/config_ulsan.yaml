@@ -25,7 +25,9 @@ train:
 
   per_device_train_batch_size: 24
   per_device_eval_batch_size: 24
-  dataloader_num_workers: 0
+  # batch 준비·pinning을 worker 프로세스에서 한다(샘플 순서는 main의 sampler가 정한다).
+  dataloader_num_workers: 4
+  dataloader_persistent_workers: true
 
   torch_compile: false
   disable_tqdm: true
@@ -34,8 +36,14 @@ train:
   remove_unused_columns: false
   save_strategy: epoch
   save_total_limit: 1
+  # epoch 체크포인트는 가중치만 저장한다(학습 재개 없음, stage2.init_from은 가중치만 사용).
+  save_only_model: true
+  # batch를 GPU로 비동기 복사한다(pinned memory). 계산 결과는 같다.
+  accelerator_config:
+    non_blocking: true
 
-  optim: adamw_torch
+  # 같은 AdamW 식을 단일 fused kernel로 계산한다.
+  optim: adamw_torch_fused
   learning_rate: 1e-3
   weight_decay: 0.05
   # optimizer_schedule이 실제 epoch 스케줄을 정의한다.
@@ -45,6 +53,8 @@ train:
   max_grad_norm: 5.0
 
   logging_strategy: epoch
+  # 스텝마다 loss의 NaN/Inf를 검사하는 GPU 동기화를 하지 않는다(로그 집계에만 영향).
+  logging_nan_inf_filter: false
   eval_strategy: epoch
   load_best_model_at_end: true
 
