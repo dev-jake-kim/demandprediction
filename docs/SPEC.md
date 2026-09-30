@@ -50,15 +50,17 @@ flowchart TD
     WC --> C1
 
     subgraph LH["LocalHistoryEncoder: 공간 + 최근 시간"]
-        L1["노드별 이웃 창 crop<br/>[B,k,N,P]<br/>P=(2a+1)^2"]
-        L2["log1p + Fourier 스칼라 임베딩<br/>격자 밖은 EDGE 토큰"]
-        L3["CLS + 노드 임베딩 + 위치 임베딩<br/>[B·k·N, 1+P, D]"]
-        L4["공간 Transformer<br/>시점·노드별 창 요약"]
-        L5["CLS 요약 [B,N,k,D]<br/>+ 최근 context 15"]
+        L1["노드 토큰<br/>log1p + Fourier 스칼라 임베딩<br/>+ 노드 임베딩 [B·k, N, D]"]
+        L2["층마다: [층별 sink, 노드 N개]<br/>[B·k, 1+N, D]"]
+        L3["masked Transformer 층<br/>노드는 sink + 자기 창만 봄<br/>+ 방향별·head별 bias"]
+        L4["sink 출력 버림<br/>노드 출력만 다음 층으로"]
+        L5["최종 노드 출력 [B,N,k,D]<br/>+ 최근 context 15"]
         L6["공유 history LSTM"]
         L7["적응 노드만 W + ΔW LSTM<br/>stage 2에서 ΔW 학습"]
         HN["h_neural [B,N,history_hidden]"]
-        L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> HN
+        L1 --> L2 --> L3 --> L4
+        L4 -->|"transformer_layers번 반복"| L2
+        L4 --> L5 --> L6 --> HN
         L5 --> L7 --> HN
     end
 
@@ -111,7 +113,7 @@ flowchart TD
         R1 --> R2 --> R3 --> R4
     end
 
-    L1 -.->|"검색 켬"| R1
+    H -.->|"검색 켬"| R1
     HA -.->|"gate 입력"| R4
     O2 -.->|"neural_pred"| R4
     R4 -.->|"검색 켬 예측"| PRED
@@ -142,7 +144,7 @@ flowchart TD
 | `configs/model/merged_{ulsan,porto}.yaml` | 도시별 모델 하이퍼파라미터·스위치 |
 | `configs/dataset/{ulsan,porto}.yaml` | 데이터 경로·분할 |
 | `train.py` / `test.py` | 학습 / 체크포인트 평가 |
-| `validate_merged.py`, `tests/test_merged_parity.py` | 구조·인과·포팅 검증 |
+| `validate_merged.py` | 구조·인과 검증 |
 | `visualize_merged_node_metrics.py` | 노드별 지표 지도 |
 | `run_ablation.sh`, `run_seeds.sh` | 실험 러너 |
 
@@ -238,10 +240,10 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | `use_daily` / `use_weekly` | true | `h_daily` / `h_weekly`를 0으로 (valid mask는 유지) |
 | `use_weather` | true | 정규화 날씨를 0으로 (train 평균에 해당) |
 | `use_calendar` | true | 요일·시간 임베딩을 0으로 |
-| `use_neighbors` | true | 이웃 창에서 중앙 노드 외 토큰을 0으로 (EDGE 치환 이후) |
+| `use_neighbors` | true | masked attention에서 노드가 자기 자신과 sink만 보도록 이웃을 가림 |
 | `use_branch_attention` | true | 학습된 attention 대신 유효 브랜치 균등 평균 |
 | `use_softplus` | true | neural head의 raw 선형 출력 사용 (음수 가능) |
-| `weather_injection` | `concat` | `cls_add`: 날씨를 LSTM 입력 대신 Transformer CLS에 더함 |
+| `weather_injection` | `concat` | `cls_add`: 날씨를 LSTM 입력 대신 Transformer 노드 토큰에 더함 |
 
 루트 설정의 `ablation`은 결과 파일 이름·JSON 메타데이터용 라벨이며 모델을 바꾸지 않는다.
 기본값은 검색 pass와 맞춘 `no-ir`이다.
@@ -303,7 +305,7 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
   `weather_injection ∈ {concat, cls_add}`, `node_adaptive=true`면
   `node_adaptive_indices` 필수. 값 검사는 파이썬 리스트에서 한다(`from_pretrained`의
   meta device 초기화와 호환).
-- 버퍼 `weather_mean`, `weather_std`, `local_history.neighbor_valid`는 persistent로
+- 버퍼 `weather_mean`, `weather_std`, `local_history.neighbor_direction`은 persistent로
   체크포인트에 저장된다. 검색 CPU cache는 저장하지 않는다.
 - 손실 집계: 요소별 손실(`combined`, `mae`, `demand_split`)은 전체 원소 평균을 `loss`로,
   합을 `loss_sum`으로 낸다. `rmse_mape`는 손실 객체가 스칼라를 직접 반환한다.
@@ -323,34 +325,41 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
 - `concat`: `E = 3 + weekday_dim + hour_dim = 15` =
   `(weather − weather_mean)/weather_std ⊕ weekday_emb ⊕ hour_emb`.
 - `cls_add`: `E = weekday_dim + hour_dim = 12`. 정규화 날씨는 별도로
-  `LocalHistoryEncoder`의 CLS에 더해지며 주기 브랜치에는 날씨가 들어가지 않는다.
+  `LocalHistoryEncoder`의 노드 토큰에 더해지며 주기 브랜치에는 날씨가 들어가지 않는다.
 - 요일·시간 임베딩 테이블(`nn.Embedding(7,·)`, `nn.Embedding(24,·)`)은 세 브랜치가 공유한다.
 
 ### 6.2 `LocalHistoryEncoder`
 
-`forward(demands [B,k,H,W], extra [B,k,E], weather_cls [B,k,3]|None) → (local_crop [B,k,N,P], h_neural [B,N,history_hidden])`
+`forward(demands [B,k,H,W], extra [B,k,E], weather_cls [B,k,3]|None) → h_neural [B,N,history_hidden]`
 
-`crop(demands, radius=None) → [B,k,N,(2r+1)²]`: 노드별 raw 이웃 창(격자 밖 0 패딩, 행 우선,
-중앙은 `P//2`).
+시점마다 격자 전체를 한 시퀀스로 인코딩한다. 노드 토큰은 시점당 한 번만 만들고, 이웃 창은
+attention mask로 표현한다.
 
 <details>
 <summary>세부</summary>
 
-1. 창 값 `log1p(max(x,0))` → `FourierScalarEmbedding` → `[B,k,N,P,D]`.
+1. 노드 토큰: `log1p(max(x,0))` → `FourierScalarEmbedding` → `+ node_embedding[n]`
+   → `[B·k, N, D]` (`cls_add`면 `Linear(3→D)(정규화 날씨)`를 모든 노드 토큰에 더함).
    `FourierScalarEmbedding(v) = Linear([v, sin(2π·v·f), cos(2π·v·f)])`,
    `f = exp(log_frequencies)`, `log_frequencies`는 `linspace(-2,2,num_bands)`로 초기화되는
    학습 파라미터.
-2. `neighbor_valid [N,P]`가 False인 격자 밖 칸은 학습 가능한 EDGE 토큰으로 바꾼다.
-   `use_neighbors=false`면 그 뒤 중앙 외 토큰을 0으로 만든다.
-3. CLS 토큰 = `special_embedding[CLS] + node_embedding[n]`
-   (`cls_add`면 `Linear(3→D)(정규화 날씨)`를 더함). `[CLS, 창 P개]`에
-   `position_embedding [1+P, D]`를 더한다.
-4. `B·k·N`개 시퀀스를 pre-norm Transformer Encoder(GELU, `transformer_layers`층)로
-   인코딩하고 CLS 출력만 취한다. attention 가중치 dropout은 `attention_dropout`,
-   나머지는 `dropout`.
-5. 노드별 시계열 `[B·N, k, D]`에 `extra`를 브로드캐스트해 붙이고 공유
+2. 층 `l`마다 입력 `[sink_l, 노드 N개]` (`[B·k, 1+N, D]`). `sink_embedding [layers, D]`는
+   층별 독립 파라미터이며, 층 출력에서 sink는 버리고 노드 출력만 다음 층 입력이 된다.
+3. attention mask `[B·k·heads, 1+N, 1+N]` (더하는 값):
+   - sink 행·열은 가리지 않는다(0).
+   - 노드 `i`→노드 `j`: `j`가 `i`의 `(2a+1)×(2a+1)` 창 안이면 `direction_bias[h, dir(i,j)]`,
+     밖이면 `-inf`. `dir = (dy+a)·(2a+1) + (dx+a)`(행 우선, 자기 자신 `P//2`)이고
+     `neighbor_direction [N,N]` 버퍼(창 밖 -1)에 저장한다. `direction_bias [heads, P]`는
+     0으로 초기화되는 학습 파라미터다.
+   - 격자 밖 이웃은 토큰이 없으므로 가장자리 노드는 창 안 실재 노드만 본다.
+   - `use_neighbors=false`면 노드는 자기 자신과 sink만 본다.
+4. 각 층은 pre-norm `nn.TransformerEncoderLayer`(GELU)이며 attention 가중치 dropout은
+   `attention_dropout`, 나머지는 `dropout`. eval·no_grad의 MHA fast path는 3D float mask를
+   올바르게 적용하지 않으므로 호출 동안 끈다.
+5. 수용 영역은 층마다 넓어진다: `L`층 뒤 노드 출력은 반경 `a·L` 창의 정보를 가진다.
+6. 최종 노드 출력 `[B·N, k, D]`에 `extra`를 브로드캐스트해 붙이고 공유
    `history_lstm (D+E → history_hidden)`의 마지막 hidden을 `h_neural`로 쓴다.
-6. 노드 적응(6.7)이 켜져 있으면 선택된 노드의 hidden만 `W+ΔW` 경로 결과로 덮어쓴다
+7. 노드 적응(6.7)이 켜져 있으면 선택된 노드의 hidden만 `W+ΔW` 경로 결과로 덮어쓴다
    (out-of-place `index_copy`).
 
 </details>
@@ -402,7 +411,7 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
 
 ### 6.6 `CausalRetrieval` (선택 경로)
 
-`forward(local_crop [B,k,N,P_r], sample_idx [B]) → ir_out [B,N]`, `use_retrieval=true`일 때만
+`forward(demands [B,k,H,W], sample_idx [B]) → ir_out [B,N]`, `use_retrieval=true`일 때만
 생성된다. 학습 파라미터·gradient가 없다.
 
 <details>
@@ -410,8 +419,8 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
 
 - 생성 시 `retrieval_grid_path`의 `[T,H,W]` 격자를 읽어 모든 시점의 이웃 창
   (`P_r=(2r+1)²`, `r = retrieval_local_radius ?? local_radius`)을 CPU에 만든다.
-  검색 반지름이 Transformer 반지름과 다를 때만 query용 crop을 따로 만든다.
-- query: 노드별 `[k·P_r]` 창을 L2 정규화. 후보 시점 τ의 창은 `[τ−k, τ)`.
+- query: 최근 수요에서 노드별 `[k·P_r]` raw 창(격자 밖 0)을 잘라 L2 정규화. 후보 시점 τ의
+  창은 `[τ−k, τ)`.
 - 후보 범위: `τ ∈ [k, end)`, `end = t`(`observed_past`) 또는 `min(t, retrieval_train_end)`
   (`train_prefix`). 예측 시점과 미래는 후보가 될 수 없다.
 - 코사인 유사도 top-`retrieval_k`를 `retrieval_chunk_size` 단위로 병합하고,
@@ -558,13 +567,9 @@ python test.py <checkpoint_dir> --city {ulsan,porto} --weather_csv_path <csv> \
 - 검색 후보가 `τ < t`만 사용.
 - Transformer 3×3에서 검색 창 3×3·5×5 선택이 forward에 반영.
 - 검색 pass: grid 없이 생성·예측·체크포인트 복원, `prediction = neural_pred`, `λ=1`.
+- masked Transformer 수용 영역: 1층은 반경 1, 2층은 반경 2 밖 수요에 무반응(eval·no_grad).
 
 </details>
-
-### `tests/test_merged_parity.py`
-
-고정 커밋 `81472a5`의 포팅 이전 `merged_model/`과 forward·loss 일치, 저장·복원 왕복,
-짧은 학습 loss 궤적 일치를 검사한다.
 
 ### `visualize_merged_node_metrics.py`
 

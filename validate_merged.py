@@ -235,9 +235,9 @@ def _check_node_adaptive_identity() -> dict:
 
     demands = torch.rand(2, time_step, height, width) * 5
     with torch.no_grad():
-        _, adaptive_hidden = encoder(demands)
+        adaptive_hidden = encoder(demands)
         encoder.node_adaptive = False  # Run the shared nn.LSTM path with identical weights.
-        _, reference_hidden = encoder(demands)
+        reference_hidden = encoder(demands)
         encoder.node_adaptive = True
 
     gap = float((adaptive_hidden - reference_hidden).abs().max())
@@ -285,7 +285,7 @@ def _check_retrieval_boundary() -> dict:
             retrieval_scope='observed_past',
             retrieval_train_end=None,
         )
-        query = retrieval._crops[3:5].clone().reshape(1, 2, 1, 1)
+        query = retrieval._grid[3:5].clone().reshape(1, 2, 1, 1)
         before = retrieval(query, torch.tensor([5]))
         # Target and future values must be outside the candidate interval
         # [time_step, target_time), so changing them cannot affect retrieval.
@@ -327,10 +327,8 @@ def _check_independent_retrieval_radius() -> dict:
                     weekly_weather=weather, weekly_hour=time, weekly_day_of_week=time,
                 )
                 model.retrieval._cache.fill_(float('nan'))
-                expected = model.retrieval(
-                    model.local_history.crop(history, radius=radius), sample_idx
-                )
-            if model.local_history.crop(history).shape[-1] != 9:
+                expected = model.retrieval(history, sample_idx)
+            if model.local_history.num_neighbors != 9:
                 raise AssertionError('Transformer window is not 3×3')
             if model.retrieval._crops.shape[-1] != (2 * radius + 1) ** 2:
                 raise AssertionError(f'Retrieval candidates do not use radius {radius}')
@@ -385,6 +383,33 @@ def _check_retrieval_pass() -> dict:
     return {'retrieval_pass_missing_grid_and_reload': True}
 
 
+def _check_masked_grid_receptive_field() -> dict:
+    """L층 masked Transformer에서 노드는 반경 a·L 밖 수요의 영향을 받지 않는다."""
+
+    torch.manual_seed(0)
+    height = width = 7
+    center = 3 * width + 3
+    for layers in (1, 2):
+        encoder = LocalHistoryEncoder(
+            height=height, width=width, time_step=2, local_radius=1, d_model=8,
+            num_fourier_bands=2, transformer_layers=layers, transformer_heads=2,
+            transformer_ffn=16, history_hidden=5, dropout=0.0,
+        ).eval()
+        with torch.no_grad():
+            encoder.direction_bias.normal_()
+            demands = torch.rand(1, 2, height, width) * 3
+            base = encoder(demands)[0, center]
+            responses = {}
+            for distance in range(1, 4):
+                moved = demands.clone()
+                moved[:, :, 3 - distance, 3 - distance] += 5.0
+                responses[distance] = bool((encoder(moved)[0, center] - base).abs().max() > 1e-6)
+        expected = {distance: distance <= layers for distance in responses}
+        if responses != expected:
+            raise AssertionError(f'{layers}층 수용 영역이 다름: {responses} != {expected}')
+    return {'masked_grid_receptive_radius': 'local_radius * transformer_layers'}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', default='cpu')
@@ -399,6 +424,7 @@ def main() -> None:
     results.append(_check_retrieval_boundary())
     results.append(_check_independent_retrieval_radius())
     results.append(_check_retrieval_pass())
+    results.append(_check_masked_grid_receptive_field())
     report = {'device': str(device), 'all_pass': True, 'checks': results}
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

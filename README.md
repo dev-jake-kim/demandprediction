@@ -35,7 +35,6 @@ python validate_merged.py --device cpu                     # 학습 전 빠른 �
 - 결과(로그, 체크포인트)는 `output/${project_name}/{날짜}/{시간}/`에 저장된다 (`hydra.run.dir`).
 - 결과 요약 JSON 경로는 `run_json`, 없으면 `output/merged/runs/`. 이전 실험 기록은 `output/past/`.
 - 기능 스위치와 2-stage 학습은 `docs/SPEC.md` 4·8절 참고.
-- 포팅 충실도 검증: `python tests/test_merged_parity.py --device cuda`
 
 ## 평가 (test.py)
 

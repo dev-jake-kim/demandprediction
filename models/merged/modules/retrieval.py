@@ -66,15 +66,26 @@ class CausalRetrieval(nn.Module):
         self._cache = grid_tensor.new_full((grid_tensor.shape[0], self.num_nodes), float("nan"))
         self.grid_path = str(path)
 
-    @torch.no_grad()
-    def forward(self, local_crop: Tensor, sample_idx: Tensor) -> Tensor:
-        """Return raw retrieval values ``[B,N]`` for causal candidates."""
+    def _crop(self, demands: Tensor) -> Tensor:
+        """``[B, k, H, W]`` -> ``[B, k, N, (2r+1)^2]`` 노드별 raw 창(격자 밖 0, 행 우선)."""
 
+        batch, steps = demands.shape[:2]
+        padded = F.pad(
+            demands.reshape(batch * steps, 1, self.height, self.width), (self.local_radius,) * 4
+        )
+        patches = F.unfold(padded, kernel_size=self.window_size)
+        return patches.transpose(1, 2).reshape(batch, steps, self.num_nodes, self.num_neighbors)
+
+    @torch.no_grad()
+    def forward(self, demands: Tensor, sample_idx: Tensor) -> Tensor:
+        """``[B, k, H, W]`` 최근 수요로 인과 후보를 검색해 ``[B, N]`` raw 값을 반환한다."""
+
+        if demands.ndim != 4 or tuple(demands.shape[1:]) != (self.time_step, self.height, self.width):
+            raise ValueError("Unexpected retrieval query shape")
+        local_crop = self._crop(demands)
         batch, steps, nodes, neighbors = local_crop.shape
         if self._grid is None or self._crops is None:
             return local_crop.new_zeros((batch, nodes))
-        if steps != self.time_step or nodes != self.num_nodes or neighbors != self.num_neighbors:
-            raise ValueError("Unexpected retrieval query shape")
 
         search_device = local_crop.device
         query = local_crop.detach().to(device=search_device, dtype=torch.float32)

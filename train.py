@@ -385,24 +385,23 @@ def main(cfg: DictConfig) -> None:
         raise ValueError(f"알 수 없는 optimizer_schedule.name: {schedule_name!r}")
 
     # SDPA 제한은 attention 가중치 dropout이 켜진 경우에만 적용된다.
-    nodes = train_ds.height * train_ds.width
-    per_sample = train_ds.time_step * nodes
+    # 샘플 하나는 이력 시점마다 격자 전체 시퀀스 하나를 attention에 넣는다.
+    per_sample = train_ds.time_step
     if model_config.attention_dropout > 0.0:
         max_batch = max(1, SDPA_BATCH_LIMIT // per_sample)
         for key in ('per_device_train_batch_size', 'per_device_eval_batch_size'):
             if train_cfg[key] > max_batch:
                 logger.warning(
-                    f'{key}={train_cfg[key]}는 time_step({train_ds.time_step}) * nodes({nodes})'
-                    f'={per_sample}와 곱하면 SDPA_BATCH_LIMIT({SDPA_BATCH_LIMIT})을 넘어'
-                    f'memory-efficient attention이 죽는다(attention_dropout={model_config.attention_dropout}>0)'
-                    f' -> {max_batch}로 낮춘다'
+                    f'{key}={train_cfg[key]}는 time_step({per_sample})와 곱하면 '
+                    f'SDPA_BATCH_LIMIT({SDPA_BATCH_LIMIT})을 넘어 memory-efficient attention이 '
+                    f'죽는다(attention_dropout={model_config.attention_dropout}>0) -> {max_batch}로 낮춘다'
                 )
                 train_cfg[key] = max_batch
     else:
         logger.info(
             f'[batch] attention_dropout=0이라 SDPA_BATCH_LIMIT 클램프를 건너뛴다 '
-            f'(rows = batch * {per_sample} = '
-            f'{train_cfg["per_device_train_batch_size"] * per_sample:,}). 이제 한계는 VRAM이다.'
+            f'(attention 시퀀스 = batch * {per_sample} = '
+            f'{train_cfg["per_device_train_batch_size"] * per_sample:,}).'
         )
 
     def build_trainer(

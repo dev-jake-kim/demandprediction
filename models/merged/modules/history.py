@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Sequence
 
 import torch
@@ -12,7 +13,7 @@ from .embeddings import FourierScalarEmbedding
 
 
 class LocalHistoryEncoder(nn.Module):
-    """Local crop -> Transformer per history step -> temporal LSTM."""
+    """전체 노드 토큰 + 층별 sink -> 이웃 창 masked Transformer (시점별) -> temporal LSTM."""
 
     def __init__(
         self,
@@ -51,14 +52,16 @@ class LocalHistoryEncoder(nn.Module):
         self.local_radius = local_radius
         self.window_size = 2 * local_radius + 1
         self.num_neighbors = self.window_size * self.window_size
+        self.transformer_heads = transformer_heads
         self.extra_dim = extra_dim
 
         # from_pretrained가 체크포인트에서 복원하도록 persistent 버퍼로 둔다.
-        self.register_buffer("neighbor_valid", self._make_neighbor_valid(), persistent=True)
+        self.register_buffer("neighbor_direction", self._make_neighbor_direction(), persistent=True)
         self.scalar_embedding = FourierScalarEmbedding(d_model, num_fourier_bands)
-        self.special_embedding = nn.Embedding(2, d_model)  # 0: CLS, 1: EDGE
+        # 층마다 독립 sink 토큰. 한 층의 sink 출력은 다음 층으로 전달하지 않는다.
+        self.sink_embedding = nn.Parameter(torch.randn(transformer_layers, d_model) * 0.02)
         self.node_embedding = nn.Parameter(torch.randn(self.num_nodes, d_model) * 0.02)
-        self.position_embedding = nn.Parameter(torch.randn(1 + self.num_neighbors, d_model) * 0.02)
+        self.direction_bias = nn.Parameter(torch.zeros(transformer_heads, self.num_neighbors))
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -72,10 +75,8 @@ class LocalHistoryEncoder(nn.Module):
         encoder_layer.self_attn.dropout = (
             dropout if attention_dropout is None else attention_dropout
         )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=transformer_layers,
-            enable_nested_tensor=False,
+        self.transformer = nn.ModuleList(
+            copy.deepcopy(encoder_layer) for _ in range(transformer_layers)
         )
         self.history_lstm = nn.LSTM(d_model + extra_dim, history_hidden, batch_first=True)
         self.history_hidden = history_hidden
@@ -155,44 +156,56 @@ class LocalHistoryEncoder(nn.Module):
             hidden = out_gate.sigmoid() * cell.tanh()
         return hidden
 
-    def _make_neighbor_valid(self) -> Tensor:
-        # Window columns use row-major offsets: dy = c // window - r, dx = c % window - r.
-        radius, window = self.local_radius, self.window_size
-        offsets = torch.arange(-radius, radius + 1)
-        dy = offsets.repeat_interleave(window)  # [neighbors]
-        dx = offsets.repeat(window)  # [neighbors]
+    def _make_neighbor_direction(self) -> Tensor:
+        """``[N, N]`` long. query 노드 기준 key 노드의 창 내 방향 index, 창 밖이면 -1.
+
+        방향 index는 ``(dy + r) * window + (dx + r)``(행 우선)이며 자기 자신은 ``P // 2``다.
+        """
+
+        radius = self.local_radius
         node = torch.arange(self.num_nodes)
-        y = torch.div(node, self.width, rounding_mode="floor").unsqueeze(1) + dy.unsqueeze(0)
-        x = (node % self.width).unsqueeze(1) + dx.unsqueeze(0)
-        return (y >= 0) & (y < self.height) & (x >= 0) & (x < self.width)
+        y = torch.div(node, self.width, rounding_mode="floor")
+        x = node % self.width
+        dy = y.unsqueeze(0) - y.unsqueeze(1)
+        dx = x.unsqueeze(0) - x.unsqueeze(1)
+        inside = (dy.abs() <= radius) & (dx.abs() <= radius)
+        if not self.use_neighbors:
+            inside = inside & (dy == 0) & (dx == 0)
+        direction = (dy + radius) * self.window_size + (dx + radius)
+        return torch.where(inside, direction, torch.full_like(direction, -1))
 
-    def crop(self, demands: Tensor, radius: int | None = None) -> Tensor:
-        """Return raw local windows as ``[B, k, N, (2*radius+1)^2]``."""
+    def _attention_mask(self, sequences: int) -> Tensor:
+        """``[sequences * heads, 1+N, 1+N]`` 더하는 attention mask (index 0 = sink).
 
-        if demands.ndim != 4 or tuple(demands.shape[-2:]) != (self.height, self.width):
-            raise ValueError(
-                f"demand_history must be [B,k,{self.height},{self.width}], got {tuple(demands.shape)}"
-            )
-        radius = self.local_radius if radius is None else radius
-        window_size = 2 * radius + 1
-        batch, steps = demands.shape[:2]
-        padded = F.pad(
-            demands.reshape(batch * steps, 1, self.height, self.width),
-            (radius,) * 4,
+        sink 행·열은 막지 않는다. 노드 쌍은 창 안이면 방향별·head별 bias, 밖이면 -inf.
+        """
+
+        direction = self.neighbor_direction
+        allowed = F.pad(direction >= 0, (1, 0, 1, 0), value=True)
+        bias = F.pad(self.direction_bias[:, direction.clamp_min(0)], (1, 0, 1, 0))
+        mask = bias.masked_fill(~allowed, float("-inf"))
+        length = mask.shape[-1]
+        return (
+            mask.unsqueeze(0)
+            .expand(sequences, -1, -1, -1)
+            .reshape(sequences * self.transformer_heads, length, length)
         )
-        patches = F.unfold(padded, kernel_size=window_size)
-        return patches.transpose(1, 2).reshape(batch, steps, self.num_nodes, window_size ** 2)
 
     def forward(
         self,
         demands: Tensor,
         extra: Tensor | None = None,
         weather_cls: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        local_crop = self.crop(demands)
-        batch, steps, nodes, neighbors = local_crop.shape
-        if steps != self.time_step or nodes != self.num_nodes or neighbors != self.num_neighbors:
-            raise ValueError("Unexpected local crop shape")
+    ) -> Tensor:
+        """``[B, k, H, W]`` 수요 -> ``[B, N, history_hidden]``."""
+
+        if demands.ndim != 4 or tuple(demands.shape[1:]) != (self.time_step, self.height, self.width):
+            raise ValueError(
+                f"demand_history must be [B,{self.time_step},{self.height},{self.width}], "
+                f"got {tuple(demands.shape)}"
+            )
+        batch, steps = demands.shape[:2]
+        nodes = self.num_nodes
         if self.extra_dim > 0:
             if extra is None:
                 raise ValueError(f"extra_dim={self.extra_dim}인데 extra가 None임")
@@ -201,30 +214,26 @@ class LocalHistoryEncoder(nn.Module):
         elif extra is not None:
             raise ValueError("extra_dim=0인데 extra가 주어짐")
 
-        valid = self.neighbor_valid.to(device=local_crop.device)
-        log_values = torch.log1p(torch.clamp(local_crop, min=0.0)).unsqueeze(-1)
-        value_tokens = self.scalar_embedding(log_values)
-        edge_token = self.special_embedding.weight[1].view(1, 1, 1, 1, -1)
-        value_tokens = torch.where(valid.view(1, 1, nodes, neighbors, 1), value_tokens, edge_token)
-
-        if not self.use_neighbors:
-            # Zero after EDGE replacement so all non-central tokens are disabled uniformly.
-            keep = torch.zeros(neighbors, dtype=value_tokens.dtype, device=value_tokens.device)
-            keep[neighbors // 2] = 1.0
-            value_tokens = value_tokens * keep.view(1, 1, 1, neighbors, 1)
-
-        cls_token = self.special_embedding.weight[0].view(1, 1, 1, 1, -1)
-        cls_token = cls_token + self.node_embedding.view(1, 1, nodes, 1, -1)
-        cls_token = cls_token.expand(batch, steps, -1, -1, -1)
+        log_values = torch.log1p(torch.clamp(demands, min=0.0)).reshape(batch, steps, nodes, 1)
+        tokens = self.scalar_embedding(log_values) + self.node_embedding
         if self.weather_projection is not None:
             if weather_cls is None:
                 raise ValueError("weather_cls_dim>0인데 weather_cls가 None임")
-            cls_token = cls_token + self.weather_projection(weather_cls)[:, :, None, None, :]
-        tokens = torch.cat([cls_token, value_tokens], dim=3)
-        tokens = tokens + self.position_embedding.view(1, 1, 1, 1 + neighbors, -1)
-        encoded = self.transformer(tokens.reshape(batch * steps * nodes, 1 + neighbors, -1))
-        cls = encoded[:, 0].reshape(batch, steps, nodes, -1)
-        sequence = cls.permute(0, 2, 1, 3).reshape(batch * nodes, steps, -1)
+            tokens = tokens + self.weather_projection(weather_cls)[:, :, None, :]
+        sequences = batch * steps
+        hidden_tokens = tokens.reshape(sequences, nodes, -1)
+        mask = self._attention_mask(sequences)
+        # eval·no_grad fast path는 head별 3D float mask를 무시한 결과를 내므로 끈다.
+        fastpath = torch.backends.mha.get_fastpath_enabled()
+        torch.backends.mha.set_fastpath_enabled(False)
+        try:
+            for layer, sink in zip(self.transformer, self.sink_embedding):
+                layer_input = torch.cat([sink.expand(sequences, 1, -1), hidden_tokens], dim=1)
+                hidden_tokens = layer(layer_input, src_mask=mask)[:, 1:]
+        finally:
+            torch.backends.mha.set_fastpath_enabled(fastpath)
+        summary = hidden_tokens.reshape(batch, steps, nodes, -1)
+        sequence = summary.permute(0, 2, 1, 3).reshape(batch * nodes, steps, -1)
 
         if self.extra_dim > 0:
             expanded_extra = (
@@ -244,7 +253,7 @@ class LocalHistoryEncoder(nn.Module):
             # Use out-of-place index_copy so both paths remain differentiable.
             node_hidden = node_hidden.index_copy(1, index, adaptive_hidden)
 
-        return local_crop, node_hidden
+        return node_hidden
 
 
 __all__ = ["LocalHistoryEncoder"]

@@ -74,7 +74,6 @@ class MergedDemandModel(PreTrainedModel):
         self.width = width
         self.num_nodes = height * width
         self.time_step = config.time_step
-        self.retrieval_radius = retrieval_radius
 
         self.use_daily = config.use_daily
         self.use_weekly = config.use_weekly
@@ -251,7 +250,7 @@ class MergedDemandModel(PreTrainedModel):
             weather_cls = (weather - self.weather_mean) / self.weather_std
             if not self.use_weather:
                 weather_cls = torch.zeros_like(weather_cls)
-        local_crop, h_neural = self.local_history(demand_history, recent_extra, weather_cls)
+        h_neural = self.local_history(demand_history, recent_extra, weather_cls)
         # Ablation은 브랜치 출력을 0으로 바꾸되 valid mask와 모듈 shape은 유지한다.
         h_daily, daily_valid = self.daily_branch(daily_demand, daily_mask, daily_extra)
         if not self.use_daily:
@@ -264,12 +263,7 @@ class MergedDemandModel(PreTrainedModel):
         )
 
         if self.retrieval is not None:
-            # 검색 반지름이 Transformer와 다르면 query용 crop을 별도로 만든다.
-            retrieval_crop = (
-                local_crop if self.retrieval_radius == self.local_history.local_radius
-                else self.local_history.crop(demand_history, radius=self.retrieval_radius)
-            )
-            ir_out = self.retrieval(retrieval_crop, sample_idx)
+            ir_out = self.retrieval(demand_history, sample_idx)
             neural_pred, lambda_weight, prediction = self.output_gate(h_attn, ir_out)
         else:
             # 검색 pass에서는 zero retrieval을 gate에 넣지 않고 우회한다.
