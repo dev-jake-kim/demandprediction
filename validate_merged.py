@@ -100,7 +100,6 @@ def _check_dataset(city: str, device: torch.device) -> dict:
         'neural_head': model.output_gate.neural_head.weight.grad is not None,
         'branch_attention': model.branch_attention.query_projection.weight.grad is not None,
         'local_history': model.local_history.scalar_embedding.projection.weight.grad is not None,
-        'retrieval_has_no_gradient': model.retrieval._grid is not None,
         # 캘린더 임베딩이 세 LSTM 입력에 실제로 연결돼 있는지 — concat을 빠뜨리면 여기서 잡힌다.
         'weekday_embedding': _has_gradient(model.weekday_embedding.weight),
         'hour_embedding': _has_gradient(model.hour_embedding.weight),
@@ -320,6 +319,52 @@ def _check_retrieval_boundary() -> dict:
     return {'retrieval_candidate_boundary': 'tau < target_time'}
 
 
+def _check_retrieval_pass() -> dict:
+    """검색을 끈 모델은 없는 raw grid로도 예측·체크포인트 복원이 가능해야 한다."""
+    with tempfile.TemporaryDirectory(prefix='merged_no_retrieval_') as temp_dir:
+        grid_path = Path(temp_dir) / 'absent.npy'
+        config = MergedDemandConfig(
+            height=3, width=3, time_step=2, local_radius=1, use_retrieval=False,
+            d_model=8, transformer_heads=2, transformer_layers=1,
+            retrieval_grid_path=str(grid_path),
+            weather_mean=[0.0] * 3, weather_std=[1.0] * 3,
+        )
+        model = MergedDemandModel(config).eval()
+        if model.retrieval is not None:
+            raise AssertionError('disabled retrieval instantiated a grid search')
+        batch = {
+            'demand_history': torch.ones(1, 2, 3, 3),
+            'daily_demand': torch.ones(1, 2, 9, 1),
+            'daily_mask': torch.zeros(1, 2, dtype=torch.bool),
+            'weekly_demand': torch.ones(1, 2, 9, 1),
+            'weekly_mask': torch.zeros(1, 2, dtype=torch.bool),
+            'sample_idx': torch.tensor([7]),
+            'weather': torch.zeros(1, 2, 3),
+            'hour_of_day': torch.zeros(1, 2, dtype=torch.long),
+            'day_of_week': torch.zeros(1, 2, dtype=torch.long),
+            'daily_weather': torch.zeros(1, 2, 3),
+            'daily_hour': torch.zeros(1, 2, dtype=torch.long),
+            'daily_day_of_week': torch.zeros(1, 2, dtype=torch.long),
+            'weekly_weather': torch.zeros(1, 2, 3),
+            'weekly_hour': torch.zeros(1, 2, dtype=torch.long),
+            'weekly_day_of_week': torch.zeros(1, 2, dtype=torch.long),
+        }
+        with torch.no_grad():
+            expected = model.forward_debug(**batch)
+        checkpoint = Path(temp_dir) / 'checkpoint'
+        model.save_pretrained(checkpoint)
+        restored = MergedDemandModel.from_pretrained(checkpoint).eval()
+        with torch.no_grad():
+            actual = restored.forward_debug(**batch)
+        if restored.retrieval is not None or not torch.equal(expected['logits'], actual['logits']):
+            raise AssertionError('search-free checkpoint did not reload without its raw grid')
+        if not torch.equal(actual['logits'].flatten(1), actual['neural_pred']):
+            raise AssertionError('disabled retrieval did not pass through neural prediction')
+        if actual['ir_out'] is not None or not torch.all(actual['lambda_weight'] == 1):
+            raise AssertionError('disabled retrieval passed through the output gate')
+    return {'retrieval_pass_missing_grid_and_reload': True}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', default='cpu')
@@ -332,6 +377,7 @@ def main() -> None:
     results.append(_check_periodic_extra_channels())
     results.append(_check_node_adaptive_identity())
     results.append(_check_retrieval_boundary())
+    results.append(_check_retrieval_pass())
     report = {'device': str(device), 'all_pass': True, 'checks': results}
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

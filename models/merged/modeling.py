@@ -155,10 +155,8 @@ class MergedDemandModel(PreTrainedModel):
             node_adaptive_indices=node_adaptive_indices,
         )
         self.periodic_hidden = config.periodic_hidden
-        # ablation은 "0-치환" 방식이다 — 모듈을 없애지 않고 항상 생성·실행한 뒤, 그 모듈이
-        # 결과로 이어지는 텐서만 0으로 바꾼다. 모듈을 지우면 텐서 shape·파라미터 수·attention
-        # 후보 개수까지 함께 바뀌어, 측정된 차이가 "그 모듈의 정보" 때문인지 "구조 변화" 때문인지
-        # 분리되지 않는다. 0-치환은 그 교란을 없앤다.
+        # 주기 브랜치는 0-치환으로 정보만 제거한다. 검색은 tmp-extracted처럼
+        # 사용하지 않을 때 아예 실행하지 않으며 raw grid도 적재하지 않는다.
         self.daily_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim)
         self.weekly_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim)
         self.branch_attention = BranchAttention(
@@ -167,19 +165,21 @@ class MergedDemandModel(PreTrainedModel):
             config.fusion_dim,
             use_attention=self.use_branch_attention,
         )
-        # 검색기도 끄든 켜든 항상 만들고 항상 계산한다(느리지만 경로가 동일해진다).
-        # use_retrieval=False면 ir_out만 0이 되고, 게이트는 그대로 남아 lambda를 학습한다
-        # — 처음부터 재학습하므로 모델이 lambda->1을 배워 보정할 수 있다.
-        self.retrieval = CausalRetrieval(
-            height=height,
-            width=width,
-            time_step=config.time_step,
-            local_radius=config.local_radius,
-            retrieval_grid_path=config.retrieval_grid_path,
-            retrieval_k=config.retrieval_k,
-            retrieval_chunk_size=config.retrieval_chunk_size,
-            retrieval_scope=config.retrieval_scope,
-            retrieval_train_end=config.retrieval_train_end,
+        # 검색이 꺼지면 검색기와 corpus/crop/cache를 만들지 않는다. neural head는
+        # 기존 no-ir 체크포인트와 동일한 output_gate에 남기고 lambda만 bypass한다.
+        self.retrieval = (
+            CausalRetrieval(
+                height=height,
+                width=width,
+                time_step=config.time_step,
+                local_radius=config.local_radius,
+                retrieval_grid_path=config.retrieval_grid_path,
+                retrieval_k=config.retrieval_k,
+                retrieval_chunk_size=config.retrieval_chunk_size,
+                retrieval_scope=config.retrieval_scope,
+                retrieval_train_end=config.retrieval_train_end,
+            )
+            if self.use_retrieval else None
         )
         self.output_gate = NeuralRetrievalGate(config.fusion_dim, use_softplus=self.use_softplus)
         # 이 저장소의 다른 모델들과 목적함수를 맞추려면 'combined'(CombinedLoss)를 쓴다.
@@ -242,13 +242,6 @@ class MergedDemandModel(PreTrainedModel):
             if not getattr(param, '_is_hf_initialized', False):
                 param.data.zero_()
 
-    # Keep the old debugging entry points available while the implementation
-    # is organized under named components.
-    def _crop_all_nodes(self, demands: Tensor) -> Tensor:
-        return self.local_history.crop(demands)
-
-    def _retrieve(self, local_crop: Tensor, sample_idx: Tensor) -> Tensor:
-        return self.retrieval(local_crop, sample_idx)
 
     def _temporal_extra(self, weather: Tensor, hour: Tensor, day_of_week: Tensor) -> Tensor:
         """(정규화 날씨 3) ⊕ (요일 임베딩) ⊕ (시간대 임베딩) -> ``[B, L, extra_dim]``.

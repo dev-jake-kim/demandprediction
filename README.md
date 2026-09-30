@@ -12,12 +12,11 @@ conda activate DA
 
 ## 모델
 
-로컬 히스토리 인코더 + daily/weekly 주기 브랜치 + 인과적 검색 + 브랜치 어텐션 + 신경망/검색
-게이트를 하나로 합친 모델(`MergedDemandModel`) 하나뿐이다 — 이 브랜치(tmp)에는 다른 모델
-구현이 없다(`models/config.py`, `models/modeling.py` 부재, `models/__init__.py` 참고).
-원래 자기 완결형 `merged_model/` 패키지였던 것을 저장소 공용 관례(HuggingFace
-`PreTrainedModel` + Hydra + `Trainer`)로 포팅한 것이며, 계산 그래프는 그대로다. 설계와 코드
-지도는 `docs/MERGED_ARCHITECTURE.md`, ablation 결과는 `docs/MERGED_ABLATION_RESULTS.md`.
+로컬 히스토리 인코더 + daily/weekly 주기 브랜치 + 브랜치 어텐션을
+`MergedDemandModel`로 합쳤다. 기본값에서는 tmp-extracted처럼 검색을
+pass하여 raw grid를 검색용으로 적재하지 않고 neural 예측만 사용한다.
+`model.use_retrieval=true`를 명시하면 인과적 검색과 출력 게이트를 켠다.
+설계는 `docs/MERGED_ARCHITECTURE.md`, 실험은 `docs/MERGED_TUNING_RESULTS.md`.
 
 ## 학습 (train.py)
 
@@ -27,9 +26,9 @@ Hydra로 설정을 관리한다. **도시마다 최적 하이퍼파라미터가 
 `docs/MERGED_TUNING_RESULTS.md`.
 
 ```bash
-python train.py                                            # ulsan (기본값, full)
-python train.py --config-name config_porto model.loss_type=mae   # porto
-python train.py model.use_retrieval=false ablation=no-ir   # ablation (ulsan)
+python train.py                                            # ulsan, 검색 pass (기본값)
+python train.py --config-name config_porto                  # porto, 검색 pass
+python train.py model.use_retrieval=true ablation=full     # 검색 켬 (ulsan)
 python validate_merged.py --device cpu                     # 학습 전 빠른 구조/인과 검사
 ```
 

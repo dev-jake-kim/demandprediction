@@ -76,8 +76,9 @@ raw history
 h_neural → query
 [h_daily, h_weekly, h_neural] → key/value candidates → branch attention → h_attn
 
-raw local crop + absolute sample_idx → CausalRetrieval → ir_out
-h_attn + ir_out → NeuralRetrievalGate → prediction → loss(labels)   # combined | mae | rmse_mape
+검색 켬: raw local crop + absolute sample_idx → CausalRetrieval → ir_out
+         h_attn + ir_out → NeuralRetrievalGate → prediction → loss(labels)
+검색 pass(기본값): h_attn → neural_head → prediction → loss(labels)
 ```
 
 The daily/weekly masks are applied twice: valid lags are compacted before the
@@ -91,9 +92,12 @@ zeroed context and are dropped by compaction, so the widened feature dimension
 must flow through the `gather` in `periodic.py` — `validate_merged.py` pins this with a
 reference-implementation comparison.
 
-The retrieval module uses raw values and only candidate times
-`[time_step, target_time)`. Its CPU cache is not part of the checkpoint; it is
-reconstructed from the temporal grid when a model is created.
+`model.use_retrieval=false`이면 tmp-extracted의 미사용 검색 관점처럼
+검색기를 만들거나 raw grid·검색 후보 crop/cache를 적재하지 않는다.
+게이트의 `lambda_layer`는 건너뛰며 `neural_head`만 예측에 사용한다
+(기존 검색 끔 체크포인트의 신경망 가중치와 호환). 검색 켬에서는 raw
+수요를 사용하며 후보 시간은 `[time_step, target_time)`로 제한한다.
+검색 켬의 CPU cache는 체크포인트에 저장되지 않고 모델 생성 시 재구성된다.
 
 ## 노드별 LSTM weight offset (`node_adaptive`)
 

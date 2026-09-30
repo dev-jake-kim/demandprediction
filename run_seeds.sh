@@ -31,7 +31,7 @@ for seed in "${SEEDS[@]}"; do
   # — dataset="$DATASET" 오버라이드만으로는 model: 그룹이 안 바뀌므로 --config-name을 쓴다.
   PYTHONUNBUFFERED=1 conda run --no-capture-output -n DA \
     python train.py --config-name "config_${DATASET}" \
-      train.seed="$seed" model.loss_type="$LOSS_TYPE" \
+      train.seed="$seed" model.loss_type="$LOSS_TYPE" model.use_retrieval=true \
       ablation=full run_json="$out" > "$log" 2>&1
   echo "[done] seed=$seed $(python3 -c "
 import json;d=json.load(open('$out'));t=d['test']

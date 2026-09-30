@@ -9,9 +9,9 @@ warmup-cosine LR을 적용한다. 원래 고정 LR/2000 epoch의 기록과
 도시마다 최적 하이퍼파라미터가 달라 루트 config를 도시별로 분리했다 — 기본값은
 ``configs/config_ulsan.yaml``, porto는 ``--config-name config_porto``로 명시한다::
 
-    python train.py                                    # ulsan
-    python train.py --config-name config_porto          # porto
-    python train.py model.use_retrieval=false ablation=no-ir   # ablation (ulsan)
+    python train.py                                    # ulsan, 검색 pass
+    python train.py --config-name config_porto          # porto, 검색 pass
+    python train.py model.use_retrieval=true ablation=full   # 검색 켬 (ulsan)
 
 ``model.node_adaptive=true``면 history LSTM에 노드별 weight offset(ΔW)을 붙이고 학습을
 2-stage로 나눈다(stage 1: ΔW 고정 = 지금까지와 동일한 학습 / stage 2: ΔW 해제 + ``stage2.loss``).

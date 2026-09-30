@@ -68,6 +68,10 @@ case "${1:-}" in
       out="output/merged/runs/${city}_mae_${ab}_zero_seed${seed}.json"
       log="output/merged/logs/${city}_mae_${ab}_zero_seed${seed}.log"
       overrides="${ABLATION_OVERRIDES[$ab]:-}"
+      # 도시 기본값은 검색 pass. no-ir 외의 이전 ablation은 검색 켬 기준으로 유지한다.
+      if [ "$ab" != no-ir ]; then
+        overrides="model.use_retrieval=true $overrides"
+      fi
       echo "[w$GPU-$SLOT] $(date +%H:%M:%S) 시작 $ab/$city/$seed"
       # shellcheck disable=SC2086
       # 도시마다 최적 하이퍼파라미터가 달라 루트 config가 나뉘어 있다(config_ulsan/config_porto)

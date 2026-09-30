@@ -24,14 +24,13 @@ retrieval_scope: observed_past
 weekday_dim: 7
 hour_dim: 5
 
-# --- ablation 스위치 (기본값 = full, 아무것도 끄지 않은 모델) ---
-# ablation은 "0-치환" 방식이다 — 모듈을 없애지 않고 항상 생성·실행한 뒤 결과 텐서만 0으로
-# 바꾼다. 예외는 use_branch_attention으로, 어텐션은 출력이 아니라 선택 메커니즘이라
-# 0-치환이 성립하지 않아 균등 가중으로 대체한다.
-# CLI 오버라이드 예: python train.py --config-name config_ulsan model.use_retrieval=false
+# --- ablation 스위치 (기본값: 검색 pass, 나머지 관점 켬) ---
+# use_retrieval=false는 tmp-extracted처럼 검색 객체·corpus·게이트의 lambda 경로를
+# 사용하지 않는다. 검색을 켜는 대조군은 model.use_retrieval=true로 명시한다.
+# 그 밖의 관점 ablation은 출력 0-치환(브랜치 attention은 균등 가중 대체)이다.
 use_daily: true
 use_weekly: true
-use_retrieval: true
+use_retrieval: false
 use_weather: true
 # 'concat'(기본, 정규화 3값을 세 LSTM 입력에 붙임) | 'cls_add'(ir-weather 방식, CLS에 더함)
 weather_injection: concat
