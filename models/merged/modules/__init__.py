@@ -5,7 +5,7 @@ from .embeddings import FourierScalarEmbedding
 from .fusion import PredictionHead
 from .history import LocalHistoryEncoder
 from .periodic import PeriodicLSTMEncoder
-from .retrieval import CausalRetrieval, RetrievalFusion
+from .retrieval import CausalRetrieval, RetrievalFusion, demand_bucket_bounds
 
 __all__ = [
     'BranchAttention',
@@ -15,4 +15,5 @@ __all__ = [
     'PeriodicLSTMEncoder',
     'PredictionHead',
     'RetrievalFusion',
+    'demand_bucket_bounds',
 ]

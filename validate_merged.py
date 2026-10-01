@@ -24,8 +24,10 @@ from models.merged.modules import (
     CausalRetrieval,
     LocalHistoryEncoder,
     PeriodicLSTMEncoder,
+    RetrievalFusion,
+    demand_bucket_bounds,
 )
-from train import build_dataset_kwargs, select_node_adaptive_indices
+from train import build_dataset_kwargs, select_node_adaptive_indices, select_retrieval_value_cap
 
 ROOT = Path(__file__).resolve().parent
 
@@ -70,6 +72,7 @@ def _check_dataset(city: str, device: torch.device) -> dict:
         time_step=train_set.time_step,
         retrieval_grid_path=str(path),
         retrieval_train_end=train_set.train_end,
+        retrieval_value_cap=select_retrieval_value_cap(train_set),
         **weather_stats,
         node_adaptive_indices=node_adaptive_indices,
         **OmegaConf.to_container(cfg.model, resolve=True),
@@ -275,8 +278,8 @@ def _check_node_adaptive_identity() -> dict:
     }
 
 
-def _reference_retrieval(grid: np.ndarray, k: int, radius: int, top: int, allowed) -> np.ndarray:
-    """브루트포스 기준: 모든 (t, 노드)에서 허용 후보 τ를 직접 훑어 검색 결과 ``[T, N, P]``를 만든다."""
+def _reference_retrieval(grid: np.ndarray, k: int, radius: int, top: int, allowed) -> dict:
+    """브루트포스 기준: (t, 노드)마다 허용 후보 τ를 직접 훑어 유사도 내림차순 top-k ``[(s, τ)]``."""
 
     total, height, width = grid.shape
     padded = np.pad(grid, ((0, 0), (radius, radius), (radius, radius)))
@@ -285,25 +288,35 @@ def _reference_retrieval(grid: np.ndarray, k: int, radius: int, top: int, allowe
         [padded[:, y:y + size, x:x + size].reshape(total, -1) for y in range(height) for x in range(width)],
         axis=1,
     ).astype(np.float64)  # [T, N, P]
-    out = np.zeros(crops.shape)
+    out = {}
     for t in range(k, total):
         for node in range(crops.shape[1]):
             query = crops[t - k:t, node].T.reshape(-1)
             query = query / max(np.linalg.norm(query), 1e-12)
             scored = []
             for tau in range(k, total):
-                if not allowed(t, tau):
-                    continue
-                key = crops[tau - k:tau, node].T.reshape(-1)
-                scored.append((float(query @ (key / max(np.linalg.norm(key), 1e-12))), tau))
-            if not scored:
-                continue
-            best = sorted(scored, reverse=True)[:top]
-            scores = np.array([s for s, _ in best])
-            weights = np.exp(scores - scores.max())
-            weights /= weights.sum()
-            out[t, node] = sum(w * crops[tau, node] for w, (_, tau) in zip(weights, best))
+                if allowed(t, tau):
+                    key = crops[tau - k:tau, node].T.reshape(-1)
+                    scored.append((float(query @ (key / max(np.linalg.norm(key), 1e-12))), tau))
+            out[t, node] = sorted(scored, reverse=True)[:top]
     return out
+
+
+def _table_gap(table: tuple[torch.Tensor, torch.Tensor], reference: dict) -> float:
+    """표의 (유사도, τ)가 기준과 같은지 비교하고 최대 유사도 차이를 반환한다."""
+
+    scores, times = table
+    gap = 0.0
+    for (t, node), expected in reference.items():
+        row_scores, row_times = scores[t, node], times[t, node]
+        valid = torch.isfinite(row_scores)
+        if int(valid.sum()) != len(expected):
+            raise AssertionError(f'retrieval candidate count differs at t={t}, node={node}')
+        if row_times[valid].tolist() != [tau for _, tau in expected]:
+            raise AssertionError(f'retrieval candidates differ at t={t}, node={node}')
+        for actual, (score, _) in zip(row_scores[valid].tolist(), expected):
+            gap = max(gap, abs(actual - score))
+    return gap
 
 
 def _check_retrieval_boundary() -> dict:
@@ -325,8 +338,8 @@ def _check_retrieval_boundary() -> dict:
     cpu = torch.device('cpu')
     with tempfile.TemporaryDirectory(prefix='merged_retrieval_') as temp_dir:
         retrieval = build(grid, temp_dir)
-        train_table = retrieval.table(True, cpu).double().numpy()
-        eval_table = retrieval.table(False, cpu).double().numpy()
+        train_table = retrieval.table(True, cpu)
+        eval_table = retrieval.table(False, cpu)
         try:
             CausalRetrieval(
                 height=3, width=3, time_step=k, local_radius=1, retrieval_grid_path=None,
@@ -341,38 +354,37 @@ def _check_retrieval_boundary() -> dict:
         def train_allowed(t: int, tau: int) -> bool:
             return tau < train_end and not (t <= tau <= t + mask_hours)
 
-        reference_train = _reference_retrieval(grid, k, 1, top, train_allowed)
-        reference_eval = _reference_retrieval(grid, k, 1, top, lambda t, tau: tau < t)
         gap = max(
-            float(np.abs(train_table - reference_train).max()),
-            float(np.abs(eval_table - reference_eval).max()),
+            _table_gap(train_table, _reference_retrieval(grid, k, 1, top, train_allowed)),
+            _table_gap(eval_table, _reference_retrieval(grid, k, 1, top, lambda t, tau: tau < t)),
         )
         if gap > 1e-5:
             raise AssertionError(f'retrieval differs from brute-force reference: {gap}')
+
+        def query(values: np.ndarray, training: bool, times: list[int]) -> tuple[torch.Tensor, ...]:
+            module = build(values, temp_dir).train(training)
+            return module(torch.tensor(times))
+
+        def same(a: tuple[torch.Tensor, ...], b: tuple[torch.Tensor, ...]) -> bool:
+            return all(torch.equal(x, y) for x, y in zip(a, b))
 
         # 정답 y_t를 바꿔도 train 모드 결과[t]는 같아야 한다(τ=t의 V, τ∈(t,t+k]의 K가 가려짐).
         target = 12
         changed = grid.copy()
         changed[target] = 1_000.0
-        if not np.array_equal(
-            build(changed, temp_dir).table(True, cpu)[target].numpy(), train_table[target].astype(np.float32)
-        ):
+        if not same(query(changed, True, [target]), query(grid, True, [target])):
             raise AssertionError('train-mode retrieval at t depends on y_t')
-        # train 구간 밖 값을 바꿔도 train 구간 t의 train 모드 결과는 같아야 한다.
+        # train 구간 밖 값을 바꿔도 train 구간 t의 train 모드 결과(유사도·V)는 같아야 한다.
         changed = grid.copy()
         changed[train_end:] = 1_000.0
-        if not torch.equal(
-            build(changed, temp_dir).table(True, cpu)[: train_end + 1],
-            retrieval.table(True, cpu)[: train_end + 1],
-        ):
+        times = list(range(k, train_end + 1))
+        if not same(query(changed, True, times), query(grid, True, times)):
             raise AssertionError('train-mode retrieval used values outside the train split')
         # eval 모드는 t 이후를 바꿔도 결과[t]가 같아야 한다.
         changed = grid.copy()
         changed[target:] = 1_000.0
-        if not torch.equal(
-            build(changed, temp_dir).table(False, cpu)[: target + 1],
-            retrieval.table(False, cpu)[: target + 1],
-        ):
+        times = list(range(k, target + 1))
+        if not same(query(changed, False, times), query(grid, False, times)):
             raise AssertionError('eval-mode retrieval used target or future values')
     return {
         'retrieval_matches_bruteforce': gap,
@@ -404,25 +416,37 @@ def _check_independent_retrieval_radius() -> dict:
             config = MergedDemandConfig(
                 height=3, width=3, time_step=2, local_radius=1, retrieval_local_radius=radius,
                 d_model=8, transformer_heads=2, transformer_layers=1,
-                retrieval_grid_path=str(path), retrieval_k=2, retrieval_train_end=10,
+                retrieval_grid_path=str(path), retrieval_k=2, retrieval_train_end=10, retrieval_value_cap=7,
                 temperature_min=-5.0, temperature_max=30.0, precipitation_max=20.0,
             )
             model = MergedDemandModel(config).eval()
             with torch.no_grad():
                 output = model._compute(**inputs)
-            expected = model.retrieval.table(False, torch.device('cpu'))[7]
+            scores, values = model.retrieval(sample_idx)
             if model.local_history.num_neighbors != 9:
                 raise AssertionError('Transformer window is not 3×3')
-            if tuple(output['retrieved'].shape) != (1, 9, (2 * radius + 1) ** 2):
+            if tuple(output['retrieval_values'].shape) != (1, 9, 2, (2 * radius + 1) ** 2):
                 raise AssertionError(f'Retrieval values do not use radius {radius}')
-            if not torch.equal(output['retrieved'][0], expected):
+            if not (torch.equal(output['retrieval_scores'], scores) and torch.equal(output['retrieval_values'], values)):
                 raise AssertionError('eval forward did not use the eval-mode table')
             model.train()
             model._compute(**inputs)['logits'].sum().backward()
-            grad = model.retrieval_fusion.value_projection.weight.grad
-            if grad is None or not bool(grad.abs().sum() > 0):
-                raise AssertionError('retrieval fusion receives no gradient')
-    return {'transformer_neighbors': 9, 'retrieval_neighbors_checked': [9, 25], 'fusion_gradient': True}
+            fusion = model.retrieval_fusion
+            for name, param in (('embedding', fusion.value_embedding.weight), ('score_scale', fusion.score_scale)):
+                if param.grad is None or not bool(param.grad.abs().sum() > 0):
+                    raise AssertionError(f'retrieval fusion {name} receives no gradient')
+            # 검색 켬 체크포인트 복원(bucket 경계 포함)이 같은 예측을 내는지 확인한다.
+            checkpoint = Path(temp_dir) / f'checkpoint_r{radius}'
+            model.save_pretrained(checkpoint)
+            restored = MergedDemandModel.from_pretrained(checkpoint).eval()
+            model.eval()
+            with torch.no_grad():
+                if not torch.equal(model._compute(**inputs)['logits'], restored._compute(**inputs)['logits']):
+                    raise AssertionError('retrieval checkpoint round trip changed predictions')
+    return {
+        'transformer_neighbors': 9, 'retrieval_neighbors_checked': [9, 25], 'fusion_gradient': True,
+        'retrieval_checkpoint_roundtrip': True,
+    }
 
 
 def _check_retrieval_pass() -> dict:
@@ -464,9 +488,31 @@ def _check_retrieval_pass() -> dict:
             actual = restored.forward_debug(**batch)
         if restored.retrieval is not None or not torch.equal(expected['logits'], actual['logits']):
             raise AssertionError('search-free checkpoint did not reload without its raw grid')
-        if actual['retrieved'] is not None or not torch.equal(actual['h_local'], actual['h_neural']):
+        if actual['retrieval_values'] is not None or not torch.equal(actual['h_local'], actual['h_neural']):
             raise AssertionError('disabled retrieval changed the local representation')
     return {'retrieval_pass_missing_grid_and_reload': True}
+
+
+def _check_retrieval_fusion() -> dict:
+    """수요 bucket 경계, bucket 배정, 후보 없는 칸이 융합 결과에 영향을 주지 않는지 확인한다."""
+
+    if demand_bucket_bounds(7) != [0, 1, 2, 3, 4, 5, 7]:
+        raise AssertionError(f'bucket bounds for cap 7: {demand_bucket_bounds(7)}')
+    if demand_bucket_bounds(30) != [0, 1, 2, 3, 4, 5, 7, 10, 14, 19, 25, 30]:
+        raise AssertionError(f'bucket bounds for cap 30: {demand_bucket_bounds(30)}')
+    torch.manual_seed(0)
+    fusion = RetrievalFusion(num_neighbors=2, history_hidden=4, embedding_dim=3, value_cap=7)
+    buckets = fusion.bucketize(torch.tensor([0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 100.0])).tolist()
+    if buckets != [0, 1, 4, 5, 5, 6, 6]:
+        raise AssertionError(f'bucket assignment wrong: {buckets}')
+    h_neural = torch.randn(1, 1, 4)
+    scores = torch.tensor([[[0.9, float('-inf')]]])
+    values = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
+    other = values.clone()
+    other[..., 1, :] = 100.0
+    if not torch.equal(fusion(h_neural, scores, values), fusion(h_neural, scores, other)):
+        raise AssertionError('candidate slot without a valid neighbor changed the fusion output')
+    return {'retrieval_buckets_cap7': demand_bucket_bounds(7), 'invalid_slot_ignored': True}
 
 
 def _check_masked_grid_receptive_field() -> dict:
@@ -509,6 +555,7 @@ def main() -> None:
     results.append(_check_node_adaptive_identity())
     results.append(_check_retrieval_boundary())
     results.append(_check_independent_retrieval_radius())
+    results.append(_check_retrieval_fusion())
     results.append(_check_retrieval_pass())
     results.append(_check_masked_grid_receptive_field())
     report = {'device': str(device), 'all_pass': True, 'checks': results}

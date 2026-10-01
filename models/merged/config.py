@@ -34,6 +34,8 @@ class MergedDemandConfig(PretrainedConfig):
         retrieval_chunk_size: int = 256,
         retrieval_train_end: int | None = None,
         retrieval_future_mask_hours: int = 72,
+        retrieval_value_cap: int | None = None,
+        retrieval_embedding_dim: int = 16,
         temperature_min: float | None = None,
         temperature_max: float | None = None,
         precipitation_max: float | None = None,
@@ -80,6 +82,9 @@ class MergedDemandConfig(PretrainedConfig):
         self.retrieval_train_end = retrieval_train_end
         # train 모드에서 [t, t + 이 값] 후보를 가린다. time_step 이상이어야 누수가 없다.
         self.retrieval_future_mask_hours = retrieval_future_mask_hours
+        # train 구간 상위 0.5% 수요 경계(train.py가 주입). 이 값 이상은 한 embedding bucket이다.
+        self.retrieval_value_cap = retrieval_value_cap
+        self.retrieval_embedding_dim = retrieval_embedding_dim
         # train 구간 통계. precipitation_max는 snow_scale=1 기준으로 고정한다.
         self.temperature_min = temperature_min
         self.temperature_max = temperature_max

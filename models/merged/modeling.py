@@ -153,8 +153,18 @@ class MergedDemandModel(PreTrainedModel):
             )
             if self.use_retrieval else None
         )
+        if self.use_retrieval and config.retrieval_value_cap is None:
+            raise ValueError(
+                'use_retrieval=True면 retrieval_value_cap이 필요함 - train.py가 train 구간 상위 0.5% '
+                '수요 경계를 계산해 넘겨야 한다'
+            )
         self.retrieval_fusion = (
-            RetrievalFusion((2 * retrieval_radius + 1) ** 2, config.history_hidden)
+            RetrievalFusion(
+                (2 * retrieval_radius + 1) ** 2,
+                config.history_hidden,
+                config.retrieval_embedding_dim,
+                int(config.retrieval_value_cap),
+            )
             if self.use_retrieval else None
         )
         # 속성 이름은 기존 체크포인트 키(output_gate.neural_head.*)와 맞추려고 유지한다.
@@ -256,10 +266,10 @@ class MergedDemandModel(PreTrainedModel):
         weather_cls = self._weather_features(weather) if self.weather_cls_dim else None
         h_neural = self.local_history(demand_history, recent_extra, weather_cls)
         if self.retrieval is not None:
-            retrieved = self.retrieval(sample_idx)
-            h_local = self.retrieval_fusion(h_neural, retrieved)
+            retrieval_scores, retrieval_values = self.retrieval(sample_idx)
+            h_local = self.retrieval_fusion(h_neural, retrieval_scores, retrieval_values)
         else:
-            retrieved = None
+            retrieval_scores = retrieval_values = None
             h_local = h_neural
         # Ablation은 브랜치 출력을 0으로 바꾸되 valid mask와 모듈 shape은 유지한다.
         h_daily, daily_valid = self.daily_branch(daily_demand, daily_mask, daily_extra)
@@ -282,7 +292,8 @@ class MergedDemandModel(PreTrainedModel):
             'attention_weights': attention_weights,
             'h_neural': h_neural,
             'h_local': h_local,
-            'retrieved': retrieved,
+            'retrieval_scores': retrieval_scores,
+            'retrieval_values': retrieval_values,
             'h_attn': h_attn,
             'daily_valid': daily_valid,
             'weekly_valid': weekly_valid,

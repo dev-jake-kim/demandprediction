@@ -13,15 +13,29 @@ from torch.nn import functional as F
 QUERY_CHUNK = 64
 
 
+def demand_bucket_bounds(value_cap: int) -> list[int]:
+    """수요 bucket의 하한 목록. 0~5는 1단위, 이후 간격이 2, 3, 4, ...로 커지고
+    (0, 1, 2, 3, 4, 5, 7, 10, 14, 19, 25, ...), ``value_cap`` 이상은 마지막 bucket 하나다."""
+
+    if value_cap < 1:
+        raise ValueError(f'retrieval_value_cap은 1 이상이어야 함 (받음: {value_cap})')
+    bounds = [0, 1, 2, 3, 4, 5]
+    step = 2
+    while bounds[-1] + step < value_cap:
+        bounds.append(bounds[-1] + step)
+        step += 1
+    return [bound for bound in bounds if bound < value_cap] + [value_cap]
+
+
 class CausalRetrieval(nn.Module):
-    """노드별 3×3(반경 r) raw 창으로 비슷한 과거 시점을 찾아 그 시점의 창 수요를 가중평균한다.
+    """노드별 3×3(반경 r) raw 창으로 비슷한 과거 시점 top-k를 찾아 그 유사도와 창 수요를 돌려준다.
 
     - Q(t) = K(t) = 창 수요 ``[t-k, t)`` (``[k·P]``로 펴 L2 정규화), V(τ) = 창 수요 ``τ`` (``[P]``).
     - 후보 τ (모두 ``τ ≥ k``):
       - train 모드: ``τ < train_end`` 이고 ``τ ∉ [t, t + future_mask_hours]``
       - eval 모드: ``τ < t``
-    - 결과는 ``(모드, t)``에만 의존하므로 모드별로 모든 t를 첫 사용 시 한 번 계산해 두고,
-      forward는 ``sample_idx``로 gather만 한다(GPU→CPU 동기화 없음).
+    - 결과는 ``(모드, t)``에만 의존하므로 모드별로 모든 t의 top-k(유사도, τ)를 첫 사용 시 한 번
+      계산해 두고, forward는 ``sample_idx``로 gather만 한다(GPU→CPU 동기화 없음).
     """
 
     def __init__(
@@ -55,8 +69,10 @@ class CausalRetrieval(nn.Module):
         self.retrieval_train_end = retrieval_train_end
         self.future_mask_hours = future_mask_hours
         self._crops: Tensor | None = None
-        # (training, device) -> [T, N, P]. 체크포인트에 저장하지 않는다.
-        self._tables: dict[tuple[bool, torch.device], Tensor] = {}
+        # 체크포인트에 저장하지 않는 장치별 사본.
+        self._device_crops: dict[torch.device, Tensor] = {}
+        # (training, device) -> (scores [T,N,K], times [T,N,K]).
+        self._tables: dict[tuple[bool, torch.device], tuple[Tensor, Tensor]] = {}
         if retrieval_grid_path is not None:
             self._load_grid(retrieval_grid_path)
 
@@ -74,8 +90,18 @@ class CausalRetrieval(nn.Module):
         patches = F.unfold(padded, kernel_size=self.window_size)
         # [T, N, P]: 시점별 노드 창(격자 밖 0, 행 우선).
         self._crops = patches.transpose(1, 2).contiguous()
+        self._device_crops.clear()
         self._tables.clear()
         self.grid_path = str(path)
+
+    def crops(self, device: torch.device) -> Tensor:
+        assert self._crops is not None
+        device = torch.device(device)
+        cached = self._device_crops.get(device)
+        if cached is None:
+            cached = self._crops.to(device)
+            self._device_crops[device] = cached
+        return cached
 
     def candidate_mask(self, target_times: Tensor, candidate_times: Tensor, training: bool) -> Tensor:
         """``[Q]``, ``[C]`` -> ``[Q, C]`` bool. 예측 시점 t마다 후보 τ가 허용되는가."""
@@ -89,22 +115,22 @@ class CausalRetrieval(nn.Module):
         return tau < t
 
     @torch.no_grad()
-    def _build_table(self, training: bool, device: torch.device) -> Tensor:
-        assert self._crops is not None
-        crops = self._crops.to(device)
+    def _build_table(self, training: bool, device: torch.device) -> tuple[Tensor, Tensor]:
+        crops = self.crops(device)
         total, nodes, neighbors = crops.shape
         k = self.time_step
-        table = crops.new_zeros(total, nodes, neighbors)
-        if total <= k:
-            return table
+        count = max(total - k, 0)
+        top = max(min(self.retrieval_k, count), 1)
+        # 허용 후보가 없는 칸은 score -inf (τ는 0, 쓰이지 않는다).
+        scores = crops.new_full((total, nodes, top), float('-inf'))
+        times = torch.zeros(total, nodes, top, dtype=torch.long, device=device)
+        if count == 0:
+            return scores, times
         # windows[c] = 창 수요 [c, c+k) -> 시점 τ = c + k의 K이자 같은 t의 Q.
-        windows = crops.unfold(0, k, 1)[: total - k]  # [C, N, P, k]
-        count = windows.shape[0]
+        windows = crops.unfold(0, k, 1)[:count]  # [C, N, P, k]
         keys = F.normalize(windows.reshape(count, nodes, neighbors * k), dim=-1)
         keys = keys.permute(1, 0, 2).contiguous()  # [N, C, D]
-        values = crops[k:].permute(1, 0, 2).contiguous()  # [N, C, P] = V(c + k)
-        times = torch.arange(k, total, device=device)
-        node_index = torch.arange(nodes, device=device).view(-1, 1, 1)
+        candidate_times = torch.arange(k, total, device=device)
 
         for q_start in range(0, count, QUERY_CHUNK):
             q_end = min(q_start + QUERY_CHUNK, count)
@@ -113,30 +139,29 @@ class CausalRetrieval(nn.Module):
             best_index: Tensor | None = None
             for c_start in range(0, count, self.retrieval_chunk_size):
                 c_end = min(c_start + self.retrieval_chunk_size, count)
-                scores = torch.bmm(queries, keys[:, c_start:c_end].transpose(1, 2))  # [N, Q, Cc]
-                allowed = self.candidate_mask(times[q_start:q_end], times[c_start:c_end], training)
-                scores = scores.masked_fill(~allowed, float('-inf'))
-                take = min(self.retrieval_k, c_end - c_start)
-                chunk_scores, chunk_index = scores.topk(take, dim=-1)
+                chunk = torch.bmm(queries, keys[:, c_start:c_end].transpose(1, 2))  # [N, Q, Cc]
+                allowed = self.candidate_mask(
+                    candidate_times[q_start:q_end], candidate_times[c_start:c_end], training
+                )
+                chunk = chunk.masked_fill(~allowed, float('-inf'))
+                chunk_scores, chunk_index = chunk.topk(min(top, c_end - c_start), dim=-1)
                 chunk_index = chunk_index + c_start
                 if best_scores is None:
                     best_scores, best_index = chunk_scores, chunk_index
                 else:
                     merged_scores = torch.cat([best_scores, chunk_scores], dim=-1)
                     merged_index = torch.cat([best_index, chunk_index], dim=-1)
-                    take = min(self.retrieval_k, merged_scores.shape[-1])
-                    best_scores, order = merged_scores.topk(take, dim=-1)
+                    best_scores, order = merged_scores.topk(min(top, merged_scores.shape[-1]), dim=-1)
                     best_index = merged_index.gather(-1, order)
             assert best_scores is not None and best_index is not None
-            # 허용 후보가 하나도 없으면 softmax가 NaN -> 0 (검색 결과 0).
-            weights = torch.softmax(best_scores, dim=-1).nan_to_num(0.0)  # [N, Q, K]
-            picked = values[node_index, best_index]  # [N, Q, K, P]
-            retrieved = (weights.unsqueeze(-1) * picked).sum(dim=2)  # [N, Q, P]
-            table[k + q_start : k + q_end] = retrieved.transpose(0, 1)
-        return table
+            width = best_scores.shape[-1]
+            scores[k + q_start : k + q_end, :, :width] = best_scores.transpose(0, 1)
+            picked = torch.where(torch.isfinite(best_scores), best_index + k, 0)
+            times[k + q_start : k + q_end, :, :width] = picked.transpose(0, 1)
+        return scores, times
 
-    def table(self, training: bool, device: torch.device) -> Tensor | None:
-        """``[T, N, P]`` 모드별 검색 결과 표. grid가 없으면 None."""
+    def table(self, training: bool, device: torch.device) -> tuple[Tensor, Tensor] | None:
+        """모드별 top-k 표 ``(scores [T,N,K], times [T,N,K])``. grid가 없으면 None."""
 
         if self._crops is None:
             return None
@@ -147,28 +172,57 @@ class CausalRetrieval(nn.Module):
             self._tables[key] = cached
         return cached
 
-    def forward(self, sample_idx: Tensor) -> Tensor:
-        """``[B]`` 절대 예측 시점 -> ``[B, N, P]`` 검색된 창 수요(raw). 모드는 ``self.training``."""
+    def forward(self, sample_idx: Tensor) -> tuple[Tensor, Tensor]:
+        """``[B]`` 절대 예측 시점 -> ``(scores [B,N,K], values [B,N,K,P])``. 모드는 ``self.training``.
 
-        table = self.table(self.training, sample_idx.device)
+        허용 후보가 없는 칸은 score가 ``-inf``다(values는 의미 없음).
+        """
+
+        device = sample_idx.device
+        table = self.table(self.training, device)
         if table is None:
-            return torch.zeros(
-                sample_idx.shape[0], self.num_nodes, self.num_neighbors, device=sample_idx.device
+            batch = sample_idx.shape[0]
+            return (
+                torch.full((batch, self.num_nodes, 1), float('-inf'), device=device),
+                torch.zeros(batch, self.num_nodes, 1, self.num_neighbors, device=device),
             )
-        return table[sample_idx.long()]
+        scores, times = table
+        index = sample_idx.long()
+        picked_times = times[index]  # [B, N, K]
+        node_index = torch.arange(self.num_nodes, device=device).view(1, -1, 1)
+        values = self.crops(device)[picked_times, node_index]  # [B, N, K, P]
+        return scores[index], values
 
 
 class RetrievalFusion(nn.Module):
-    """``h_local = Linear([h_neural ⊕ Linear(log1p(retrieved))])``."""
+    """검색 후보마다 ``sigmoid(a·s + b) · Embedding(bucket(v))``를 만들어 후보 합을 구하고
+    ``h_neural``과 concat해 ``Linear``로 ``history_hidden``에 맞춘다.
 
-    def __init__(self, num_neighbors: int, history_hidden: int) -> None:
+    ``v``는 후보 τ의 3×3 창 수요 ``P``개이며 칸별로 embedding을 따로 합한 뒤 ``[P·E]``로 편다.
+    """
+
+    def __init__(
+        self, num_neighbors: int, history_hidden: int, embedding_dim: int, value_cap: int
+    ) -> None:
         super().__init__()
-        self.value_projection = nn.Linear(num_neighbors, history_hidden)
-        self.fuse = nn.Linear(2 * history_hidden, history_hidden)
+        bounds = demand_bucket_bounds(value_cap)
+        # persistent: from_pretrained의 meta-device 초기화는 비저장 buffer를 복원하지 않는다.
+        self.register_buffer('bucket_bounds', torch.tensor(bounds, dtype=torch.float32))
+        self.value_embedding = nn.Embedding(len(bounds), embedding_dim)
+        self.score_scale = nn.Parameter(torch.tensor(1.0))
+        self.score_bias = nn.Parameter(torch.tensor(0.0))
+        self.fuse = nn.Linear(history_hidden + num_neighbors * embedding_dim, history_hidden)
 
-    def forward(self, h_neural: Tensor, retrieved: Tensor) -> Tensor:
-        r_emb = self.value_projection(torch.log1p(retrieved.to(h_neural.dtype)))
-        return self.fuse(torch.cat([h_neural, r_emb], dim=-1))
+    def bucketize(self, values: Tensor) -> Tensor:
+        return torch.bucketize(values, self.bucket_bounds, right=True) - 1
+
+    def forward(self, h_neural: Tensor, scores: Tensor, values: Tensor) -> Tensor:
+        valid = torch.isfinite(scores)
+        gate = torch.sigmoid(self.score_scale * scores.masked_fill(~valid, 0.0) + self.score_bias)
+        gate = (gate * valid).to(h_neural.dtype)  # [B, N, K]
+        embedded = self.value_embedding(self.bucketize(values))  # [B, N, K, P, E]
+        summed = (gate[..., None, None] * embedded).sum(dim=2)  # [B, N, P, E]
+        return self.fuse(torch.cat([h_neural, summed.flatten(2)], dim=-1))
 
 
-__all__ = ['CausalRetrieval', 'RetrievalFusion']
+__all__ = ['CausalRetrieval', 'RetrievalFusion', 'demand_bucket_bounds']
