@@ -232,7 +232,7 @@ class CausalRetrieval(nn.Module):
         return scores[index], values, self.query_measures(device)[index]
 
 
-FUSION_MODES = ('average', 'embedding')
+FUSION_MODES = ('average', 'embedding', 'vote')
 
 
 class RetrievalFusion(nn.Module):
@@ -244,6 +244,8 @@ class RetrievalFusion(nn.Module):
       ``use_fallback``이면 질의 크기 m으로 학습 벡터 O와 ``(1 − w)·C + w·O`` (``w = e^{−m/τ}``)로
       섞는다. 질의가 전부 0이면(m=0) 유사도가 모두 0이라 top-k가 무의미하므로 결과는 O가 된다.
       ``learn_tau``면 τ를 ``log τ`` 파라미터로 학습한다.
+    - ``vote``: v를 가장 가까운 bucket 값으로 반올림하고(동점은 위쪽, cap 이상은 마지막 bucket)
+      bucket마다 그 후보들의 s를 합한다. 수요 0 bucket을 뺀 ``[B, N, buckets − 1]``을 쓴다.
     """
 
     def __init__(
@@ -267,12 +269,15 @@ class RetrievalFusion(nn.Module):
             self.fuse = nn.Linear(2 * history_hidden, history_hidden)
             return
         if value_cap is None:
-            raise ValueError('embedding 융합에는 retrieval_value_cap이 필요함')
-        if fallback_tau <= 0:
-            raise ValueError(f'retrieval_fallback_tau는 양수여야 함 (받음: {fallback_tau})')
+            raise ValueError(f'{mode} 융합에는 retrieval_value_cap이 필요함')
         bounds = demand_bucket_bounds(value_cap)
         # persistent: from_pretrained의 meta-device 초기화는 비저장 buffer를 복원하지 않는다.
         self.register_buffer('bucket_bounds', torch.tensor(bounds, dtype=torch.float32))
+        if mode == 'vote':
+            self.fuse = nn.Linear(history_hidden + len(bounds) - 1, history_hidden)
+            return
+        if fallback_tau <= 0:
+            raise ValueError(f'retrieval_fallback_tau는 양수여야 함 (받음: {fallback_tau})')
         self.value_embedding = nn.Embedding(len(bounds), embedding_dim)
         self.score_scale = nn.Parameter(torch.tensor(1.0))
         self.score_bias = nn.Parameter(torch.tensor(0.0))
@@ -293,7 +298,18 @@ class RetrievalFusion(nn.Module):
         return torch.exp(-query_measure * torch.exp(-self.fallback_log_tau))
 
     def bucketize(self, values: Tensor) -> Tensor:
+        """embedding용: 하한 기준 bucket(내림)."""
+
         return torch.bucketize(values, self.bucket_bounds, right=True) - 1
+
+    def nearest_bucket(self, values: Tensor) -> Tensor:
+        """vote용: 가장 가까운 bucket 값의 index. 동점이면 위쪽, cap 이상은 마지막 bucket."""
+
+        bounds = self.bucket_bounds
+        lower = self.bucketize(values)
+        upper = (lower + 1).clamp_max(len(bounds) - 1)
+        take_upper = (bounds[upper] - values) <= (values - bounds[lower])
+        return torch.where(take_upper, upper, lower)
 
     def forward(self, h_neural: Tensor, scores: Tensor, values: Tensor, query_measure: Tensor) -> Tensor:
         valid = torch.isfinite(scores)
@@ -303,6 +319,12 @@ class RetrievalFusion(nn.Module):
             averaged = (weights * values.masked_fill(~valid, 0.0)).sum(dim=-1, keepdim=True)
             r_emb = self.value_projection(torch.log1p(averaged.to(h_neural.dtype)))
             return self.fuse(torch.cat([h_neural, r_emb], dim=-1))
+        if self.mode == 'vote':
+            weight = scores.masked_fill(~valid, 0.0).to(h_neural.dtype)  # [B, N, K]
+            votes = weight.new_zeros(*weight.shape[:-1], len(self.bucket_bounds))
+            votes = votes.scatter_add(-1, self.nearest_bucket(values), weight)
+            # 수요 0 bucket(index 0)은 버린다.
+            return self.fuse(torch.cat([h_neural, votes[..., 1:]], dim=-1))
         gate = torch.sigmoid(self.score_scale * scores.masked_fill(~valid, 0.0) + self.score_bias)
         gate = (gate * valid).to(h_neural.dtype)  # [B, N, K]
         embedded = self.value_embedding(self.bucketize(values))  # [B, N, K, E]

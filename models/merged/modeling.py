@@ -154,10 +154,14 @@ class MergedDemandModel(PreTrainedModel):
             )
             if self.use_retrieval else None
         )
-        if self.use_retrieval and config.retrieval_fusion == 'embedding' and config.retrieval_value_cap is None:
+        if (
+            self.use_retrieval
+            and config.retrieval_fusion in ('embedding', 'vote')
+            and config.retrieval_value_cap is None
+        ):
             raise ValueError(
-                'embedding 검색 융합에는 retrieval_value_cap이 필요함 - train.py가 train 구간 상위 '
-                '0.5% 수요 경계를 계산해 넘겨야 한다'
+                f'{config.retrieval_fusion} 검색 융합에는 retrieval_value_cap이 필요함 - train.py가 '
+                'train 구간 상위 0.5% 수요 경계를 계산해 넘겨야 한다'
             )
         self.retrieval_fusion = (
             RetrievalFusion(

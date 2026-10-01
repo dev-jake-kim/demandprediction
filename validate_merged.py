@@ -418,6 +418,7 @@ def _check_independent_retrieval_radius() -> dict:
             (2, 'nonzero_count', True, 'embedding', True),
             (1, 'mean', False, 'embedding', False),
             (1, 'mean', False, 'average', False),
+            (1, 'mean', False, 'vote', False),
         )
         for case, (radius, measure, learn_tau, fusion_mode, use_fallback) in enumerate(variants):
             config = MergedDemandConfig(
@@ -457,6 +458,13 @@ def _check_independent_retrieval_radius() -> dict:
             fusion = model.retrieval_fusion
             if fusion_mode == 'average':
                 checked = (('value_projection', fusion.value_projection.weight),)
+            elif fusion_mode == 'vote':
+                # vote 벡터가 들어가는 fuse 열(h_neural 뒤)에 gradient가 흘러야 한다.
+                vote_columns = fusion.fuse.weight[:, config.history_hidden:]
+                vote_grad = fusion.fuse.weight.grad[:, config.history_hidden:]
+                if vote_columns.shape[1] != len(demand_bucket_bounds(7)) - 1 or not bool(vote_grad.abs().sum() > 0):
+                    raise AssertionError('vote fusion input has the wrong width or no gradient')
+                checked = ()
             else:
                 checked = (
                     ('embedding', fusion.value_embedding.weight),
@@ -570,9 +578,21 @@ def _check_retrieval_fusion() -> dict:
     expected = average.fuse(torch.cat([h_neural, average.value_projection(torch.zeros(1, 1, 1))], dim=-1))
     if not torch.allclose(average(h_neural, empty, pair_values, busy), expected, atol=1e-6):
         raise AssertionError('average fusion without candidates is not zero retrieval')
+
+    # vote: 가장 가까운 bucket(동점 위쪽, cap 이상 마지막)마다 s를 합하고 0번 bucket을 버린다.
+    vote = RetrievalFusion(4, mode='vote', value_cap=21)  # bounds 0,1,2,3,4,5,7,10,14,19,21
+    nearest = vote.nearest_bucket(torch.tensor([17.0, 6.0, 12.0, 20.0, 22.0, 15.0, 0.0])).tolist()
+    if nearest != [9, 6, 8, 10, 10, 8, 0]:
+        raise AssertionError(f'nearest bucket wrong: {nearest}')
+    vote_scores = torch.tensor([[[0.9, 0.8, 0.7, 0.6, 0.5, 0.4, float('-inf')]]])
+    vote_values = torch.tensor([[[5.0, 4.0, 15.0, 5.0, 78.0, 0.0, 3.0]]])
+    expected_votes = torch.tensor([[[0.0, 0.0, 0.0, 0.8, 1.5, 0.0, 0.0, 0.7, 0.0, 0.5]]])
+    expected = vote.fuse(torch.cat([h_neural, expected_votes], dim=-1))
+    if not torch.allclose(vote(h_neural, vote_scores, vote_values, busy), expected, atol=1e-6):
+        raise AssertionError('vote fusion does not match the expected per-bucket similarity sums')
     return {
         'retrieval_buckets_cap7': demand_bucket_bounds(7), 'invalid_slot_ignored': True,
-        'zero_query_uses_O': True, 'average_fusion_formula': True,
+        'zero_query_uses_O': True, 'average_fusion_formula': True, 'vote_fusion_formula': True,
     }
 
 

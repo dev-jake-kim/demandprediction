@@ -109,7 +109,7 @@ flowchart TD
         R1["Q: 최근 [t-k, t) 3×3 raw 창<br/>+ 절대 시점 sample_idx=t"]
         R2["후보 τ: K=[τ-k, τ) 3×3 raw 창<br/>V=τ 시점 노드 자신의 수요 1개<br/>train(): τ<train_end, τ∉[t, t+72h]<br/>eval(): τ<t"]
         R3["cosine top-k<br/>유사도 s [B,N,K], V [B,N,K]"]
-        R4["retrieval_fusion<br/>average: softmax(s) 가중평균 V → Linear(1→H)<br/>embedding: Σ sigmoid(a·s+b)·Embedding(bucket(V)) 16차원<br/>(+ O 혼합 (1−w)·C + w·O)"]
+        R4["retrieval_fusion<br/>average: softmax(s) 가중평균 V → Linear(1→H)<br/>embedding: Σ sigmoid(a·s+b)·Embedding(bucket(V)) 16차원<br/>(+ O 혼합 (1−w)·C + w·O)<br/>vote: bucket별 Σ s, 0번 bucket 제외"]
         R5["concat [h_neural ⊕ 검색 벡터]<br/>Linear → history_hidden<br/>h_local"]
         R1 --> R2 --> R3 --> R4 --> R5
     end
@@ -228,7 +228,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | | `retrieval_k`, `retrieval_chunk_size` | 20, 256 |
 | | `retrieval_future_mask_hours` | 72 (train 모드에서 `[t, t+72h]` 후보 제외, `≥ time_step`) |
 | | `retrieval_embedding_dim` | 16 (수요 bucket embedding 차원) |
-| | `retrieval_fusion`, `retrieval_use_fallback` | `embedding`, true (융합 방식, embedding에서 O 혼합 사용) |
+| | `retrieval_fusion`, `retrieval_use_fallback` | `embedding`, true (융합 방식 `average`/`embedding`/`vote`, embedding에서 O 혼합 사용) |
 | | `retrieval_query_measure` | `mean` (O 혼합의 m: `mean` 질의 평균 / `nonzero_count` 질의의 0 아닌 칸 수) |
 | | `retrieval_fallback_tau`, `retrieval_fallback_learn_tau` | 1.0, false (`w = e^{−m/τ}`, 학습 시 τ는 이 값에서 시작) |
 | 노드 적응 | `node_adaptive`, `node_adaptive_min_demand` | true, 0.1 |
@@ -468,6 +468,11 @@ reshape한 것이 `logits`다. 검색 결과는 출력에서 섞지 않고 6.6�
       `w = e^{−m/τ}`, τ는 `retrieval_fallback_tau`이고 `retrieval_fallback_learn_tau=true`면 `log τ`를
       학습한다. 질의가 전부 0이면(m=0) 유사도가 모두 0이라 top-k가 동점 중 임의 후보가 되므로 `R = O`다.
     - `h_local = Linear(history_hidden + 16 → history_hidden)([h_neural ⊕ R])`
+  - `vote`: V_i를 bucket 값(`0, 1, 2, 3, 4, 5, 7, 10, 14, 19, …, cap`) 중 **가장 가까운 값**으로
+    반올림하고(동점은 위쪽: 6→7, 12→14, 20→21; cap 이상은 마지막 bucket), bucket마다 그 후보들의
+    raw `s`를 합한다(빈 칸 0). 수요 0 bucket을 버린 `vote[1:]`을 쓴다(Ulsan 6, Porto 10차원).
+    `h_local = Linear(history_hidden + (bucket 수 − 1) → history_hidden)([h_neural ⊕ vote[1:]])`.
+    질의가 전부 0이면 s가 모두 0이라 vote도 0이다.
   - `h_local`이 `BranchAttention`의 neural 후보·query로 `h_neural`을 대신한다.
 
 <details>
@@ -627,8 +632,9 @@ python test.py <checkpoint_dir> --city {ulsan,porto} --weather_csv_path <csv> \
 - 검색: 모드별 top-k `(s, τ)` 표가 브루트포스 기준과 일치, `retrieval_future_mask_hours < time_step`
   거부, train 모드에서 `y_t`나 train 구간 밖 값을 바꿔도, eval 모드에서 `t` 이후 값을 바꿔도
   결과[t](유사도·V)가 그대로.
-- 검색 융합: bucket 경계·배정, 빈 후보 칸 무시, m=0이면 검색 결과와 무관하게 `O`만 사용, average 식.
-  검색 켬(embedding O 켬·끔, average) eval forward가 eval 모드 표를 쓰고, V가 τ의 노드 자신 수요이고,
+- 검색 융합: bucket 경계·배정, 빈 후보 칸 무시, m=0이면 검색 결과와 무관하게 `O`만 사용, average 식,
+  vote의 가장 가까운 bucket 반올림·bucket별 s 합·0번 제외. 검색 켬(embedding O 켬·끔, average, vote)
+  eval forward가 eval 모드 표를 쓰고, V가 τ의 노드 자신 수요이고,
   m(평균·0 아닌 칸 수)이 `demand_history` 창에서 계산한 값과 같고, 융합 파라미터에 gradient가
   흐르며, 체크포인트 복원 후 예측이 같다.
 - Transformer 3×3에서 검색 창 3×3·5×5 선택이 forward에 반영.
