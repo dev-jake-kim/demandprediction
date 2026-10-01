@@ -485,9 +485,8 @@ def main(cfg: DictConfig) -> None:
             for param in deltas:
                 param.requires_grad_(False)
             probe = build_trainer('stage1_eval', train_cfg['learning_rate'])
-            stage1_metrics = probe.evaluate(
-                eval_dataset=eval_test_set, metric_key_prefix='stage1_test'
-            )
+            # persistent worker의 eval dataloader 캐시를 피하도록 test는 predict로 평가한다.
+            stage1_metrics = probe.predict(eval_test_set, metric_key_prefix='stage1_test').metrics
             logger.info(f'[stage1] Test metrics: {stage1_metrics}')
             del probe
         else:
@@ -500,9 +499,7 @@ def main(cfg: DictConfig) -> None:
                 f'학습 파라미터 {trainable_count(stage1):,}개'
             )
             stage1.train()
-            stage1_metrics = stage1.evaluate(
-                eval_dataset=eval_test_set, metric_key_prefix='stage1_test'
-            )
+            stage1_metrics = stage1.predict(eval_test_set, metric_key_prefix='stage1_test').metrics
             logger.info(f'[stage1] Test metrics: {stage1_metrics}')
             history1, best_epoch1, best_val1 = _summarize_history(stage1.state.log_history)
             stage_records['stage1'] = {
@@ -545,7 +542,7 @@ def main(cfg: DictConfig) -> None:
     trainer.save_model(output_dir)
     logger.info(f'Model saved to: {output_dir}')
 
-    test_metrics = trainer.evaluate(eval_dataset=eval_test_set, metric_key_prefix='test')
+    test_metrics = trainer.predict(eval_test_set, metric_key_prefix='test').metrics
     logger.info(f'Test metrics: {test_metrics}')
 
     if deltas:
