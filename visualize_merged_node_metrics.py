@@ -11,13 +11,13 @@ and their difference.
         --out output/merged_node_metrics/ulsan_lossC.png
 
     CUDA_VISIBLE_DEVICES=1 python visualize_merged_node_metrics.py \\
-        --city porto --adformer-dir output/past/ADFormer \\
+        --city porto --adformer-dir output/ADFormer/window24/regional_metrics \\
         --variant output/past/experiments/checkpoints/tmp_node01_mae_porto_seed245 \\
         --baseline-label "ADFormer (5-seed mean)" --variant-label "stage2 (seed=245)" \\
         --out output/node_metric_comparison/porto_seed245_vs_adformer.png
 
     CUDA_VISIBLE_DEVICES=1 python visualize_merged_node_metrics.py \\
-        --city porto --adformer-dir output/past/ADFormer \\
+        --city porto --adformer-dir output/ADFormer/window24/regional_metrics \\
         --variant output/past/experiments/checkpoints/tmp_node01_mae_porto_seed245 \\
                   output/past/experiments/checkpoints/tmp_node01_mae_porto_seed6835 \\
                   output/past/experiments/checkpoints/tmp_node01_mae_porto_seed851 \\

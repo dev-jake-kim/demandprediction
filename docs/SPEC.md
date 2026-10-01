@@ -602,6 +602,8 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
 - `output`은 외장 디스크 `/mnt/hdd/jinsu_extention_disk/gir`을 가리키는 symlink이며
   git 추적 대상이 아니다.
 - 이전 실험 기록은 모두 `output/past/`에 있다.
+- ADFormer 기준선 원자료는 입력 창별로 `output/ADFormer/window24/`, `output/ADFormer/window8/`에
+  있다(시드별 CSV, 노드별 지표 `regional_metrics/`). 수치는 `docs/ADFORMER_REFERENCE.md`.
 - **채택 모델**은 `output/adopted/`에 둔다: 결과 JSON은 `runs/`, 체크포인트·학습 로그·GPU 사용률
   기록은 `checkpoints/`의 같은 이름 폴더. 현재 채택 모델은 커밋 `8d28250`(날씨 2채널: 기온,
   강수 + g·적설, min-max), `local_radius=1`(3×3), 검색 pass, 시드 245
@@ -618,12 +620,6 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
 값의 각 비교군 대비 변화율을 `(변경 후 / 비교군 − 1) × 100`으로 표기한다
 (예: `0.214 (−24%)`). 세 지표 모두 낮을수록 좋다.
 
-ADFormer 기준선 (5시드 245/6835/851/5123/535 평균 ± 표준편차):
-
-| 도시 | RMSE | MAE | MAPE (%) |
-|---|---:|---:|---:|
-| Ulsan | 0.7284 ± 0.0029 | 0.3265 ± 0.0011 | 15.7116 ± 0.1842 |
-| Porto | 1.6753 ± 0.0305 | 0.4913 ± 0.0022 | 15.4257 ± 0.1298 |
-
-ADFormer 기록에는 test 구간 메타데이터와 MAPE 분모 정의가 없으므로, 이 모델의
-MAPE(+1)와의 비교는 보고 수치 간 비교로만 해석한다.
+ADFormer 기준선은 입력 시간 창(24시간, 8시간)별로 [`ADFORMER_REFERENCE.md`](ADFORMER_REFERENCE.md)에
+있다. 비교할 때는 이 모델과 **같은 입력 창·같은 시드**의 ADFormer 값을 쓴다. ADFormer 기록은
+test 샘플 수가 다르고 MAPE 분모 정의가 없으므로, 비교는 보고 수치 간 비교로만 해석한다.
