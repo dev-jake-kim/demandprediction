@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from dataset_frame import UnifiedDemandDataset, resolve_dataset_path
 from models.merged import MergedDemandConfig, MergedDemandModel
@@ -58,8 +58,12 @@ def _check_dataset(city: str, device: torch.device) -> dict:
     if not (train_set.val_end == val_set.val_end == test_set.val_end):
         raise AssertionError(f'{city}: validation bounds differ between dataset views')
 
-    sample = next(iter(DataLoader(train_set, batch_size=1, shuffle=False)))
+    # 모든 daily·weekly lag의 원천 시점이 0 이상인 샘플로 검사한다.
+    probe = int(train_set.weekly_lag_values[0])
+    sample = next(iter(DataLoader(Subset(train_set, [probe]), batch_size=1, shuffle=False)))
     sample = {key: value.to(device) for key, value in sample.items()}
+    if bool(sample['daily_mask'].any()) or bool(sample['weekly_mask'].any()):
+        raise AssertionError(f'{city}: probe sample should have all periodic lags valid')
     model_config = MergedDemandConfig(
         height=train_set.height,
         width=train_set.width,

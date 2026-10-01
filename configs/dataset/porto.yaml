@@ -1,7 +1,7 @@
 city: porto
 npy_path: data/raw/porto_temporal_grid.npy
 weather_csv_path: data/raw/porto_meteorological_data.csv
-time_step: 24
+time_step: 8
 # 시간순 분할이며 남은 구간은 test다.
 train_ratio: 0.7
 val_ratio: 0.15

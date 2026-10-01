@@ -30,7 +30,7 @@
 ```mermaid
 flowchart TD
     subgraph IN["입력: 예측 시점 t"]
-        H["최근 수요 이력<br/>demand_history [B,k,H,W]<br/>k=24"]
+        H["최근 수요 이력<br/>demand_history [B,k,H,W]<br/>k=8"]
         CTX["최근 날씨·요일·시간<br/>[B,k]"]
         D["daily lag 수요 + mask<br/>[B,6,N,1], [B,6]"]
         DC["daily lag 날씨·요일·시간"]
@@ -119,7 +119,7 @@ flowchart TD
     R4 -.->|"검색 켬 예측"| PRED
 ```
 
-기호: `B` batch, `k=time_step=24`, `N=H×W` 노드 수, `D=d_model`,
+기호: `B` batch, `k=time_step=8`(입력 시간 창), `N=H×W` 노드 수, `D=d_model`,
 `P=(2a+1)²` 이웃 창 셀 수(`a=local_radius`; 3×3이면 9, 5×5이면 25),
 `L`은 최근 이력 `k`, daily lag 6, weekly lag 4 중 하나.
 
@@ -208,7 +208,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 
 | 그룹 | 필드 | 현재 값 (Ulsan / Porto) |
 |---|---|---|
-| 데이터 파생 | `height`, `width`, `time_step` | 14×12 / 10×20, 24 |
+| 데이터 파생 | `height`, `width`, `time_step` | 14×12 / 10×20, 8 (`configs/dataset/<city>.yaml`) |
 | | `temperature_min`, `temperature_max` | train 구간 기온 최솟값·최댓값 |
 | | `precipitation_max` | train 구간 `강수 + 1·적설`의 최댓값 (> 0) |
 | | `node_adaptive_indices` | train 구간 평균 수요 > `node_adaptive_min_demand`인 노드 id |
@@ -563,8 +563,9 @@ python test.py <checkpoint_dir> --city {ulsan,porto} --weather_csv_path <csv> \
 ```
 
 체크포인트를 `from_pretrained`로 복원해 지정 split 전체를 평가하고 네 지표를 로그와
-`<checkpoint_dir>/test.log`에 쓴다. **분할 비율 CLI 기본값은 0.80/0.10**이므로 현재
-학습 분할(0.70/0.15)을 평가하려면 비율을 명시해야 한다.
+`<checkpoint_dir>/test.log`에 쓴다. `--time_step`을 주지 않으면 체크포인트 config의
+`time_step`을 쓴다. **분할 비율 CLI 기본값은 0.80/0.10**이므로 현재 학습 분할(0.70/0.15)을
+평가하려면 비율을 명시해야 한다.
 
 ### `validate_merged.py --device {cpu,cuda}`
 
@@ -605,12 +606,16 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
 - ADFormer 기준선 원자료는 입력 창별로 `output/ADFormer/window24/`, `output/ADFormer/window8/`에
   있다(시드별 CSV, 노드별 지표 `regional_metrics/`). 수치는 `docs/ADFORMER_REFERENCE.md`.
 - **채택 모델**은 `output/adopted/`에 둔다: 결과 JSON은 `runs/`, 체크포인트·학습 로그·GPU 사용률
-  기록은 `checkpoints/`의 같은 이름 폴더. 현재 채택 모델은 커밋 `8d28250`(날씨 2채널: 기온,
-  강수 + g·적설, min-max), `local_radius=1`(3×3), 검색 pass, 시드 245
-  `weathermerge_{ulsan,porto}_seed245_8d28250`이다.
-- 이전 채택 모델(커밋 `b79e824`, 날씨 3채널 z-score, 5시드
-  `maskedgrid3_{ulsan,porto}_seed{seed}_b79e824`)은 `output/past/adopted_b79e824/`에 있으며
-  커밋 `b79e824`의 코드로만 불러올 수 있다.
+  기록은 `checkpoints/`의 같은 이름 폴더. 현재 채택 모델은 날씨 2채널(기온, 강수 + g·적설,
+  min-max), `local_radius=1`(3×3), 검색 pass, **입력 시간 창 8시간**, 5시드
+  (245/6835/851/5123/535) `timestep8_{ulsan,porto}_seed{seed}_{39185a1|d02824a}`이다
+  (시드 245는 커밋 `39185a1`, 나머지는 `d02824a`; 두 커밋의 모델 코드는 같다).
+- 이전 채택 모델:
+  - 커밋 `8d28250`, 입력 창 24시간, 시드 245 `weathermerge_{ulsan,porto}_seed245_8d28250`:
+    `output/past/adopted_8d28250/`. 현재 코드로 불러올 수 있다(`test.py`는 체크포인트의
+    `time_step`을 따른다).
+  - 커밋 `b79e824`, 날씨 3채널 z-score, 5시드 `maskedgrid3_{ulsan,porto}_seed{seed}_b79e824`:
+    `output/past/adopted_b79e824/`. 커밋 `b79e824`의 코드로만 불러올 수 있다.
 
 ---
 
@@ -621,5 +626,5 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
 (예: `0.214 (−24%)`). 세 지표 모두 낮을수록 좋다.
 
 ADFormer 기준선은 입력 시간 창(24시간, 8시간)별로 [`ADFORMER_REFERENCE.md`](ADFORMER_REFERENCE.md)에
-있다. 비교할 때는 이 모델과 **같은 입력 창·같은 시드**의 ADFormer 값을 쓴다. ADFormer 기록은
-test 샘플 수가 다르고 MAPE 분모 정의가 없으므로, 비교는 보고 수치 간 비교로만 해석한다.
+있다. 채택 모델이 8시간 창이므로 **ADFormer 8시간 창의 같은 시드 값**과 비교한다. ADFormer
+기록은 test 샘플 수가 다르고 MAPE 분모 정의가 없으므로, 비교는 보고 수치 간 비교로만 해석한다.

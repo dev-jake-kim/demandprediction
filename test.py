@@ -72,7 +72,7 @@ def main() -> None:
     parser.add_argument('--npy_path', type=str, default=None, help='예: data/raw/ulsan_temporal_grid.npy')
     parser.add_argument('--weather_csv_path', type=str, required=True)
     parser.add_argument('--split', type=str, default='test', choices=('train', 'val', 'test'))
-    parser.add_argument('--time_step', type=int, default=24)
+    parser.add_argument('--time_step', type=int, default=None, help='기본값: 체크포인트 config의 time_step')
     parser.add_argument('--daily_period', type=int, default=24)
     parser.add_argument('--daily_lags', type=int, default=6)
     parser.add_argument('--weekly_period', type=int, default=168)
@@ -98,7 +98,7 @@ def main() -> None:
         data_path,
         args.split,
         weather_csv_path=args.weather_csv_path,
-        time_step=args.time_step,
+        time_step=args.time_step if args.time_step is not None else model.config.time_step,
         daily_period=args.daily_period,
         daily_lags=args.daily_lags,
         weekly_period=args.weekly_period,
