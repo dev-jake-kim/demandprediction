@@ -212,7 +212,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | | `weather_mean`, `weather_std` | train 구간 3채널 통계 (std ≥ 1e-6) |
 | | `node_adaptive_indices` | train 구간 평균 수요 > `node_adaptive_min_demand`인 노드 id |
 | | `retrieval_grid_path`, `retrieval_train_end` | 수요 `.npy` 절대경로, `train_end` |
-| local | `local_radius` | 2 (3×3 실험은 1) |
+| local | `local_radius` | 1 (3×3) |
 | | `d_model` | 16 / 64 |
 | | `num_fourier_bands` | 8 |
 | | `transformer_layers`, `transformer_heads`, `transformer_ffn` | 2, 4, 128 |
@@ -594,6 +594,10 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
 - `output`은 외장 디스크 `/mnt/hdd/jinsu_extention_disk/gir`을 가리키는 symlink이며
   git 추적 대상이 아니다.
 - 이전 실험 기록은 모두 `output/past/`에 있다.
+- **채택 모델**은 `output/adopted/`에 둔다: 결과 JSON은 `runs/`, 체크포인트·학습 로그·GPU 사용률
+  기록은 `checkpoints/`의 같은 이름 폴더. 현재 채택 모델은 커밋 `b79e824`,
+  `local_radius=1`(3×3, 현재 기본값), 검색 pass, 5시드(245/6835/851/5123/535)
+  `maskedgrid3_{ulsan,porto}_seed{seed}_b79e824`이다.
 
 ---
 

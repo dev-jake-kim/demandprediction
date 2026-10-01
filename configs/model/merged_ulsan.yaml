@@ -1,6 +1,6 @@
 
 # height/width/time_step/retrieval_grid_path/retrieval_train_end/weather_mean/weather_std는 train.py가 데이터에서 채운다.
-local_radius: 2
+local_radius: 1
 d_model: 16
 num_fourier_bands: 8
 transformer_layers: 2
