@@ -13,8 +13,6 @@ import torch
 from torch import Tensor, nn
 from transformers import PreTrainedModel
 
-from dataset_frame.unified_demand_dataset import NUM_WEATHER_FEATURES
-
 from .config import MergedDemandConfig
 from .losses import SCALAR_LOSS_TYPES, build_loss
 from .modules import (
@@ -24,6 +22,8 @@ from .modules import (
     NeuralRetrievalGate,
     PeriodicLSTMEncoder,
 )
+
+WEATHER_CHANNELS = 2  # 기온, 강수 + g·적설
 
 
 class MergedDemandModel(PreTrainedModel):
@@ -55,20 +55,22 @@ class MergedDemandModel(PreTrainedModel):
             raise ValueError('d_model must be divisible by transformer_heads')
         if config.weekday_dim <= 0 or config.hour_dim <= 0:
             raise ValueError('weekday_dim and hour_dim must be positive')
-        if config.weather_mean is None or config.weather_std is None:
+        missing = [
+            name for name in ('temperature_min', 'temperature_max', 'precipitation_max')
+            if getattr(config, name) is None
+        ]
+        if missing:
             raise ValueError(
-                'weather_mean/weather_std(각 3개, train split 통계)가 필요함 — '
-                '시간 리크를 막으려면 train.py가 train 구간에서만 계산해 넘겨야 한다'
+                f'날씨 정규화 통계가 없음: {missing}. train.py가 train 구간에서 계산해 넘겨야 한다'
             )
-        # 설정값은 Python 리스트에서 검사한다. ``from_pretrained``의 meta-device 초기화와 호환된다.
-        weather_mean_list = [float(value) for value in config.weather_mean]
-        weather_std_list = [float(value) for value in config.weather_std]
-        if len(weather_mean_list) != NUM_WEATHER_FEATURES:
-            raise ValueError(f'weather_mean must have {NUM_WEATHER_FEATURES} entries')
-        if len(weather_std_list) != NUM_WEATHER_FEATURES:
-            raise ValueError(f'weather_std must have {NUM_WEATHER_FEATURES} entries')
-        if any(value <= 0 for value in weather_std_list):
-            raise ValueError('weather_std must be positive (0으로 나누기 방지)')
+        # 설정값은 Python 값으로 검사한다. ``from_pretrained``의 meta-device 초기화와 호환된다.
+        self.temperature_min = float(config.temperature_min)
+        self.temperature_range = float(config.temperature_max) - self.temperature_min
+        self.precipitation_max = float(config.precipitation_max)
+        if self.temperature_range <= 0:
+            raise ValueError('temperature_max는 temperature_min보다 커야 함')
+        if self.precipitation_max <= 0:
+            raise ValueError('precipitation_max는 양수여야 함')
 
         self.height = height
         self.width = width
@@ -99,22 +101,14 @@ class MergedDemandModel(PreTrainedModel):
                 )
             node_adaptive_indices = [int(value) for value in config.node_adaptive_indices]
 
+        self.snow_scale = nn.Parameter(torch.tensor(1.0))
         self.weekday_embedding = nn.Embedding(7, config.weekday_dim)
         self.hour_embedding = nn.Embedding(24, config.hour_dim)
-        self.weather_cls_dim = (
-            NUM_WEATHER_FEATURES if self.weather_injection == 'cls_add' else 0
-        )
+        self.weather_cls_dim = WEATHER_CHANNELS if self.weather_injection == 'cls_add' else 0
         self.extra_dim = (
-            (NUM_WEATHER_FEATURES if self.weather_injection == 'concat' else 0)
+            (WEATHER_CHANNELS if self.weather_injection == 'concat' else 0)
             + config.weekday_dim
             + config.hour_dim
-        )
-
-        self.register_buffer(
-            'weather_mean', torch.tensor(weather_mean_list, dtype=torch.float32), persistent=True
-        )
-        self.register_buffer(
-            'weather_std', torch.tensor(weather_std_list, dtype=torch.float32), persistent=True
         )
 
         self.local_history = LocalHistoryEncoder(
@@ -201,16 +195,24 @@ class MergedDemandModel(PreTrainedModel):
                 param.data.zero_()
 
 
+    def _weather_features(self, weather: Tensor) -> Tensor:
+        """``[B,L,3]`` (기온, 강수, 적설) -> ``[B,L,2]`` (기온, 강수 + g·적설) 정규화."""
+
+        temperature, rainfall, snowfall = weather.unbind(dim=-1)
+        temperature_norm = (temperature - self.temperature_min) / self.temperature_range
+        precipitation_norm = (rainfall + self.snow_scale * snowfall) / self.precipitation_max
+        features = torch.stack([temperature_norm, precipitation_norm], dim=-1)
+        return features if self.use_weather else torch.zeros_like(features)
+
     def _temporal_extra(self, weather: Tensor, hour: Tensor, day_of_week: Tensor) -> Tensor:
         """한 브랜치의 시간 context를 만들고 ``[B, L, extra_dim]``을 반환한다.
 
-        날씨는 ``concat``에서만 정규화해 포함하고, 요일·시간 임베딩은 브랜치 간 공유한다.
+        날씨는 ``concat``에서만 포함하고, 요일·시간 임베딩은 브랜치 간 공유한다.
         """
 
         parts: list[Tensor] = []
         if self.weather_injection == 'concat':
-            weather_norm = (weather - self.weather_mean) / self.weather_std
-            parts.append(weather_norm if self.use_weather else torch.zeros_like(weather_norm))
+            parts.append(self._weather_features(weather))
         weekday = self.weekday_embedding(day_of_week)
         hour_vec = self.hour_embedding(hour)
         if not self.use_calendar:
@@ -245,11 +247,7 @@ class MergedDemandModel(PreTrainedModel):
         daily_extra = self._temporal_extra(daily_weather, daily_hour, daily_day_of_week)
         weekly_extra = self._temporal_extra(weekly_weather, weekly_hour, weekly_day_of_week)
 
-        weather_cls = None
-        if self.weather_cls_dim:
-            weather_cls = (weather - self.weather_mean) / self.weather_std
-            if not self.use_weather:
-                weather_cls = torch.zeros_like(weather_cls)
+        weather_cls = self._weather_features(weather) if self.weather_cls_dim else None
         h_neural = self.local_history(demand_history, recent_extra, weather_cls)
         # Ablation은 브랜치 출력을 0으로 바꾸되 valid mask와 모듈 shape은 유지한다.
         h_daily, daily_valid = self.daily_branch(daily_demand, daily_mask, daily_extra)

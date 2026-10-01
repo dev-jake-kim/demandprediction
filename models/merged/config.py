@@ -6,8 +6,8 @@ from transformers import PretrainedConfig
 class MergedDemandConfig(PretrainedConfig):
     """Configuration for the merged demand forecasting model.
 
-    Data-derived values such as grid dimensions, weather statistics, and retrieval bounds
-    are supplied by the training pipeline; the remaining fields are model settings.
+    Data-derived values such as grid dimensions, train-split weather extremes, and retrieval
+    bounds are supplied by the training pipeline; the remaining fields are model settings.
     """
 
     model_type = 'merged_demand'
@@ -34,8 +34,9 @@ class MergedDemandConfig(PretrainedConfig):
         retrieval_chunk_size: int = 256,
         retrieval_scope: str = 'observed_past',
         retrieval_train_end: int | None = None,
-        weather_mean: list[float] | None = None,
-        weather_std: list[float] | None = None,
+        temperature_min: float | None = None,
+        temperature_max: float | None = None,
+        precipitation_max: float | None = None,
         weekday_dim: int = 7,
         hour_dim: int = 5,
         use_daily: bool = True,
@@ -78,8 +79,10 @@ class MergedDemandConfig(PretrainedConfig):
         self.retrieval_chunk_size = retrieval_chunk_size
         self.retrieval_scope = retrieval_scope
         self.retrieval_train_end = retrieval_train_end
-        self.weather_mean = weather_mean
-        self.weather_std = weather_std
+        # train 구간 통계. precipitation_max는 snow_scale=1 기준으로 고정한다.
+        self.temperature_min = temperature_min
+        self.temperature_max = temperature_max
+        self.precipitation_max = precipitation_max
         self.weekday_dim = weekday_dim
         self.hour_dim = hour_dim
         self.use_daily = use_daily

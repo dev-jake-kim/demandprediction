@@ -40,8 +40,8 @@ flowchart TD
     end
 
     subgraph CE["시점별 보조 context"]
-        C1["날씨 정규화 3<br/>+ 요일 임베딩 7<br/>+ 시간 임베딩 5"]
-        C2["context [B,L,15]"]
+        C1["날씨 2 (기온, 강수 + g·적설)<br/>+ 요일 임베딩 7<br/>+ 시간 임베딩 5"]
+        C2["context [B,L,14]"]
         C1 --> C2
     end
 
@@ -54,7 +54,7 @@ flowchart TD
         L2["층마다: [층별 sink, 노드 N개]<br/>[B·k, 1+N, D]"]
         L3["masked Transformer 층<br/>노드는 sink + 자기 창만 봄<br/>+ 방향별·head별 bias"]
         L4["sink 출력 버림<br/>노드 출력만 다음 층으로"]
-        L5["최종 노드 출력 [B,N,k,D]<br/>+ 최근 context 15"]
+        L5["최종 노드 출력 [B,N,k,D]<br/>+ 최근 context 14"]
         L6["공유 history LSTM"]
         L7["적응 노드만 W + ΔW LSTM<br/>stage 2에서 ΔW 학습"]
         HN["h_neural [B,N,history_hidden]"]
@@ -209,7 +209,8 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | 그룹 | 필드 | 현재 값 (Ulsan / Porto) |
 |---|---|---|
 | 데이터 파생 | `height`, `width`, `time_step` | 14×12 / 10×20, 24 |
-| | `weather_mean`, `weather_std` | train 구간 3채널 통계 (std ≥ 1e-6) |
+| | `temperature_min`, `temperature_max` | train 구간 기온 최솟값·최댓값 |
+| | `precipitation_max` | train 구간 `강수 + 1·적설`의 최댓값 (> 0) |
 | | `node_adaptive_indices` | train 구간 평균 수요 > `node_adaptive_min_demand`인 노드 id |
 | | `retrieval_grid_path`, `retrieval_train_end` | 수요 `.npy` 절대경로, `train_end` |
 | local | `local_radius` | 1 (3×3) |
@@ -305,11 +306,12 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
 
 - 생성 시 검증: `height,width,time_step>0`, `local_radius≥0`, 검색 반지름 ≥0,
   `fusion_dim,retrieval_k,retrieval_chunk_size>0`, `d_model % transformer_heads == 0`,
-  `weekday_dim,hour_dim>0`, `weather_mean/std`가 3개씩 있고 std>0,
+  `weekday_dim,hour_dim>0`, `temperature_min/max`·`precipitation_max`가 있고
+  `temperature_max > temperature_min`, `precipitation_max > 0`,
   `weather_injection ∈ {concat, cls_add}`, `node_adaptive=true`면
   `node_adaptive_indices` 필수. 값 검사는 파이썬 리스트에서 한다(`from_pretrained`의
   meta device 초기화와 호환).
-- 버퍼 `weather_mean`, `weather_std`, `local_history.neighbor_direction`은 persistent로
+- 버퍼 `local_history.neighbor_direction`은 persistent로
   체크포인트에 저장된다. 검색 CPU cache는 저장하지 않는다.
 - 손실 집계: 요소별 손실(`combined`, `mae`, `demand_split`)은 전체 원소 평균을 `loss`로,
   합을 `loss_sum`으로 낸다. `rmse_mape`는 손실 객체가 스칼라를 직접 반환한다.
@@ -326,15 +328,21 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
 
 `(weather [B,L,3], hour [B,L], day_of_week [B,L]) → extra [B,L,E]`
 
-- `concat`: `E = 3 + weekday_dim + hour_dim = 15` =
-  `(weather − weather_mean)/weather_std ⊕ weekday_emb ⊕ hour_emb`.
-- `cls_add`: `E = weekday_dim + hour_dim = 12`. 정규화 날씨는 별도로
+- 날씨 2채널 (`[B,L,2]`):
+  - `temperature_norm = (기온 − temperature_min) / (temperature_max − temperature_min)`
+  - `precipitation_norm = (강수 + g·적설) / precipitation_max`
+  - `g`(`snow_scale`)는 1로 초기화되는 학습 스칼라다. `precipitation_max`는 `g=1` 기준
+    train 최댓값으로 고정한다(g가 학습 중 바뀌므로 다시 재지 않는다).
+  - clip하지 않으므로 val·test에서 train 범위를 벗어난 값은 [0,1] 밖일 수 있다.
+- `concat`: `E = 2 + weekday_dim + hour_dim = 14` = 날씨 2 ⊕ 요일 임베딩 ⊕ 시간 임베딩.
+  최근 이력·daily·weekly context 모두 같은 방식이다.
+- `cls_add`: `E = weekday_dim + hour_dim = 12`. 날씨 2채널은 별도로
   `LocalHistoryEncoder`의 노드 토큰에 더해지며 주기 브랜치에는 날씨가 들어가지 않는다.
 - 요일·시간 임베딩 테이블(`nn.Embedding(7,·)`, `nn.Embedding(24,·)`)은 세 브랜치가 공유한다.
 
 ### 6.2 `LocalHistoryEncoder`
 
-`forward(demands [B,k,H,W], extra [B,k,E], weather_cls [B,k,3]|None) → h_neural [B,N,history_hidden]`
+`forward(demands [B,k,H,W], extra [B,k,E], weather_cls [B,k,2]|None) → h_neural [B,N,history_hidden]`
 
 시점마다 격자 전체를 한 시퀀스로 인코딩한다. 노드 토큰은 시점당 한 번만 만들고, 이웃 창은
 attention mask로 표현한다.
@@ -343,7 +351,7 @@ attention mask로 표현한다.
 <summary>세부</summary>
 
 1. 노드 토큰: `log1p(max(x,0))` → `FourierScalarEmbedding` → `+ node_embedding[n]`
-   → `[B·k, N, D]` (`cls_add`면 `Linear(3→D)(정규화 날씨)`를 모든 노드 토큰에 더함).
+   → `[B·k, N, D]` (`cls_add`면 `Linear(2→D)(날씨 2채널)`을 모든 노드 토큰에 더함).
    `FourierScalarEmbedding(v) = Linear([v, sin(2π·v·f), cos(2π·v·f)])`,
    `f = exp(log_frequencies)`, `log_frequencies`는 `linspace(-2,2,num_bands)`로 초기화되는
    학습 파라미터.
@@ -537,7 +545,7 @@ python train.py --config-name config_<city> "description='실험 설명'" \
 - **`limit_samples`**: 각 split 앞쪽 N개만 쓰는 스모크용.
 - **결과 JSON**: `run_json`이 있으면 그 경로, 없으면
   `output/<project_name>/runs/<city>_<loss_type>_<ablation>[_nodeadaptive]_seed<seed>.json`.
-  데이터 경로, 날씨 통계, 장치, 목적함수·stage 손실, ablation 라벨과 스위치 값, seed,
+  데이터 경로, 날씨 정규화 통계(`weather_stats`), 장치, 목적함수·stage 손실, ablation 라벨과 스위치 값, seed,
   적응 노드 정보, stage별 기록, 최적 epoch·검증 손실, 체크포인트 경로, test 지표
   (`loss`, `mae`, `rmse`, `mape_plus1`, `mape_excl_zero`), epoch별 history를 담는다.
 
@@ -597,7 +605,8 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
 - **채택 모델**은 `output/adopted/`에 둔다: 결과 JSON은 `runs/`, 체크포인트·학습 로그·GPU 사용률
   기록은 `checkpoints/`의 같은 이름 폴더. 현재 채택 모델은 커밋 `b79e824`,
   `local_radius=1`(3×3, 현재 기본값), 검색 pass, 5시드(245/6835/851/5123/535)
-  `maskedgrid3_{ulsan,porto}_seed{seed}_b79e824`이다.
+  `maskedgrid3_{ulsan,porto}_seed{seed}_b79e824`이다. 이후 날씨 입력을 2채널(강수 + g·적설)로
+  바꿨으므로 이 체크포인트는 커밋 `b79e824`의 코드로만 불러올 수 있다.
 
 ---
 

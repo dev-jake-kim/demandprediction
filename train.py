@@ -318,11 +318,14 @@ def main(cfg: DictConfig) -> None:
     logger.info(f'[Commit] {git_commit()}')
     data_path, dataset_kwargs, train_ds, val_ds, test_ds = build_datasets(cfg)
 
-    # train 구간에서 날씨 통계를 계산하고 분산 0인 피처의 표준편차를 제한한다.
+    # train 구간 날씨 극값으로 min-max 정규화한다. 강수 최댓값은 snow_scale=1 기준으로 고정한다.
     train_weather = train_ds.weather[train_ds.time_step : train_ds.train_end]
-    weather_mean = train_weather.mean(axis=0)
-    weather_std = train_weather.std(axis=0).clip(min=1e-6)
-    logger.info(f'weather_mean={weather_mean.tolist()}, weather_std={weather_std.tolist()}')
+    weather_stats = {
+        'temperature_min': float(train_weather[:, 0].min()),
+        'temperature_max': float(train_weather[:, 0].max()),
+        'precipitation_max': float((train_weather[:, 1] + train_weather[:, 2]).max()),
+    }
+    logger.info(f'weather_stats={weather_stats}')
 
     limit = cfg.get('limit_samples')
     train_set, val_set, eval_test_set = train_ds, val_ds, test_ds
@@ -355,8 +358,7 @@ def main(cfg: DictConfig) -> None:
         time_step=train_ds.time_step,
         retrieval_grid_path=str(data_path),
         retrieval_train_end=train_ds.train_end,
-        weather_mean=weather_mean.tolist(),
-        weather_std=weather_std.tolist(),
+        **weather_stats,
         node_adaptive_indices=node_adaptive_indices,
         **model_kwargs,
     )
@@ -558,8 +560,7 @@ def main(cfg: DictConfig) -> None:
         'dataset': cfg.dataset.city,
         'data_path': str(data_path),
         'weather_path': str(dataset_kwargs['weather_csv_path']),
-        'weather_mean': weather_mean.tolist(),
-        'weather_std': weather_std.tolist(),
+        'weather_stats': weather_stats,
         'device': str(trainer.args.device),
         'retrieval_scope': cfg.model.retrieval_scope,
         # stage별 목적함수를 별도로 기록한다.

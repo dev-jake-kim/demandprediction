@@ -44,8 +44,11 @@ def _check_dataset(city: str, device: torch.device) -> dict:
     val_set = UnifiedDemandDataset(path, 'val', **kwargs)
     test_set = UnifiedDemandDataset(path, 'test', **kwargs)
     train_weather = train_set.weather[train_set.time_step : train_set.train_end]
-    weather_mean = train_weather.mean(axis=0)
-    weather_std = train_weather.std(axis=0).clip(min=1e-6)
+    weather_stats = {
+        'temperature_min': float(train_weather[:, 0].min()),
+        'temperature_max': float(train_weather[:, 0].max()),
+        'precipitation_max': float((train_weather[:, 1] + train_weather[:, 2]).max()),
+    }
     node_adaptive_indices = (
         select_node_adaptive_indices(train_set, float(cfg.model.node_adaptive_min_demand))
         if cfg.model.node_adaptive else None
@@ -63,8 +66,7 @@ def _check_dataset(city: str, device: torch.device) -> dict:
         time_step=train_set.time_step,
         retrieval_grid_path=str(path),
         retrieval_train_end=train_set.train_end,
-        weather_mean=weather_mean.tolist(),
-        weather_std=weather_std.tolist(),
+        **weather_stats,
         node_adaptive_indices=node_adaptive_indices,
         **OmegaConf.to_container(cfg.model, resolve=True),
     )
@@ -315,7 +317,7 @@ def _check_independent_retrieval_radius() -> dict:
                 height=3, width=3, time_step=2, local_radius=1, retrieval_local_radius=radius,
                 d_model=8, transformer_heads=2, transformer_layers=1,
                 retrieval_grid_path=str(path), retrieval_k=2,
-                weather_mean=[0.0] * 3, weather_std=[1.0] * 3,
+                temperature_min=-5.0, temperature_max=30.0, precipitation_max=20.0,
             )
             model = MergedDemandModel(config).eval()
             with torch.no_grad():
@@ -345,7 +347,7 @@ def _check_retrieval_pass() -> dict:
             height=3, width=3, time_step=2, local_radius=1, use_retrieval=False,
             d_model=8, transformer_heads=2, transformer_layers=1,
             retrieval_grid_path=str(grid_path),
-            weather_mean=[0.0] * 3, weather_std=[1.0] * 3,
+            temperature_min=-5.0, temperature_max=30.0, precipitation_max=20.0,
         )
         model = MergedDemandModel(config).eval()
         if model.retrieval is not None:
