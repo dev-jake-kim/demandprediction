@@ -30,9 +30,9 @@ def demand_bucket_bounds(value_cap: int) -> list[int]:
 
 
 class CausalRetrieval(nn.Module):
-    """노드별 3×3(반경 r) raw 창으로 비슷한 과거 시점 top-k를 찾아 그 유사도와 창 수요를 돌려준다.
+    """노드별 3×3(반경 r) raw 창으로 비슷한 과거 시점 top-k를 찾아 그 유사도와 label을 돌려준다.
 
-    - Q(t) = K(t) = 창 수요 ``[t-k, t)`` (``[k·P]``로 펴 L2 정규화), V(τ) = 창 수요 ``τ`` (``[P]``).
+    - Q(t) = K(t) = 창 수요 ``[t-k, t)`` (``[k·P]``로 펴 L2 정규화), V(τ) = 노드 자신의 수요 ``τ``.
     - 후보 τ (모두 ``τ ≥ k``):
       - train 모드: ``τ < train_end`` 이고 ``τ ∉ [t, t + future_mask_hours]``
       - eval 모드: ``τ < t``
@@ -208,8 +208,8 @@ class CausalRetrieval(nn.Module):
         return cached
 
     def forward(self, sample_idx: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """``[B]`` 절대 예측 시점 -> ``(scores [B,N,K], values [B,N,K,P], query_measure [B,N])``.
-        모드는 ``self.training``.
+        """``[B]`` 절대 예측 시점 -> ``(scores [B,N,K], values [B,N,K], query_measure [B,N])``.
+        모드는 ``self.training``. ``values``는 후보 τ에서 예측 대상 노드 자신의 수요(label)다.
 
         허용 후보가 없는 칸은 score가 ``-inf``다(values는 의미 없음).
         """
@@ -220,38 +220,54 @@ class CausalRetrieval(nn.Module):
         if table is None:
             return (
                 torch.full((batch, self.num_nodes, 1), float('-inf'), device=device),
-                torch.zeros(batch, self.num_nodes, 1, self.num_neighbors, device=device),
+                torch.zeros(batch, self.num_nodes, 1, device=device),
                 torch.zeros(batch, self.num_nodes, device=device),
             )
         scores, times = table
         index = sample_idx.long()
         picked_times = times[index]  # [B, N, K]
         node_index = torch.arange(self.num_nodes, device=device).view(1, -1, 1)
-        values = self.crops(device)[picked_times, node_index]  # [B, N, K, P]
+        # 창은 행 우선이므로 가운데 칸(P // 2)이 노드 자신이다.
+        values = self.crops(device)[picked_times, node_index, self.num_neighbors // 2]  # [B, N, K]
         return scores[index], values, self.query_measures(device)[index]
 
 
-class RetrievalFusion(nn.Module):
-    """검색 후보마다 ``sigmoid(a·s + b) · Embedding(bucket(v))``를 만들어 후보 합 ``C``를 구하고,
-    질의 크기 ``m``으로 학습 벡터 ``O``와 섞은 ``(1 − w)·C + w·O`` (``w = e^{−m/τ}``)를
-    ``h_neural``과 concat해 ``Linear``로 ``history_hidden``에 맞춘다.
+FUSION_MODES = ('average', 'embedding')
 
-    ``v``는 후보 τ의 3×3 창 수요 ``P``개이며 칸별로 embedding을 따로 합한 뒤 ``[P·E]``로 편다.
-    질의가 전부 0이면(m=0) 유사도가 모두 0이라 top-k가 무의미하므로 결과는 ``O``가 된다.
-    ``learn_tau``면 τ를 ``log τ`` 파라미터로 학습한다.
+
+class RetrievalFusion(nn.Module):
+    """검색 후보 (유사도 s, label v)를 노드 벡터로 만들어 ``h_neural``과 concat하고 ``Linear``로
+    ``history_hidden``에 맞춘다.
+
+    - ``average``: ``softmax(s)``로 v를 가중평균하고 ``Linear(1 → H)(log1p(·))``로 편다.
+    - ``embedding``: 후보 합 ``C = Σ sigmoid(a·s + b) · Embedding(bucket(v))`` (E차원).
+      ``use_fallback``이면 질의 크기 m으로 학습 벡터 O와 ``(1 − w)·C + w·O`` (``w = e^{−m/τ}``)로
+      섞는다. 질의가 전부 0이면(m=0) 유사도가 모두 0이라 top-k가 무의미하므로 결과는 O가 된다.
+      ``learn_tau``면 τ를 ``log τ`` 파라미터로 학습한다.
     """
 
     def __init__(
         self,
-        num_neighbors: int,
         history_hidden: int,
-        embedding_dim: int,
-        value_cap: int,
         *,
+        mode: str = 'embedding',
+        embedding_dim: int = 16,
+        value_cap: int | None = None,
+        use_fallback: bool = True,
         fallback_tau: float = 1.0,
         learn_tau: bool = False,
     ) -> None:
         super().__init__()
+        if mode not in FUSION_MODES:
+            raise ValueError(f'retrieval_fusion은 {FUSION_MODES} 중 하나 (받음: {mode!r})')
+        self.mode = mode
+        self.use_fallback = use_fallback and mode == 'embedding'
+        if mode == 'average':
+            self.value_projection = nn.Linear(1, history_hidden)
+            self.fuse = nn.Linear(2 * history_hidden, history_hidden)
+            return
+        if value_cap is None:
+            raise ValueError('embedding 융합에는 retrieval_value_cap이 필요함')
         if fallback_tau <= 0:
             raise ValueError(f'retrieval_fallback_tau는 양수여야 함 (받음: {fallback_tau})')
         bounds = demand_bucket_bounds(value_cap)
@@ -260,13 +276,14 @@ class RetrievalFusion(nn.Module):
         self.value_embedding = nn.Embedding(len(bounds), embedding_dim)
         self.score_scale = nn.Parameter(torch.tensor(1.0))
         self.score_bias = nn.Parameter(torch.tensor(0.0))
-        # O: 질의 수요가 적을수록 검색 결과 대신 쓰는 학습 벡터. 0에서 시작한다.
-        self.fallback_embedding = nn.Parameter(torch.zeros(num_neighbors * embedding_dim))
-        self.fallback_log_tau = (
-            nn.Parameter(torch.tensor(math.log(fallback_tau))) if learn_tau else None
-        )
-        self.fallback_tau = float(fallback_tau)
-        self.fuse = nn.Linear(history_hidden + num_neighbors * embedding_dim, history_hidden)
+        if self.use_fallback:
+            # O: 질의 수요가 적을수록 검색 결과 대신 쓰는 학습 벡터. 0에서 시작한다.
+            self.fallback_embedding = nn.Parameter(torch.zeros(embedding_dim))
+            self.fallback_log_tau = (
+                nn.Parameter(torch.tensor(math.log(fallback_tau))) if learn_tau else None
+            )
+            self.fallback_tau = float(fallback_tau)
+        self.fuse = nn.Linear(history_hidden + embedding_dim, history_hidden)
 
     def fallback_weight(self, query_measure: Tensor) -> Tensor:
         """``w = e^{−m/τ}``."""
@@ -280,13 +297,20 @@ class RetrievalFusion(nn.Module):
 
     def forward(self, h_neural: Tensor, scores: Tensor, values: Tensor, query_measure: Tensor) -> Tensor:
         valid = torch.isfinite(scores)
+        if self.mode == 'average':
+            # 허용 후보가 하나도 없으면 softmax가 NaN -> 0 (검색 결과 0).
+            weights = torch.softmax(scores, dim=-1).nan_to_num(0.0)
+            averaged = (weights * values.masked_fill(~valid, 0.0)).sum(dim=-1, keepdim=True)
+            r_emb = self.value_projection(torch.log1p(averaged.to(h_neural.dtype)))
+            return self.fuse(torch.cat([h_neural, r_emb], dim=-1))
         gate = torch.sigmoid(self.score_scale * scores.masked_fill(~valid, 0.0) + self.score_bias)
         gate = (gate * valid).to(h_neural.dtype)  # [B, N, K]
-        embedded = self.value_embedding(self.bucketize(values))  # [B, N, K, P, E]
-        retrieved = (gate[..., None, None] * embedded).sum(dim=2).flatten(2)  # C [B, N, P·E]
-        weight = self.fallback_weight(query_measure.to(h_neural.dtype)).unsqueeze(-1)
-        blended = (1.0 - weight) * retrieved + weight * self.fallback_embedding
-        return self.fuse(torch.cat([h_neural, blended], dim=-1))
+        embedded = self.value_embedding(self.bucketize(values))  # [B, N, K, E]
+        retrieved = (gate.unsqueeze(-1) * embedded).sum(dim=2)  # C [B, N, E]
+        if self.use_fallback:
+            weight = self.fallback_weight(query_measure.to(h_neural.dtype)).unsqueeze(-1)
+            retrieved = (1.0 - weight) * retrieved + weight * self.fallback_embedding
+        return self.fuse(torch.cat([h_neural, retrieved], dim=-1))
 
 
-__all__ = ['CausalRetrieval', 'RetrievalFusion', 'demand_bucket_bounds']
+__all__ = ['FUSION_MODES', 'CausalRetrieval', 'RetrievalFusion', 'demand_bucket_bounds']

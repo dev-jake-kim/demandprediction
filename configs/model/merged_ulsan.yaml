@@ -16,7 +16,10 @@ retrieval_k: 20
 retrieval_chunk_size: 256
 # 학습(train 모드)에서 [t, t+72h] 후보를 가린다. 평가(eval 모드)는 t 이전만 후보다.
 retrieval_future_mask_hours: 72
-# 검색 결과 C와 학습 벡터 O 혼합: (1-w)C + wO, w = e^(-m/τ). m은 mean | nonzero_count.
+# 검색 결과 융합: average(softmax(s) 가중평균 label) | embedding(gate·bucket embedding 합).
+retrieval_fusion: embedding
+# embedding에서 검색 결과 C와 학습 벡터 O 혼합: (1-w)C + wO, w = e^(-m/τ). m은 mean | nonzero_count.
+retrieval_use_fallback: true
 retrieval_query_measure: mean
 retrieval_fallback_tau: 1.0
 retrieval_fallback_learn_tau: false

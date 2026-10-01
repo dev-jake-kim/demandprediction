@@ -154,17 +154,20 @@ class MergedDemandModel(PreTrainedModel):
             )
             if self.use_retrieval else None
         )
-        if self.use_retrieval and config.retrieval_value_cap is None:
+        if self.use_retrieval and config.retrieval_fusion == 'embedding' and config.retrieval_value_cap is None:
             raise ValueError(
-                'use_retrieval=True면 retrieval_value_cap이 필요함 - train.py가 train 구간 상위 0.5% '
-                '수요 경계를 계산해 넘겨야 한다'
+                'embedding 검색 융합에는 retrieval_value_cap이 필요함 - train.py가 train 구간 상위 '
+                '0.5% 수요 경계를 계산해 넘겨야 한다'
             )
         self.retrieval_fusion = (
             RetrievalFusion(
-                (2 * retrieval_radius + 1) ** 2,
                 config.history_hidden,
-                config.retrieval_embedding_dim,
-                int(config.retrieval_value_cap),
+                mode=config.retrieval_fusion,
+                embedding_dim=config.retrieval_embedding_dim,
+                value_cap=(
+                    None if config.retrieval_value_cap is None else int(config.retrieval_value_cap)
+                ),
+                use_fallback=bool(config.retrieval_use_fallback),
                 fallback_tau=float(config.retrieval_fallback_tau),
                 learn_tau=bool(config.retrieval_fallback_learn_tau),
             )

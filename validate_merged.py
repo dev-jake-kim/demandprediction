@@ -412,12 +412,19 @@ def _check_independent_retrieval_radius() -> dict:
             daily_weather=weather, daily_hour=time, daily_day_of_week=time,
             weekly_weather=weather, weekly_hour=time, weekly_day_of_week=time,
         )
-        # 반경 1은 m=평균·고정 τ, 반경 2는 m=0 아닌 칸 수·학습 τ로 검사한다.
-        for radius, measure, learn_tau in ((1, 'mean', False), (2, 'nonzero_count', True)):
+        # (반경, m 정의, τ 학습, 융합 모드, O 혼합): embedding 세 가지와 average 하나를 검사한다.
+        variants = (
+            (1, 'mean', False, 'embedding', True),
+            (2, 'nonzero_count', True, 'embedding', True),
+            (1, 'mean', False, 'embedding', False),
+            (1, 'mean', False, 'average', False),
+        )
+        for case, (radius, measure, learn_tau, fusion_mode, use_fallback) in enumerate(variants):
             config = MergedDemandConfig(
                 height=3, width=3, time_step=2, local_radius=1, retrieval_local_radius=radius,
                 d_model=8, transformer_heads=2, transformer_layers=1,
                 retrieval_grid_path=str(path), retrieval_k=2, retrieval_train_end=10, retrieval_value_cap=7,
+                retrieval_fusion=fusion_mode, retrieval_use_fallback=use_fallback,
                 retrieval_query_measure=measure, retrieval_fallback_tau=0.5,
                 retrieval_fallback_learn_tau=learn_tau,
                 temperature_min=-5.0, temperature_max=30.0, precipitation_max=20.0,
@@ -428,10 +435,16 @@ def _check_independent_retrieval_radius() -> dict:
             scores, values, _ = model.retrieval(sample_idx)
             if model.local_history.num_neighbors != 9:
                 raise AssertionError('Transformer window is not 3×3')
-            if tuple(output['retrieval_values'].shape) != (1, 9, 2, (2 * radius + 1) ** 2):
-                raise AssertionError(f'Retrieval values do not use radius {radius}')
+            if tuple(output['retrieval_values'].shape) != (1, 9, 2):
+                raise AssertionError('retrieval values must be one label per candidate')
             if not (torch.equal(output['retrieval_scores'], scores) and torch.equal(output['retrieval_values'], values)):
                 raise AssertionError('eval forward did not use the eval-mode table')
+            # V는 후보 τ에서 노드 자신의 수요다(이웃 칸 아님).
+            _, times = model.retrieval.table(False, torch.device('cpu'))
+            flat_grid = torch.from_numpy(grid.reshape(len(grid), -1))
+            expected_values = flat_grid[times[7], torch.arange(9).view(-1, 1)]
+            if not torch.equal(values[0], expected_values):
+                raise AssertionError('retrieval label is not the target node demand at tau')
             # m은 입력 demand_history의 [t-k, t) × 반경 r 창(격자 밖 0)에서 계산한 값과 같아야 한다.
             window = 2 * radius + 1
             source = history if measure == 'mean' else (history > 0).float()
@@ -442,16 +455,20 @@ def _check_independent_retrieval_radius() -> dict:
             model.train()
             model._compute(**inputs)['logits'].sum().backward()
             fusion = model.retrieval_fusion
-            for name, param in (
-                ('embedding', fusion.value_embedding.weight),
-                ('score_scale', fusion.score_scale),
-                ('fallback_embedding', fusion.fallback_embedding),
-                *((('fallback_log_tau', fusion.fallback_log_tau),) if learn_tau else ()),
-            ):
+            if fusion_mode == 'average':
+                checked = (('value_projection', fusion.value_projection.weight),)
+            else:
+                checked = (
+                    ('embedding', fusion.value_embedding.weight),
+                    ('score_scale', fusion.score_scale),
+                    *((('fallback_embedding', fusion.fallback_embedding),) if use_fallback else ()),
+                    *((('fallback_log_tau', fusion.fallback_log_tau),) if learn_tau else ()),
+                )
+            for name, param in checked:
                 if param.grad is None or not bool(param.grad.abs().sum() > 0):
                     raise AssertionError(f'retrieval fusion {name} receives no gradient')
             # 검색 켬 체크포인트 복원(bucket 경계 포함)이 같은 예측을 내는지 확인한다.
-            checkpoint = Path(temp_dir) / f'checkpoint_r{radius}'
+            checkpoint = Path(temp_dir) / f'checkpoint_{case}'
             model.save_pretrained(checkpoint)
             restored = MergedDemandModel.from_pretrained(checkpoint).eval()
             model.eval()
@@ -460,7 +477,7 @@ def _check_independent_retrieval_radius() -> dict:
                     raise AssertionError('retrieval checkpoint round trip changed predictions')
     return {
         'transformer_neighbors': 9, 'retrieval_neighbors_checked': [9, 25], 'fusion_gradient': True,
-        'retrieval_checkpoint_roundtrip': True,
+        'retrieval_label_is_target_node': True, 'retrieval_checkpoint_roundtrip': ['embedding', 'average'],
     }
 
 
@@ -509,22 +526,22 @@ def _check_retrieval_pass() -> dict:
 
 
 def _check_retrieval_fusion() -> dict:
-    """수요 bucket 경계, bucket 배정, 후보 없는 칸이 융합 결과에 영향을 주지 않는지 확인한다."""
+    """수요 bucket 경계·배정, 후보 없는 칸 무시, O 대체, average 융합 식을 확인한다."""
 
     if demand_bucket_bounds(7) != [0, 1, 2, 3, 4, 5, 7]:
         raise AssertionError(f'bucket bounds for cap 7: {demand_bucket_bounds(7)}')
     if demand_bucket_bounds(30) != [0, 1, 2, 3, 4, 5, 7, 10, 14, 19, 25, 30]:
         raise AssertionError(f'bucket bounds for cap 30: {demand_bucket_bounds(30)}')
     torch.manual_seed(0)
-    fusion = RetrievalFusion(num_neighbors=2, history_hidden=4, embedding_dim=3, value_cap=7)
+    fusion = RetrievalFusion(4, mode='embedding', embedding_dim=3, value_cap=7)
     buckets = fusion.bucketize(torch.tensor([0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 100.0])).tolist()
     if buckets != [0, 1, 4, 5, 5, 6, 6]:
         raise AssertionError(f'bucket assignment wrong: {buckets}')
     h_neural = torch.randn(1, 1, 4)
     scores = torch.tensor([[[0.9, float('-inf')]]])
-    values = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
+    values = torch.tensor([[[1.0, 3.0]]])
     other = values.clone()
-    other[..., 1, :] = 100.0
+    other[..., 1] = 100.0
     busy = torch.tensor([[2.0]])
     if not torch.equal(fusion(h_neural, scores, values, busy), fusion(h_neural, scores, other, busy)):
         raise AssertionError('candidate slot without a valid neighbor changed the fusion output')
@@ -533,15 +550,29 @@ def _check_retrieval_fusion() -> dict:
         fusion.fallback_embedding.normal_()
     idle = torch.zeros(1, 1)
     expected = fusion.fuse(torch.cat([h_neural, fusion.fallback_embedding.expand(1, 1, -1)], dim=-1))
-    other[..., 0, :] = 5.0
+    other[..., 0] = 5.0
     if not (
         torch.allclose(fusion(h_neural, scores, values, idle), expected)
         and torch.equal(fusion(h_neural, scores, values, idle), fusion(h_neural, scores, other, idle))
     ):
         raise AssertionError('zero query did not fall back to O')
+
+    # average: softmax(s)로 유효 후보 label을 가중평균하고, 후보가 없으면 0이다.
+    average = RetrievalFusion(4, mode='average')
+    pair_scores = torch.tensor([[[0.9, 0.5, float('-inf')]]])
+    pair_values = torch.tensor([[[2.0, 4.0, 50.0]]])
+    weights = torch.softmax(torch.tensor([0.9, 0.5]), dim=0)
+    mean_label = (weights * torch.tensor([2.0, 4.0])).sum().view(1, 1, 1)
+    expected = average.fuse(torch.cat([h_neural, average.value_projection(torch.log1p(mean_label))], dim=-1))
+    if not torch.allclose(average(h_neural, pair_scores, pair_values, busy), expected, atol=1e-6):
+        raise AssertionError('average fusion does not match softmax-weighted label mean')
+    empty = torch.full((1, 1, 3), float('-inf'))
+    expected = average.fuse(torch.cat([h_neural, average.value_projection(torch.zeros(1, 1, 1))], dim=-1))
+    if not torch.allclose(average(h_neural, empty, pair_values, busy), expected, atol=1e-6):
+        raise AssertionError('average fusion without candidates is not zero retrieval')
     return {
         'retrieval_buckets_cap7': demand_bucket_bounds(7), 'invalid_slot_ignored': True,
-        'zero_query_uses_O': True,
+        'zero_query_uses_O': True, 'average_fusion_formula': True,
     }
 
 

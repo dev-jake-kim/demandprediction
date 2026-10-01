@@ -36,6 +36,8 @@ class MergedDemandConfig(PretrainedConfig):
         retrieval_future_mask_hours: int = 72,
         retrieval_value_cap: int | None = None,
         retrieval_embedding_dim: int = 16,
+        retrieval_fusion: str = 'embedding',
+        retrieval_use_fallback: bool = True,
         retrieval_query_measure: str = 'mean',
         retrieval_fallback_tau: float = 1.0,
         retrieval_fallback_learn_tau: bool = False,
@@ -88,6 +90,10 @@ class MergedDemandConfig(PretrainedConfig):
         # train 구간 상위 0.5% 수요 경계(train.py가 주입). 이 값 이상은 한 embedding bucket이다.
         self.retrieval_value_cap = retrieval_value_cap
         self.retrieval_embedding_dim = retrieval_embedding_dim
+        # 검색 결과 융합: 'average'(softmax(s) 가중평균 label) | 'embedding'(gate·bucket embedding 합).
+        # retrieval_use_fallback은 embedding에서 O 혼합을 쓸지 정한다.
+        self.retrieval_fusion = retrieval_fusion
+        self.retrieval_use_fallback = retrieval_use_fallback
         # O 혼합 가중치 w = e^{−m/τ}. m: 'mean'(질의 평균) | 'nonzero_count'(질의의 0 아닌 칸 수).
         # learn_tau면 τ는 이 값에서 시작해 학습한다.
         self.retrieval_query_measure = retrieval_query_measure
