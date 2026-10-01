@@ -15,8 +15,8 @@ dropout: 0.10
 attention_dropout: 0.0
 retrieval_k: 20
 retrieval_chunk_size: 256
-# observed_past는 target_time 이전 관측값만 후보로 삼는다.
-retrieval_scope: observed_past
+# 학습(train 모드)에서 [t, t+72h] 후보를 가린다. 평가(eval 모드)는 t 이전만 후보다.
+retrieval_future_mask_hours: 72
 # 날씨 특성은 임베딩 없이 3개 채널로 주입한다.
 weekday_dim: 7
 hour_dim: 5

@@ -19,8 +19,9 @@ from .modules import (
     BranchAttention,
     CausalRetrieval,
     LocalHistoryEncoder,
-    NeuralRetrievalGate,
     PeriodicLSTMEncoder,
+    PredictionHead,
+    RetrievalFusion,
 )
 
 WEATHER_CHANNELS = 2  # 기온, 강수 + g·적설
@@ -147,12 +148,17 @@ class MergedDemandModel(PreTrainedModel):
                 retrieval_grid_path=config.retrieval_grid_path,
                 retrieval_k=config.retrieval_k,
                 retrieval_chunk_size=config.retrieval_chunk_size,
-                retrieval_scope=config.retrieval_scope,
                 retrieval_train_end=config.retrieval_train_end,
+                future_mask_hours=config.retrieval_future_mask_hours,
             )
             if self.use_retrieval else None
         )
-        self.output_gate = NeuralRetrievalGate(config.fusion_dim, use_softplus=self.use_softplus)
+        self.retrieval_fusion = (
+            RetrievalFusion((2 * retrieval_radius + 1) ** 2, config.history_hidden)
+            if self.use_retrieval else None
+        )
+        # 속성 이름은 기존 체크포인트 키(output_gate.neural_head.*)와 맞추려고 유지한다.
+        self.output_gate = PredictionHead(config.fusion_dim, use_softplus=self.use_softplus)
         self.loss_fn: nn.Module
         self.configure_loss(config.loss_type)
 
@@ -249,6 +255,12 @@ class MergedDemandModel(PreTrainedModel):
 
         weather_cls = self._weather_features(weather) if self.weather_cls_dim else None
         h_neural = self.local_history(demand_history, recent_extra, weather_cls)
+        if self.retrieval is not None:
+            retrieved = self.retrieval(sample_idx)
+            h_local = self.retrieval_fusion(h_neural, retrieved)
+        else:
+            retrieved = None
+            h_local = h_neural
         # Ablation은 브랜치 출력을 0으로 바꾸되 valid mask와 모듈 shape은 유지한다.
         h_daily, daily_valid = self.daily_branch(daily_demand, daily_mask, daily_extra)
         if not self.use_daily:
@@ -257,27 +269,20 @@ class MergedDemandModel(PreTrainedModel):
         if not self.use_weekly:
             h_weekly = torch.zeros_like(h_weekly)
         h_attn, attention_weights = self.branch_attention(
-            h_neural, h_daily, h_weekly, daily_valid, weekly_valid
+            h_local, h_daily, h_weekly, daily_valid, weekly_valid
         )
 
-        if self.retrieval is not None:
-            ir_out = self.retrieval(demand_history, sample_idx)
-            neural_pred, lambda_weight, prediction = self.output_gate(h_attn, ir_out)
-        else:
-            # 검색 pass에서는 zero retrieval을 gate에 넣지 않고 우회한다.
-            ir_out = None
-            neural_pred, lambda_weight, prediction = self.output_gate(h_attn, None, bypass_gate=True)
+        prediction = self.output_gate(h_attn)
         prediction_grid = prediction.reshape(-1, self.height, self.width)
 
         output: dict[str, Tensor | None] = {
             'logits': prediction_grid,
             'prediction': prediction_grid,
             'prediction_flat': prediction,
-            'neural_pred': neural_pred,
-            'ir_out': ir_out,
-            'lambda_weight': lambda_weight,
             'attention_weights': attention_weights,
             'h_neural': h_neural,
+            'h_local': h_local,
+            'retrieved': retrieved,
             'h_attn': h_attn,
             'daily_valid': daily_valid,
             'weekly_valid': weekly_valid,

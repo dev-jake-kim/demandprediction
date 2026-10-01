@@ -562,7 +562,7 @@ def main(cfg: DictConfig) -> None:
         'weather_path': str(dataset_kwargs['weather_csv_path']),
         'weather_stats': weather_stats,
         'device': str(trainer.args.device),
-        'retrieval_scope': cfg.model.retrieval_scope,
+        'retrieval_future_mask_hours': cfg.model.retrieval_future_mask_hours,
         # stage별 목적함수를 별도로 기록한다.
         'objective': cfg.model.loss_type,
         'stage1_loss': cfg.model.loss_type,

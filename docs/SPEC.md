@@ -422,9 +422,10 @@ reshape한 것이 `logits`다. 검색 결과는 출력에서 섞지 않고 6.6�
 
 ### 6.6 검색 (`CausalRetrieval` + 융합, 선택 경로)
 
-`retrieve(demands [B,k,H,W], sample_idx [B], training: bool) → retrieved [B,N,P_r]`,
-`fuse(h_neural, retrieved) → h_local [B,N,history_hidden]`. `use_retrieval=true`일 때만
-생성된다. 검색 자체는 학습 파라미터·gradient가 없고, 융합 Linear 두 개만 학습한다.
+`CausalRetrieval(sample_idx [B]) → retrieved [B,N,P_r]` (모드는 `self.training`),
+`RetrievalFusion(h_neural, retrieved) → h_local [B,N,history_hidden]`
+(`models/merged/modules/retrieval.py`). `use_retrieval=true`일 때만 생성된다. 검색 자체는 학습
+파라미터·gradient가 없고, 융합 Linear 두 개(`value_projection`, `fuse`)만 학습한다.
 
 - 예측 시점 `t`, 노드 `n=(x,y)`, 반경 `r = retrieval_local_radius ?? local_radius`,
   `P_r = (2r+1)²` (r=1이면 3×3, 9칸).
@@ -453,11 +454,15 @@ reshape한 것이 `logits`다. 검색 결과는 출력에서 섞지 않고 6.6�
 <details>
 <summary>세부</summary>
 
-- 생성 시 `retrieval_grid_path`의 `[T,H,W]` 격자를 읽어 모든 시점의 3×3 창(K용)과
-  τ 시점 창(V용)을 CPU에 만든다. 검색 반경이 Transformer 반경과 같아도 Q는 raw 수요에서 따로 자른다.
-- 같은 `(모드, t)`의 검색 결과는 항상 같으므로 모드별 CPU cache에 `t` 단위로 저장해 재사용한다.
+- 생성 시 `retrieval_grid_path`의 `[T,H,W]` 격자를 읽어 모든 시점의 3×3 창 `[T,N,P_r]`을
+  CPU에 만든다. Q(t)는 이 격자의 `[t−k, t)` 창이고, 데이터셋의 `demand_history`와 같은 값이다.
+- 결과는 `(모드, t)`에만 의존하므로 모드별로 모든 t의 결과 `[T,N,P_r]`을 첫 사용 시 입력 장치에서
+  한 번 계산해 두고(Ulsan 0.5초, Porto 1.5초, GPU), forward는 `sample_idx`로 gather만 한다.
+  GPU→CPU 동기화가 없고 체크포인트에 저장하지 않는다.
 - train 모드 후보 수는 `t`에 거의 무관하게 약 `train_end − k − 73`개로 일정하다.
 - grid 경로가 없으면 0을 반환한다.
+- 출력 head 속성 이름 `output_gate`는 기존 체크포인트 키(`output_gate.neural_head.*`)와 맞추려고
+  유지한다. 이전 gate의 `output_gate.lambda_layer.*` 키는 불러올 때 무시된다.
 
 </details>
 
@@ -596,8 +601,9 @@ python test.py <checkpoint_dir> --city {ulsan,porto} --weather_csv_path <csv> \
 - 주기 lag가 모두 무효일 때 neural 후보로 대체.
 - 날씨·캘린더 채널이 lag 압축 뒤에도 유지되고 기준 LSTM과 일치.
 - ΔW=0 적응 경로가 `nn.LSTM`과 일치하고 비적응 노드는 비트 단위 동일.
-- 검색 후보 경계: train 모드에서 `[t, t+72h]`와 `τ ≥ train_end`, eval 모드에서 `τ ≥ t`의
-  격자 값을 바꿔도 검색 결과가 그대로다.
+- 검색: 모드별 결과 표가 브루트포스 기준과 일치, `retrieval_future_mask_hours < time_step` 거부,
+  train 모드에서 `y_t`나 train 구간 밖 값을 바꿔도, eval 모드에서 `t` 이후 값을 바꿔도 결과[t]가 그대로.
+- 검색 켬: eval forward가 eval 모드 표를 쓰고, 융합 Linear에 gradient가 흐른다.
 - Transformer 3×3에서 검색 창 3×3·5×5 선택이 forward에 반영.
 - 검색 끔: grid 없이 생성·예측·체크포인트 복원, `h_local = h_neural`, `retrieved=None`.
 - masked Transformer 수용 영역: 1층은 반경 1, 2층은 반경 2 밖 수요에 무반응(eval·no_grad).

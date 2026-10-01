@@ -32,8 +32,8 @@ class MergedDemandConfig(PretrainedConfig):
         retrieval_grid_path: str | None = None,
         retrieval_k: int = 20,
         retrieval_chunk_size: int = 256,
-        retrieval_scope: str = 'observed_past',
         retrieval_train_end: int | None = None,
+        retrieval_future_mask_hours: int = 72,
         temperature_min: float | None = None,
         temperature_max: float | None = None,
         precipitation_max: float | None = None,
@@ -77,8 +77,9 @@ class MergedDemandConfig(PretrainedConfig):
         self.retrieval_grid_path = retrieval_grid_path
         self.retrieval_k = retrieval_k
         self.retrieval_chunk_size = retrieval_chunk_size
-        self.retrieval_scope = retrieval_scope
         self.retrieval_train_end = retrieval_train_end
+        # train 모드에서 [t, t + 이 값] 후보를 가린다. time_step 이상이어야 누수가 없다.
+        self.retrieval_future_mask_hours = retrieval_future_mask_hours
         # train 구간 통계. precipitation_max는 snow_scale=1 기준으로 고정한다.
         self.temperature_min = temperature_min
         self.temperature_max = temperature_max
