@@ -1,17 +1,14 @@
 """Reusable neural blocks for :mod:`models.merged`."""
 
-from .attention import BranchAttention
 from .embeddings import FourierScalarEmbedding
-from .fusion import NeuralRetrievalGate
+from .fusion import GATE_INIT, NodeHourGate
 from .history import LocalHistoryEncoder
-from .periodic import PeriodicLSTMEncoder
-from .retrieval import CausalRetrieval
+from .periodic import LinearTrendForecaster
 
 __all__ = [
-    'BranchAttention',
-    'CausalRetrieval',
     'FourierScalarEmbedding',
+    'GATE_INIT',
+    'LinearTrendForecaster',
     'LocalHistoryEncoder',
-    'NeuralRetrievalGate',
-    'PeriodicLSTMEncoder',
+    'NodeHourGate',
 ]

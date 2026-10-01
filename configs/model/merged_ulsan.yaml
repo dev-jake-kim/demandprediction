@@ -1,5 +1,5 @@
-
-# height/width/time_step/retrieval_grid_path/retrieval_train_end/weather_mean/weather_std는 train.py가 데이터에서 채운다.
+# Ulsan merged 모델 설정.
+# height/width/time_step/temperature_min/temperature_max/precipitation_max는 train.py가 train 구간에서 채운다.
 local_radius: 1
 d_model: 16
 num_fourier_bands: 8
@@ -7,28 +7,19 @@ transformer_layers: 2
 transformer_heads: 4
 transformer_ffn: 128
 history_hidden: 64
-periodic_hidden: 64
-fusion_dim: 128
 dropout: 0.10
 
 attention_dropout: 0.0
-retrieval_k: 20
-retrieval_chunk_size: 256
-# observed_past는 target_time 이전 관측값만 후보로 삼는다.
-retrieval_scope: observed_past
-# 날씨 특성은 임베딩 없이 3개 채널로 주입한다.
 weekday_dim: 7
 hour_dim: 5
 
 # 모델 ablation 스위치.
 use_daily: true
 use_weekly: true
-use_retrieval: false
 use_weather: true
 # weather_injection은 날씨 특성의 주입 위치를 선택한다.
 weather_injection: concat
 use_calendar: true
-use_branch_attention: true
 use_neighbors: true
 use_softplus: true
 

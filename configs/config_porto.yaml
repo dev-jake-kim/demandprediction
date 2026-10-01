@@ -90,8 +90,8 @@ callbacks:
 
 # 실험 설명(필수). 학습 로그 맨 위에 커밋 해시와 함께 출력된다.
 description: ???
-# 실행 설정 라벨(모델 스위치가 아님). 기본 검색 pass와 일치시킨다.
-ablation: no-ir
+# 실행 설정 라벨(모델 스위치가 아님).
+ablation: full
 # limit_samples는 각 split에서 사용할 앞쪽 샘플 수이며 null이면 전체다.
 limit_samples: null
 # null이면 output/${project_name}/runs/<city>_<loss_type>_<ablation>_seed<seed>.json 에 쓴다.

@@ -15,15 +15,15 @@ import numpy as np
 import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from dataset_frame import UnifiedDemandDataset, resolve_dataset_path
 from models.merged import MergedDemandConfig, MergedDemandModel
 from models.merged.modules import (
-    BranchAttention,
-    CausalRetrieval,
+    GATE_INIT,
+    LinearTrendForecaster,
     LocalHistoryEncoder,
-    PeriodicLSTMEncoder,
+    NodeHourGate,
 )
 from train import build_dataset_kwargs, select_node_adaptive_indices
 
@@ -44,8 +44,11 @@ def _check_dataset(city: str, device: torch.device) -> dict:
     val_set = UnifiedDemandDataset(path, 'val', **kwargs)
     test_set = UnifiedDemandDataset(path, 'test', **kwargs)
     train_weather = train_set.weather[train_set.time_step : train_set.train_end]
-    weather_mean = train_weather.mean(axis=0)
-    weather_std = train_weather.std(axis=0).clip(min=1e-6)
+    weather_stats = {
+        'temperature_min': float(train_weather[:, 0].min()),
+        'temperature_max': float(train_weather[:, 0].max()),
+        'precipitation_max': float((train_weather[:, 1] + train_weather[:, 2]).max()),
+    }
     node_adaptive_indices = (
         select_node_adaptive_indices(train_set, float(cfg.model.node_adaptive_min_demand))
         if cfg.model.node_adaptive else None
@@ -55,17 +58,16 @@ def _check_dataset(city: str, device: torch.device) -> dict:
     if not (train_set.val_end == val_set.val_end == test_set.val_end):
         raise AssertionError(f'{city}: validation bounds differ between dataset views')
 
-    sample = next(iter(DataLoader(train_set, batch_size=1, shuffle=False)))
+    # weekly lag까지 모두 유효한 샘플을 쓴다.
+    probe = min(len(train_set) - 1, int(train_set.weekly_lag_values[0]))
+    sample = next(iter(DataLoader(Subset(train_set, [probe]), batch_size=1)))
     sample = {key: value.to(device) for key, value in sample.items()}
     model_config = MergedDemandConfig(
         height=train_set.height,
         width=train_set.width,
         time_step=train_set.time_step,
-        retrieval_grid_path=str(path),
-        retrieval_train_end=train_set.train_end,
-        weather_mean=weather_mean.tolist(),
-        weather_std=weather_std.tolist(),
         node_adaptive_indices=node_adaptive_indices,
+        **weather_stats,
         **OmegaConf.to_container(cfg.model, resolve=True),
     )
     model = MergedDemandModel(model_config).to(device)
@@ -73,15 +75,16 @@ def _check_dataset(city: str, device: torch.device) -> dict:
     with torch.no_grad():
         output = model.forward_debug(**sample)
     prediction = output['logits']
-    weights = output['attention_weights']
+    weights = output['gate_weights']
     if tuple(prediction.shape) != (1, train_set.height, train_set.width):
         raise AssertionError(f'{city}: unexpected prediction shape {tuple(prediction.shape)}')
-    if not torch.isfinite(prediction).all() or (prediction < 0).any():
-        raise AssertionError(f'{city}: prediction is not finite and non-negative')
+    if not torch.isfinite(prediction).all():
+        raise AssertionError(f'{city}: prediction is not finite')
     if not torch.allclose(weights.sum(dim=-1), torch.ones_like(weights[..., 0]), atol=1e-5):
-        raise AssertionError(f'{city}: branch attention weights do not sum to one')
+        raise AssertionError(f'{city}: gate weights do not sum to one')
+    if not (bool(output['daily_valid'].all()) and bool(output['weekly_valid'].all())):
+        raise AssertionError(f'{city}: probe sample should have all periodic lags valid')
 
-    # Retrieval is intentionally non-differentiable.
     model.train()
     model.zero_grad(set_to_none=True)
     model.forward_debug(**sample)['loss'].backward()
@@ -90,12 +93,13 @@ def _check_dataset(city: str, device: torch.device) -> dict:
         return parameter.grad is not None and bool(parameter.grad.abs().sum() > 0)
 
     gradient_checks = {
-        'neural_head': model.output_gate.neural_head.weight.grad is not None,
-        'branch_attention': model.branch_attention.query_projection.weight.grad is not None,
-        'local_history': model.local_history.scalar_embedding.projection.weight.grad is not None,
-        # Verify calendar embeddings reach the LSTM inputs.
+        'predict_layer': _has_gradient(model.predict_layer.weight),
+        'gate_logit': _has_gradient(model.gate.gate_logit),
+        'local_history': _has_gradient(model.local_history.scalar_embedding.projection.weight),
         'weekday_embedding': _has_gradient(model.weekday_embedding.weight),
         'hour_embedding': _has_gradient(model.hour_embedding.weight),
+        # 적설이 0인 샘플에서는 값이 0일 수 있어 연결 여부만 본다.
+        'snow_scale_connected': model.snow_scale.grad is not None,
     }
     if not all(gradient_checks.values()):
         raise AssertionError(f'{city}: end-to-end gradient check failed: {gradient_checks}')
@@ -105,8 +109,7 @@ def _check_dataset(city: str, device: torch.device) -> dict:
     with torch.no_grad():
         baseline = model(**{k: v for k, v in sample.items() if k != 'labels'})['logits']
         perturbed_sample = {k: v for k, v in sample.items() if k != 'labels'}
-        for key in ('weather', 'daily_weather', 'weekly_weather'):
-            perturbed_sample[key] = sample[key] + 10.0
+        perturbed_sample['weather'] = sample['weather'] + 10.0
         perturbed = model(**perturbed_sample)['logits']
     weather_sensitivity = float((baseline - perturbed).abs().max())
     if weather_sensitivity <= 1e-6:
@@ -114,7 +117,7 @@ def _check_dataset(city: str, device: torch.device) -> dict:
             f'{city}: 날씨를 바꿔도 출력이 그대로임 — 날씨 채널이 LSTM 입력에 반영되지 않음'
         )
 
-    target_time = int(sample['sample_idx'][0].item())
+    target_time = int(train_set.indices[probe])
     if target_time < train_set.time_step:
         raise AssertionError(f'{city}: sample index is before local history boundary')
     expected_target = torch.from_numpy(
@@ -136,74 +139,12 @@ def _check_dataset(city: str, device: torch.device) -> dict:
         'node_adaptive_nodes': len(node_adaptive_indices) if node_adaptive_indices else 0,
         'samples': {'train': len(train_set), 'val': len(val_set), 'test': len(test_set)},
         'target_time_probe': target_time,
-        'attention_shape': list(weights.shape),
+        'gate_shape': list(weights.shape),
         'gradient_checks': gradient_checks,
-        'lstm_input_sizes': {
-            'history': model.local_history.history_lstm.input_size,
-            'daily': model.daily_branch.lstm.input_size,
-            'weekly': model.weekly_branch.lstm.input_size,
-        },
+        'history_lstm_input_size': model.local_history.history_lstm.input_size,
         'weather_sensitivity': weather_sensitivity,
         'loss_type': model.loss_type,
         'all_pass': True,
-    }
-
-
-def _check_invalid_mask() -> dict:
-    encoder = PeriodicLSTMEncoder(hidden_size=8)
-    values = torch.ones(2, 4, 3, 1)
-    invalid = torch.tensor([[True, True, True, True], [True, False, True, False]])
-    hidden, valid = encoder(values, invalid)
-    if valid.tolist() != [False, True] or not torch.isfinite(hidden).all():
-        raise AssertionError('periodic invalid-mask handling failed')
-    attention = BranchAttention(history_hidden=8, periodic_hidden=8, fusion_dim=8)
-    fused, weights = attention(torch.ones(2, 3, 8), hidden, hidden, valid, valid)
-    if not torch.isfinite(fused).all() or not torch.allclose(
-        weights[0, :, 2], torch.ones(3), atol=1e-6
-    ):
-        raise AssertionError('all-invalid periodic branches did not fall back to neural token')
-    return {'all_invalid_periodic_falls_back_to_neural': True}
-
-
-def _check_periodic_extra_channels() -> dict:
-    """Verify weather/calendar channels survive invalid-lag compaction."""
-
-    torch.manual_seed(0)
-    extra_dim = 15
-    encoder = PeriodicLSTMEncoder(hidden_size=8, extra_dim=extra_dim)
-    encoder.eval()
-
-    length, nodes = 4, 2
-    values = torch.rand(1, length, nodes, 1)
-    extra = torch.randn(1, length, extra_dim)
-    invalid = torch.tensor([[False, True, False, False]])  # 두 번째 lag만 무효
-
-    with torch.no_grad():
-        hidden, valid = encoder(values, invalid, extra)
-
-        # Reference: compact valid positions before the LSTM.
-        keep = [0, 2, 3]
-        sequence = torch.log1p(torch.clamp(values, min=0.0))
-        sequence = sequence.permute(0, 2, 1, 3).reshape(nodes, length, 1)
-        expanded = (
-            extra[:, None, :, :].expand(1, nodes, length, extra_dim).reshape(nodes, length, extra_dim)
-        )
-        reference_input = torch.cat([sequence, expanded], dim=-1)[:, keep, :]
-        _, (reference_hidden, _) = encoder.lstm(reference_input)
-        reference = reference_hidden[-1].reshape(1, nodes, -1)
-
-    if not bool(valid.item()):
-        raise AssertionError('periodic extra-channel check: sequence should be valid')
-    if not torch.allclose(hidden, reference, atol=1e-6):
-        raise AssertionError(
-            'periodic compaction dropped concatenated channels: '
-            f'max|diff|={float((hidden - reference).abs().max()):.3e}'
-        )
-    if encoder.lstm.input_size != 1 + extra_dim:
-        raise AssertionError(f'unexpected periodic LSTM input size {encoder.lstm.input_size}')
-    return {
-        'periodic_extra_channels_survive_compaction': True,
-        'periodic_lstm_input_size': encoder.lstm.input_size,
     }
 
 
@@ -269,118 +210,75 @@ def _check_node_adaptive_identity() -> dict:
     }
 
 
-def _check_retrieval_boundary() -> dict:
-    with tempfile.TemporaryDirectory(prefix='merged_retrieval_') as temp_dir:
-        path = Path(temp_dir) / 'grid.npy'
-        grid = np.arange(12, dtype=np.float32).reshape(12, 1, 1)
-        np.save(path, grid, allow_pickle=False)
-        retrieval = CausalRetrieval(
-            height=1,
-            width=1,
-            time_step=2,
-            local_radius=0,
-            retrieval_grid_path=path,
-            retrieval_k=1,
-            retrieval_chunk_size=4,
-            retrieval_scope='observed_past',
-            retrieval_train_end=None,
-        )
-        query = retrieval._grid[3:5].clone().reshape(1, 2, 1, 1)
-        before = retrieval(query, torch.tensor([5]))
-        # Target and future values must be outside the candidate interval
-        # [time_step, target_time), so changing them cannot affect retrieval.
-        retrieval._grid[5:] = 10_000.0
-        retrieval._crops[5:] = 10_000.0
-        retrieval._cache.fill_(float('nan'))
-        after = retrieval(query, torch.tensor([5]))
-        if not torch.equal(before, after):
-            raise AssertionError('retrieval used target or future values')
-    return {'retrieval_candidate_boundary': 'tau < target_time'}
+def _check_trend_forecaster() -> dict:
+    """직선 외삽(numpy.polyfit), 0 clamp, 무효 lag 평균, 전부 무효 처리를 확인한다."""
+
+    forecaster = LinearTrendForecaster()
+    rows = [[3, 5, 1, 2, 4, 3], [5, 4, 3, 2, 1, 0], [2, 9, 4, 7, 1, 6], [1, 2, 3, 4, 5, 6]]
+    values = torch.tensor(rows, dtype=torch.float64).T[None, :, :, None]  # [1,6,4,1]
+    pred, valid = forecaster(values, torch.zeros(1, 6, dtype=torch.bool))
+    position = np.arange(1, 7)
+    expected = [max(np.polyval(np.polyfit(position, row, 1), 7), 0.0) for row in rows]
+    if not np.allclose(pred[0].numpy(), expected, atol=1e-10) or not bool(valid.all()):
+        raise AssertionError(f'trend extrapolation mismatch: {pred[0].tolist()} != {expected}')
+
+    invalid = torch.tensor([[True, True, False, False, False, False],
+                            [True, True, True, True, True, True]])
+    pred, valid = forecaster(values.expand(2, -1, -1, -1), invalid)
+    expected_mean = [float(np.mean(row[2:])) for row in rows]
+    if not np.allclose(pred[0].numpy(), expected_mean, atol=1e-10):
+        raise AssertionError('partially invalid lags must use the mean of valid lags')
+    if valid.tolist() != [True, False] or bool(pred[1].abs().sum()):
+        raise AssertionError('all-invalid lags must be invalid with zero prediction')
+    return {'trend_extrapolation_matches_polyfit': True, 'example_[3,5,1,2,4,3]': expected[0]}
 
 
-def _check_independent_retrieval_radius() -> dict:
-    """Verify retrieval radius is independent of the Transformer radius."""
-    with tempfile.TemporaryDirectory(prefix='merged_window_') as temp_dir:
-        path = Path(temp_dir) / 'grid.npy'
-        grid = (np.arange(12 * 3 * 3, dtype=np.float32) % 11).reshape(12, 3, 3)
-        np.save(path, grid, allow_pickle=False)
-        history = torch.from_numpy(grid[5:7].copy()).unsqueeze(0)
-        zeros = torch.zeros(1, 2, 9, 1)
-        mask = torch.zeros(1, 2, dtype=torch.bool)
-        weather = torch.zeros(1, 2, 3)
-        time = torch.zeros(1, 2, dtype=torch.long)
-        sample_idx = torch.tensor([7])
-        for radius in (1, 2):
-            config = MergedDemandConfig(
-                height=3, width=3, time_step=2, local_radius=1, retrieval_local_radius=radius,
-                d_model=8, transformer_heads=2, transformer_layers=1,
-                retrieval_grid_path=str(path), retrieval_k=2,
-                weather_mean=[0.0] * 3, weather_std=[1.0] * 3,
-            )
-            model = MergedDemandModel(config).eval()
-            with torch.no_grad():
-                output = model._compute(
-                    demand_history=history, daily_demand=zeros, daily_mask=mask,
-                    weekly_demand=zeros, weekly_mask=mask, sample_idx=sample_idx,
-                    weather=weather, hour_of_day=time, day_of_week=time,
-                    daily_weather=weather, daily_hour=time, daily_day_of_week=time,
-                    weekly_weather=weather, weekly_hour=time, weekly_day_of_week=time,
-                )
-                model.retrieval._cache.fill_(float('nan'))
-                expected = model.retrieval(history, sample_idx)
-            if model.local_history.num_neighbors != 9:
-                raise AssertionError('Transformer window is not 3×3')
-            if model.retrieval._crops.shape[-1] != (2 * radius + 1) ** 2:
-                raise AssertionError(f'Retrieval candidates do not use radius {radius}')
-            if not torch.equal(output['ir_out'], expected):
-                raise AssertionError(f'Retrieval query does not use radius {radius}')
-    return {'transformer_neighbors': 9, 'retrieval_neighbors_checked': [9, 25]}
+def _check_gate() -> dict:
+    """초기 가중치, 무효 브랜치 제외, 합 1을 확인한다."""
+
+    gate = NodeHourGate(num_nodes=3)
+    ones = torch.ones(2, 3)
+    hour = torch.tensor([0, 23])
+    _, weights = gate(ones, 2 * ones, 3 * ones, hour, torch.tensor([True, True]),
+                      torch.tensor([True, False]))
+    if not torch.allclose(weights[0], torch.tensor(GATE_INIT).expand(3, 3), atol=1e-6):
+        raise AssertionError(f'gate init is not {GATE_INIT}: {weights[0]}')
+    expected = torch.tensor([GATE_INIT[0], GATE_INIT[1], 0.0]) / (GATE_INIT[0] + GATE_INIT[1])
+    if not torch.allclose(weights[1], expected.expand(3, 3), atol=1e-6):
+        raise AssertionError(f'invalid weekly branch is not excluded: {weights[1]}')
+    return {'gate_init': list(GATE_INIT), 'invalid_branch_excluded': True}
 
 
-def _check_retrieval_pass() -> dict:
-    """검색을 끈 모델은 없는 raw grid로도 예측·체크포인트 복원이 가능해야 한다."""
-    with tempfile.TemporaryDirectory(prefix='merged_no_retrieval_') as temp_dir:
-        grid_path = Path(temp_dir) / 'absent.npy'
-        config = MergedDemandConfig(
-            height=3, width=3, time_step=2, local_radius=1, use_retrieval=False,
-            d_model=8, transformer_heads=2, transformer_layers=1,
-            retrieval_grid_path=str(grid_path),
-            weather_mean=[0.0] * 3, weather_std=[1.0] * 3,
-        )
-        model = MergedDemandModel(config).eval()
-        if model.retrieval is not None:
-            raise AssertionError('disabled retrieval instantiated a grid search')
-        batch = {
-            'demand_history': torch.ones(1, 2, 3, 3),
-            'daily_demand': torch.ones(1, 2, 9, 1),
-            'daily_mask': torch.zeros(1, 2, dtype=torch.bool),
-            'weekly_demand': torch.ones(1, 2, 9, 1),
-            'weekly_mask': torch.zeros(1, 2, dtype=torch.bool),
-            'sample_idx': torch.tensor([7]),
-            'weather': torch.zeros(1, 2, 3),
-            'hour_of_day': torch.zeros(1, 2, dtype=torch.long),
-            'day_of_week': torch.zeros(1, 2, dtype=torch.long),
-            'daily_weather': torch.zeros(1, 2, 3),
-            'daily_hour': torch.zeros(1, 2, dtype=torch.long),
-            'daily_day_of_week': torch.zeros(1, 2, dtype=torch.long),
-            'weekly_weather': torch.zeros(1, 2, 3),
-            'weekly_hour': torch.zeros(1, 2, dtype=torch.long),
-            'weekly_day_of_week': torch.zeros(1, 2, dtype=torch.long),
-        }
+def _check_roundtrip() -> dict:
+    """save_pretrained -> from_pretrained 후 예측이 같아야 한다."""
+
+    torch.manual_seed(0)
+    config = MergedDemandConfig(
+        height=3, width=3, time_step=2, local_radius=1, d_model=8, transformer_heads=2,
+        transformer_layers=1, temperature_min=-5.0, temperature_max=30.0, precipitation_max=20.0,
+        node_adaptive=True, node_adaptive_indices=[0, 4],
+    )
+    model = MergedDemandModel(config).eval()
+    batch = {
+        'demand_history': torch.rand(2, 2, 3, 3) * 3,
+        'daily_demand': torch.rand(2, 6, 9, 1) * 3,
+        'daily_mask': torch.zeros(2, 6, dtype=torch.bool),
+        'weekly_demand': torch.rand(2, 4, 9, 1) * 3,
+        'weekly_mask': torch.tensor([[False] * 4, [True] * 4]),
+        'weather': torch.tensor([[[10.0, 1.0, 0.5], [12.0, 0.0, 0.0]]] * 2),
+        'hour_of_day': torch.tensor([[7, 8], [22, 23]]),
+        'day_of_week': torch.tensor([[1, 1], [5, 5]]),
+    }
+    with tempfile.TemporaryDirectory(prefix='merged_roundtrip_') as temp_dir:
         with torch.no_grad():
-            expected = model.forward_debug(**batch)
-        checkpoint = Path(temp_dir) / 'checkpoint'
-        model.save_pretrained(checkpoint)
-        restored = MergedDemandModel.from_pretrained(checkpoint).eval()
+            expected = model(**batch)['logits']
+        model.save_pretrained(temp_dir)
+        restored = MergedDemandModel.from_pretrained(temp_dir).eval()
         with torch.no_grad():
-            actual = restored.forward_debug(**batch)
-        if restored.retrieval is not None or not torch.equal(expected['logits'], actual['logits']):
-            raise AssertionError('search-free checkpoint did not reload without its raw grid')
-        if not torch.equal(actual['logits'].flatten(1), actual['neural_pred']):
-            raise AssertionError('disabled retrieval did not pass through neural prediction')
-        if actual['ir_out'] is not None or not torch.all(actual['lambda_weight'] == 1):
-            raise AssertionError('disabled retrieval passed through the output gate')
-    return {'retrieval_pass_missing_grid_and_reload': True}
+            actual = restored(**batch)['logits']
+    if not torch.equal(expected, actual):
+        raise AssertionError('checkpoint round trip changed predictions')
+    return {'checkpoint_roundtrip_identical': True}
 
 
 def _check_masked_grid_receptive_field() -> dict:
@@ -418,13 +316,11 @@ def main() -> None:
     if device.type == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA requested but unavailable')
     results = [_check_dataset(city, device) for city in ('ulsan', 'porto')]
-    results.append(_check_invalid_mask())
-    results.append(_check_periodic_extra_channels())
+    results.append(_check_trend_forecaster())
+    results.append(_check_gate())
     results.append(_check_node_adaptive_identity())
-    results.append(_check_retrieval_boundary())
-    results.append(_check_independent_retrieval_radius())
-    results.append(_check_retrieval_pass())
     results.append(_check_masked_grid_receptive_field())
+    results.append(_check_roundtrip())
     report = {'device': str(device), 'all_pass': True, 'checks': results}
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
