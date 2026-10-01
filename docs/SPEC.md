@@ -24,31 +24,37 @@
 
 ## 1. 데이터 흐름
 
+기본 경로는 **검색 pass(`use_retrieval=false`)**다. 점선은
+`model.use_retrieval=true`일 때만 실행된다.
+
 ```mermaid
 flowchart TD
     subgraph IN["입력: 예측 시점 t"]
         H["최근 수요 이력<br/>demand_history [B,k,H,W]<br/>k=24"]
-        CTX["최근 날씨(기온·강수·적설)·요일·시간<br/>[B,k]"]
+        CTX["최근 날씨·요일·시간<br/>[B,k]"]
         D["daily lag 수요 + mask<br/>[B,6,N,1], [B,6]"]
+        DC["daily lag 날씨·요일·시간"]
         W["weekly lag 수요 + mask<br/>[B,4,N,1], [B,4]"]
+        WC["weekly lag 날씨·요일·시간"]
         Y["정답 labels [B,H,W]"]
     end
 
-    subgraph CE["최근 context"]
-        C0["기온 min-max 정규화<br/>(강수 + g·적설) / 강수_max"]
-        C1["날씨 2 + 요일 임베딩 7<br/>+ 시간 임베딩 5"]
-        C2["context [B,k,14]"]
-        C0 --> C1 --> C2
+    subgraph CE["시점별 보조 context"]
+        C1["날씨 정규화 3<br/>+ 요일 임베딩 7<br/>+ 시간 임베딩 5"]
+        C2["context [B,L,15]"]
+        C1 --> C2
     end
 
-    CTX --> C0
+    CTX --> C1
+    DC --> C1
+    WC --> C1
 
     subgraph LH["LocalHistoryEncoder: 공간 + 최근 시간"]
         L1["노드 토큰<br/>log1p + Fourier 스칼라 임베딩<br/>+ 노드 임베딩 [B·k, N, D]"]
         L2["층마다: [층별 sink, 노드 N개]<br/>[B·k, 1+N, D]"]
         L3["masked Transformer 층<br/>노드는 sink + 자기 창만 봄<br/>+ 방향별·head별 bias"]
         L4["sink 출력 버림<br/>노드 출력만 다음 층으로"]
-        L5["최종 노드 출력 [B,N,k,D]<br/>+ 최근 context 14"]
+        L5["최종 노드 출력 [B,N,k,D]<br/>+ 최근 context 15"]
         L6["공유 history LSTM"]
         L7["적응 노드만 W + ΔW LSTM<br/>stage 2에서 ΔW 학습"]
         HN["h_neural [B,N,history_hidden]"]
@@ -61,47 +67,61 @@ flowchart TD
     H --> L1
     C2 -->|"최근 context"| L5
 
-    subgraph LOC["local 예측"]
-        PL["predict_layer<br/>Linear(history_hidden→1) + Softplus"]
-        LP["local_pred [B,N]"]
-        PL --> LP
-    end
-
-    HN --> PL
-
-    subgraph PER["LinearTrendForecaster ×2 (학습 파라미터 없음)"]
-        P1["daily: lag 수열에 최소제곱 직선<br/>다음 위치로 외삽, 0 미만은 0<br/>무효 lag가 있으면 유효 lag 평균"]
-        P2["weekly: 같은 방식"]
-        DP["daily_pred [B,N], daily_valid [B]"]
-        WP["weekly_pred [B,N], weekly_valid [B]"]
-        P1 --> DP
-        P2 --> WP
+    subgraph PER["PeriodicLSTMEncoder ×2"]
+        P1["daily: log1p lag + context<br/>유효 lag 압축 → LSTM"]
+        P2["weekly: log1p lag + context<br/>유효 lag 압축 → LSTM"]
+        HD["h_daily [B,N,periodic_hidden]<br/>daily_valid [B]"]
+        HW["h_weekly [B,N,periodic_hidden]<br/>weekly_valid [B]"]
+        P1 --> HD
+        P2 --> HW
     end
 
     D --> P1
     W --> P2
+    C2 -->|"daily context"| P1
+    C2 -->|"weekly context"| P2
 
-    subgraph GATE["NodeHourGate"]
-        G1["gate_logit [N,24,3]<br/>예측 시점 시각 h(t)"]
-        G2["무효 브랜치 제외 softmax<br/>g_local + g_daily + g_weekly = 1"]
-        G1 --> G2
+    subgraph ATT["BranchAttention: 노드별 브랜치 선택"]
+        A1["세 표현을 fusion_dim으로 projection<br/>z_neural, z_daily, z_weekly"]
+        A2["query = z_neural<br/>keys·values = daily, weekly, neural"]
+        A3["무효 daily·weekly 후보 mask<br/>softmax attention"]
+        A4["z_neural + fused<br/>LayerNorm"]
+        HA["h_attn [B,N,fusion_dim]"]
+        A1 --> A2 --> A3 --> A4 --> HA
     end
 
-    CTX -->|"시각 h(t)"| G1
+    HN --> A1
+    HD --> A1
+    HW --> A1
 
-    F["prediction = g_local·local_pred<br/>+ g_daily·daily_pred + g_weekly·weekly_pred"]
-    LP --> F
-    DP --> F
-    WP --> F
-    G2 --> F
-    F --> PRED["logits [B,H,W]"]
+    subgraph OUT["기본 출력: 검색 pass"]
+        O1["neural_head Linear"]
+        O2["Softplus"]
+        PRED["예측 수요 logits<br/>[B,H,W]"]
+        O1 --> O2 --> PRED
+    end
+
+    HA --> O1
     PRED --> LOSS["MAE 손실"]
     Y --> LOSS
+
+    subgraph RET["선택 경로: use_retrieval=true"]
+        R1["검색용 raw 창<br/>+ absolute sample_idx"]
+        R2["CausalRetrieval<br/>후보 τ < t, top-k 유사 과거"]
+        R3["ir_out [B,N]"]
+        R4["NeuralRetrievalGate<br/>λ·neural + (1-λ)·ir_out"]
+        R1 --> R2 --> R3 --> R4
+    end
+
+    H -.->|"검색 켬"| R1
+    HA -.->|"gate 입력"| R4
+    O2 -.->|"neural_pred"| R4
+    R4 -.->|"검색 켬 예측"| PRED
 ```
 
 기호: `B` batch, `k=time_step=24`, `N=H×W` 노드 수, `D=d_model`,
 `P=(2a+1)²` 이웃 창 셀 수(`a=local_radius`; 3×3이면 9, 5×5이면 25),
-`L`은 lag 개수(daily 6, weekly 4).
+`L`은 최근 이력 `k`, daily lag 6, weekly lag 4 중 하나.
 
 ---
 
@@ -114,8 +134,10 @@ flowchart TD
 | `models/merged/modeling.py` | `MergedDemandModel`: 조립, 데이터 흐름, 손실 |
 | `models/merged/modules/history.py` | `LocalHistoryEncoder` (+ 노드별 ΔW) |
 | `models/merged/modules/embeddings.py` | `FourierScalarEmbedding` |
-| `models/merged/modules/periodic.py` | `LinearTrendForecaster` (daily·weekly 직선 외삽) |
-| `models/merged/modules/fusion.py` | `NodeHourGate` (노드×시각 softmax 융합) |
+| `models/merged/modules/periodic.py` | `PeriodicLSTMEncoder` |
+| `models/merged/modules/attention.py` | `BranchAttention` |
+| `models/merged/modules/fusion.py` | `NeuralRetrievalGate` (출력 head + 검색 gate) |
+| `models/merged/modules/retrieval.py` | `CausalRetrieval` (선택 경로) |
 | `models/merged/losses.py`, `models/losses.py` | `build_loss`와 손실 구현 |
 | `models/merged/metrics.py`, `models/metrics.py` | `compute_merged_metrics`와 공용 지표 |
 | `configs/config_{ulsan,porto}.yaml` | 도시별 Hydra 루트 설정 |
@@ -149,22 +171,23 @@ UnifiedDemandDataset(
 |---|---|---|
 | `demand_history` | `[k,H,W]` float32 | 수요 `[t-k, t)` (raw) |
 | `labels` | `[H,W]` float32 | 수요 `t` |
+| `sample_idx` | `[]` long | 절대 시간 인덱스 `t` |
 | `weather` | `[k,3]` float32 | 기온·강수·적설 `[t-k+1, t+1)` (예측 시점 날씨 포함) |
 | `hour_of_day`, `day_of_week` | `[k]` long | `[t-k, t)`의 시각(0–23)·요일(0–6) |
-| `daily_demand` / `weekly_demand` | `[L,N,1]` float32 | lag 시점의 raw 수요 (오래된 것부터) |
+| `daily_demand` / `weekly_demand` | `[L,N,1]` float32 | lag 시점의 raw 수요 |
 | `daily_mask` / `weekly_mask` | `[L]` bool | **True = 무효 lag** |
-
-예측 시점 `t`의 절대 인덱스는 `dataset.indices[i]`로 얻는다.
+| `daily_weather`, `daily_hour`, `daily_day_of_week` | `[L,3]`, `[L]`, `[L]` | daily lag 시점 context |
+| `weekly_weather`, `weekly_hour`, `weekly_day_of_week` | `[L,3]`, `[L]`, `[L]` | weekly lag 시점 context |
 
 <details>
 <summary>분할·lag·날씨 세부</summary>
 
 - 분할 경계: `train_end = int(T·train_ratio)`, `val_end = int(T·(train_ratio+val_ratio))`.
   예측 시점은 train `[k, train_end)`, val `[max(k,train_end), val_end)`,
-  test `[max(k,val_end), T)`.
+  test `[max(k,val_end), T)`. 세 split 모두 `sample_idx`는 절대 인덱스를 유지한다.
 - lag: `period·i` (`i=1..count`)마다 `[-lag_radius, +lag_radius]` 오프셋을 펼치고
   양수만 남겨 **오래된 것부터** 정렬한다. `lag_radius=0`이면 정확한 배수만 쓴다.
-  lag 원천 시점이 `<0`이면 수요를 0으로 채우고 mask를 True로 둔다.
+  lag 원천 시점이 `<0`이면 수요·context를 0으로 채우고 mask를 True로 둔다.
 - 날씨 CSV: cp949, 열 `기온(°C)`, `강수량(mm)`, `적설(cm)` 순서. 강수·적설 결측은 0으로
   채우고 기온 결측은 허용하지 않는다. 결과는 유한해야 한다.
 - 데이터셋은 정규화하지 않는다. 수요 `log1p`와 날씨 정규화는 모델이 한다.
@@ -186,36 +209,44 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | 그룹 | 필드 | 현재 값 (Ulsan / Porto) |
 |---|---|---|
 | 데이터 파생 | `height`, `width`, `time_step` | 14×12 / 10×20, 24 |
-| | `temperature_min`, `temperature_max` | train 구간 기온 최솟값·최댓값 |
-| | `precipitation_max` | train 구간 `강수 + 1·적설`의 최댓값 (> 0) |
+| | `weather_mean`, `weather_std` | train 구간 3채널 통계 (std ≥ 1e-6) |
 | | `node_adaptive_indices` | train 구간 평균 수요 > `node_adaptive_min_demand`인 노드 id |
+| | `retrieval_grid_path`, `retrieval_train_end` | 수요 `.npy` 절대경로, `train_end` |
 | local | `local_radius` | 1 (3×3) |
 | | `d_model` | 16 / 64 |
 | | `num_fourier_bands` | 8 |
 | | `transformer_layers`, `transformer_heads`, `transformer_ffn` | 2, 4, 128 |
 | | `dropout`, `attention_dropout` | 0.10, 0.0 |
 | | `history_hidden` | 64 |
+| periodic | `periodic_hidden` | 64 |
+| fusion | `fusion_dim` | 128 |
 | context | `weekday_dim`, `hour_dim` | 7, 5 |
+| 검색 | `use_retrieval` | **false** |
+| | `retrieval_local_radius` | 미지정 → `local_radius` |
+| | `retrieval_k`, `retrieval_chunk_size`, `retrieval_scope` | 20, 256, `observed_past` |
 | 노드 적응 | `node_adaptive`, `node_adaptive_min_demand` | true, 0.1 |
 | 손실 | `loss_type` | `mae` |
 | | `loss_gamma`, `loss_eps`, `rmse_weight`, `split_threshold`, `split_high_weight` | 1.0, 0.5, 10.0, 1.0, 1.0 |
 
 ### 4.2 기능 스위치
 
-모든 스위치는 `model.<name>=...` Hydra 오버라이드로 바꾼다. 모듈은 항상 생성·실행하고
-shape과 파라미터 수를 유지한다.
+모든 스위치는 `model.<name>=...` Hydra 오버라이드로 바꾼다. 검색을 제외한 스위치는
+**0-치환**이다: 모듈은 항상 생성·실행하고 결과 텐서만 0으로 바꿔 shape과 파라미터 수를
+유지한다.
 
 | 스위치 | 기본 | false일 때 |
 |---|---|---|
-| `use_daily` / `use_weekly` | true | 해당 브랜치를 gate softmax에서 제외(logit `−inf`) |
-| `use_weather` | true | 정규화 날씨 2채널을 0으로 |
+| `use_retrieval` | false | 검색기·raw grid를 만들지 않고 neural 예측을 그대로 출력 |
+| `use_daily` / `use_weekly` | true | `h_daily` / `h_weekly`를 0으로 (valid mask는 유지) |
+| `use_weather` | true | 정규화 날씨를 0으로 (train 평균에 해당) |
 | `use_calendar` | true | 요일·시간 임베딩을 0으로 |
 | `use_neighbors` | true | masked attention에서 노드가 자기 자신과 sink만 보도록 이웃을 가림 |
-| `use_softplus` | true | `local_pred`에 Softplus를 적용하지 않음 (음수 가능) |
+| `use_branch_attention` | true | 학습된 attention 대신 유효 브랜치 균등 평균 |
+| `use_softplus` | true | neural head의 raw 선형 출력 사용 (음수 가능) |
 | `weather_injection` | `concat` | `cls_add`: 날씨를 LSTM 입력 대신 Transformer 노드 토큰에 더함 |
 
 루트 설정의 `ablation`은 결과 파일 이름·JSON 메타데이터용 라벨이며 모델을 바꾸지 않는다.
-기본값은 `full`이다.
+기본값은 검색 pass와 맞춘 `no-ir`이다.
 
 <details>
 <summary>루트 설정 값 (두 도시 공통, 배치만 다름)</summary>
@@ -251,17 +282,20 @@ shape과 파라미터 수를 유지한다.
 
 ```python
 forward(demand_history, daily_demand, daily_mask, weekly_demand, weekly_mask,
-        weather, hour_of_day, day_of_week, labels=None)
-    -> {'logits': [B,H,W], 'loss'?: scalar}
+        sample_idx, weather, hour_of_day, day_of_week,
+        daily_weather, daily_hour, daily_day_of_week,
+        weekly_weather, weekly_hour, weekly_day_of_week,
+        labels=None) -> {'logits': [B,H,W], 'loss'?: scalar}
 forward_debug(**batch) -> dict   # 분석·검증 전용
 configure_loss(loss_type, *, rmse_weight=None) -> None
 node_delta_parameters() -> tuple[nn.Parameter, ...]
 ```
 
 - `forward`는 HF `Trainer`용으로 `logits`와(라벨이 있으면) `loss`만 반환한다.
-- `forward_debug`는 같은 계산의 전체 결과를 반환한다: `logits`, `local_pred`,
-  `daily_pred`, `weekly_pred`, `gate_weights [B,N,3]`(local, daily, weekly 순),
-  `h_neural`, `daily_valid`, `weekly_valid`, `loss`, `loss_sum`.
+- `forward_debug`는 같은 계산의 전체 결과를 반환한다: `logits`, `prediction`,
+  `prediction_flat`, `neural_pred`, `ir_out`, `lambda_weight`, `attention_weights`,
+  `h_neural`, `h_attn`, `daily_valid`, `weekly_valid`, `loss`, `loss_sum`.
+  검색 pass에서는 `ir_out=None`, `lambda_weight=1`이다.
 - `configure_loss`는 손실을 교체하고 `config.loss_type`(및 `rmse_weight`)을 함께 갱신해
   체크포인트가 마지막 학습 손실을 기록하게 한다.
 - `node_delta_parameters`는 노드별 ΔW 파라미터를 반환한다(적응 꺼짐이면 빈 튜플).
@@ -269,13 +303,14 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
 <details>
 <summary>조립·손실 집계·초기화 세부</summary>
 
-- 생성 시 검증: `height,width,time_step>0`, `local_radius≥0`,
-  `d_model % transformer_heads == 0`, `weekday_dim,hour_dim>0`,
-  `temperature_min/max`, `precipitation_max`가 있고 `temperature_max > temperature_min`,
-  `precipitation_max > 0`, `weather_injection ∈ {concat, cls_add}`, `node_adaptive=true`면
-  `node_adaptive_indices` 필수. 값 검사는 파이썬 값에서 한다(`from_pretrained`의
+- 생성 시 검증: `height,width,time_step>0`, `local_radius≥0`, 검색 반지름 ≥0,
+  `fusion_dim,retrieval_k,retrieval_chunk_size>0`, `d_model % transformer_heads == 0`,
+  `weekday_dim,hour_dim>0`, `weather_mean/std`가 3개씩 있고 std>0,
+  `weather_injection ∈ {concat, cls_add}`, `node_adaptive=true`면
+  `node_adaptive_indices` 필수. 값 검사는 파이썬 리스트에서 한다(`from_pretrained`의
   meta device 초기화와 호환).
-- 버퍼 `local_history.neighbor_direction`은 persistent로 체크포인트에 저장된다.
+- 버퍼 `weather_mean`, `weather_std`, `local_history.neighbor_direction`은 persistent로
+  체크포인트에 저장된다. 검색 CPU cache는 저장하지 않는다.
 - 손실 집계: 요소별 손실(`combined`, `mae`, `demand_split`)은 전체 원소 평균을 `loss`로,
   합을 `loss_sum`으로 낸다. `rmse_mape`는 손실 객체가 스칼라를 직접 반환한다.
 - `_init_weights`는 PyTorch 기본 초기화를 유지하고, 체크포인트에서 오지 않은 노드별
@@ -287,23 +322,19 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
 
 ## 6. 모듈
 
-### 6.1 최근 context (`MergedDemandModel`)
+### 6.1 보조 context (`MergedDemandModel._temporal_extra`)
 
-`(weather [B,k,3], hour_of_day [B,k], day_of_week [B,k]) → extra [B,k,E]`
+`(weather [B,L,3], hour [B,L], day_of_week [B,L]) → extra [B,L,E]`
 
-- 날씨 2채널 (`[B,k,2]`):
-  - `temperature_norm = (기온 − temperature_min) / (temperature_max − temperature_min)`
-  - `precipitation_norm = (강수 + g·적설) / precipitation_max`
-  - `g`(`snow_scale`)는 1로 초기화되는 학습 스칼라다. `precipitation_max`는 `g=1` 기준
-    train 최댓값으로 고정한다(g가 학습 중 바뀌므로 다시 재지 않는다).
-  - clip하지 않으므로 val·test에서 train 범위를 벗어난 값은 [0,1] 밖일 수 있다.
-- `concat`: `E = 2 + weekday_dim + hour_dim = 14` = 날씨 2 ⊕ 요일 임베딩 ⊕ 시간 임베딩.
-- `cls_add`: `E = weekday_dim + hour_dim = 12`. 날씨 2채널은 별도로 `LocalHistoryEncoder`의
-  노드 토큰에 더한다.
+- `concat`: `E = 3 + weekday_dim + hour_dim = 15` =
+  `(weather − weather_mean)/weather_std ⊕ weekday_emb ⊕ hour_emb`.
+- `cls_add`: `E = weekday_dim + hour_dim = 12`. 정규화 날씨는 별도로
+  `LocalHistoryEncoder`의 노드 토큰에 더해지며 주기 브랜치에는 날씨가 들어가지 않는다.
+- 요일·시간 임베딩 테이블(`nn.Embedding(7,·)`, `nn.Embedding(24,·)`)은 세 브랜치가 공유한다.
 
 ### 6.2 `LocalHistoryEncoder`
 
-`forward(demands [B,k,H,W], extra [B,k,E], weather_cls [B,k,2]|None) → h_neural [B,N,history_hidden]`
+`forward(demands [B,k,H,W], extra [B,k,E], weather_cls [B,k,3]|None) → h_neural [B,N,history_hidden]`
 
 시점마다 격자 전체를 한 시퀀스로 인코딩한다. 노드 토큰은 시점당 한 번만 만들고, 이웃 창은
 attention mask로 표현한다.
@@ -312,7 +343,7 @@ attention mask로 표현한다.
 <summary>세부</summary>
 
 1. 노드 토큰: `log1p(max(x,0))` → `FourierScalarEmbedding` → `+ node_embedding[n]`
-   → `[B·k, N, D]` (`cls_add`면 `Linear(2→D)(날씨 2채널)`을 모든 노드 토큰에 더함).
+   → `[B·k, N, D]` (`cls_add`면 `Linear(3→D)(정규화 날씨)`를 모든 노드 토큰에 더함).
    `FourierScalarEmbedding(v) = Linear([v, sin(2π·v·f), cos(2π·v·f)])`,
    `f = exp(log_frequencies)`, `log_frequencies`는 `linspace(-2,2,num_bands)`로 초기화되는
    학습 파라미터.
@@ -332,55 +363,80 @@ attention mask로 표현한다.
 5. 수용 영역은 층마다 넓어진다: `L`층 뒤 노드 출력은 반경 `a·L` 창의 정보를 가진다.
 6. 최종 노드 출력 `[B·N, k, D]`에 `extra`를 브로드캐스트해 붙이고 공유
    `history_lstm (D+E → history_hidden)`의 마지막 hidden을 `h_neural`로 쓴다.
-7. 노드 적응(6.6)이 켜져 있으면 선택된 노드의 hidden만 `W+ΔW` 경로 결과로 덮어쓴다
+7. 노드 적응(6.7)이 켜져 있으면 선택된 노드의 hidden만 `W+ΔW` 경로 결과로 덮어쓴다
    (out-of-place `index_copy`).
 
 </details>
 
-### 6.3 `LinearTrendForecaster` (daily, weekly 각각)
+### 6.3 `PeriodicLSTMEncoder` (daily, weekly 각각)
 
-`forward(values [B,L,N,1], invalid_mask [B,L]) → (pred [B,N], valid [B])`
+`forward(values [B,L,N,1], invalid_mask [B,L], extra [B,L,E]) → (h [B,N,periodic_hidden], valid [B])`
 
-학습 파라미터가 없는 닫힌 식 예측이다. 노드별 lag 수요 수열(오래된 것부터)을 그대로 쓴다.
-
-- 모든 lag가 유효: 위치 `x = 1..L`에 대해 최소제곱 직선 `y = a·x + b`를 맞추고 다음 위치로
-  외삽한다. `pred = a·(L+1) + b`.
-  - `x̄ = (L+1)/2`, `ȳ = mean(y)`, `a = Σ(x−x̄)(y−ȳ) / Σ(x−x̄)²`, `b = ȳ − a·x̄`.
-- 무효 lag가 하나라도 있음: 유효 lag의 단순 평균.
-- 유효 lag가 없음: `valid=False`, `pred=0` (gate에서 제외된다).
-- 결과가 음수면 0으로 clamp한다.
-- `valid[b]` = 유효 lag가 하나 이상인지. 수요는 raw 스케일이다.
+- `valid[b]` = 유효 lag가 하나 이상인지.
 
 <details>
 <summary>세부</summary>
 
-- lag 유효성은 샘플 단위(`[B,L]`)라 노드 축에 공유된다. 분기는 `torch.where`로 계산해
+- 입력 `log1p(max(x,0)) ⊕ extra`를 노드별 시퀀스 `[B·N, L, 1+E]`로 만든다.
+- 무효 lag를 뒤로 보내도록 안정 정렬해 유효 lag만 원래 순서대로 앞에 모은 뒤, LSTM
+  (`1+E → periodic_hidden`)을 전체 길이로 돌리고 각 행의 마지막 유효 시점(`길이−1`) 출력을
+  쓴다. 이는 유효 lag만 넣은 LSTM의 마지막 hidden과 같다. bool index·packing을 쓰지 않아
   GPU→CPU 동기화가 없다.
-- `L ≥ 2`여야 한다. 위치는 lag 순서 index이므로 `lag_radius>0`이면 실제 시간 간격과 다를 수 있다.
-- 예: `[3, 5, 1, 2, 4, 3]` → `a = −0.0571`, `b = 3.2`, `pred = 2.8`.
+- 유효 lag가 없는 행의 출력은 0이다(곱셈으로 0을 만들어 gradient도 0).
 
 </details>
 
-### 6.4 `NodeHourGate` (융합)
+### 6.4 `BranchAttention`
 
-`forward(local_pred, daily_pred, weekly_pred, hour [B], daily_valid [B], weekly_valid [B]) → (prediction [B,N], weights [B,N,3])`
+`forward(h_neural, h_daily, h_weekly, daily_valid, weekly_valid) → (h_attn [B,N,fusion_dim], weights [B,N,3])`
 
-- 학습 파라미터 `gate_logit [N, 24, 3]` (local, daily, weekly 순).
-- `hour`는 예측 시점 `t`의 시각이며 `(hour_of_day[:, -1] + 1) mod 24`로 구한다.
-- 무효이거나 스위치로 끈 브랜치의 logit을 `−inf`로 둔 뒤 softmax한다. 남은 gate의 합은 1이다.
-  local은 항상 유효하다.
-- `prediction = g_local·local_pred + g_daily·daily_pred + g_weekly·weekly_pred`.
-  최종 합에는 Softplus를 적용하지 않는다.
-- 초기값: 모든 (노드, 시각)에서 softmax가 `(0.7, 0.2, 0.1)`이 되도록
-  `gate_logit = log(0.7, 0.2, 0.1)`.
+- 후보 순서는 `[daily, weekly, neural]`. neural 후보는 항상 유효하므로 주기 lag가 전부
+  무효여도 출력이 정의된다.
 
-### 6.5 local 예측 head
+<details>
+<summary>세부</summary>
 
-`local_pred = Softplus(predict_layer(h_neural))`, `predict_layer = Linear(history_hidden → 1)`.
-`use_softplus=false`면 Softplus를 적용하지 않는다. `prediction`을 `[B,H,W]`로 reshape한 것이
-`logits`다.
+- `z_* = Linear(h_*) → fusion_dim`. query는 `W_q z_neural`, key·value는 세 후보의
+  `W_k z`, `W_v z`(bias 없음).
+- score `= q·k / √fusion_dim`, 무효 후보는 dtype 최솟값으로 마스킹 후 softmax.
+  `use_branch_attention=false`면 유효 후보 균등 가중.
+- `h_attn = LayerNorm(z_neural + Linear(Σ w·v))`.
 
-### 6.6 노드별 LSTM 적응 (`node_adaptive`)
+</details>
+
+### 6.5 출력 `NeuralRetrievalGate`
+
+`forward(h_attn, ir_out | None, *, bypass_gate=False) → (neural_pred [B,N], lambda [B,N], prediction [B,N])`
+
+- `neural_pred = Softplus(neural_head(h_attn))` (`use_softplus=false`면 raw).
+- 검색 pass(`bypass_gate=True`): `prediction = neural_pred`, `lambda = 1`.
+  `lambda_layer`는 사용하지 않는다.
+- 검색 켬: `λ = σ(lambda_layer([h_attn, ir_out]))`,
+  `prediction = λ·neural_pred + (1−λ)·ir_out`.
+- `prediction`을 `[B,H,W]`로 reshape한 것이 `logits`다.
+
+### 6.6 `CausalRetrieval` (선택 경로)
+
+`forward(demands [B,k,H,W], sample_idx [B]) → ir_out [B,N]`, `use_retrieval=true`일 때만
+생성된다. 학습 파라미터·gradient가 없다.
+
+<details>
+<summary>세부</summary>
+
+- 생성 시 `retrieval_grid_path`의 `[T,H,W]` 격자를 읽어 모든 시점의 이웃 창
+  (`P_r=(2r+1)²`, `r = retrieval_local_radius ?? local_radius`)을 CPU에 만든다.
+- query: 최근 수요에서 노드별 `[k·P_r]` raw 창(격자 밖 0)을 잘라 L2 정규화. 후보 시점 τ의
+  창은 `[τ−k, τ)`.
+- 후보 범위: `τ ∈ [k, end)`, `end = t`(`observed_past`) 또는 `min(t, retrieval_train_end)`
+  (`train_prefix`). 예측 시점과 미래는 후보가 될 수 없다.
+- 코사인 유사도 top-`retrieval_k`를 `retrieval_chunk_size` 단위로 병합하고,
+  softmax(score) 가중으로 각 τ의 수요 `grid[τ]`를 평균한다. 후보가 없으면 0.
+- 결과는 `t`별 CPU cache에 저장해 재사용한다.
+- grid 경로가 없으면 0을 반환한다.
+
+</details>
+
+### 6.7 노드별 LSTM 적응 (`node_adaptive`)
 
 선택된 노드 `A`개에만 `history_lstm` 가중치 offset을 준다.
 
@@ -473,7 +529,7 @@ python train.py --config-name config_<city> "description='실험 설명'" \
 - **조기 종료**: `min_epochs` 이전 평가는 무시하고 이후 `early_stopping_patience`
   epoch 동안 개선이 없으면 멈춘다.
 - **SDPA 배치 제한**: `attention_dropout>0`일 때만 batch를
-  `max(1, 65535 // k)`로 제한한다(샘플당 attention 시퀀스 k개).
+  `max(1, 65535 // (k·H·W))`로 제한한다.
 - **`stage2.init_from`** (적응 켬 전용): 저장된 stage 1 체크포인트에서 가중치만 이어받고
   stage 1을 건너뛴다. 저장·요청 config는 적응 노드 관련 필드와 메타데이터 외에 같아야
   하고, 저장된 ΔW는 모두 0이어야 한다. ΔW는 새 노드 목록으로 0부터 다시 만든다.
@@ -481,7 +537,7 @@ python train.py --config-name config_<city> "description='실험 설명'" \
 - **`limit_samples`**: 각 split 앞쪽 N개만 쓰는 스모크용.
 - **결과 JSON**: `run_json`이 있으면 그 경로, 없으면
   `output/<project_name>/runs/<city>_<loss_type>_<ablation>[_nodeadaptive]_seed<seed>.json`.
-  데이터 경로, 날씨 정규화 통계(`temperature_min/max`, `precipitation_max`), 장치, 목적함수·stage 손실, ablation 라벨과 스위치 값, seed,
+  데이터 경로, 날씨 통계, 장치, 목적함수·stage 손실, ablation 라벨과 스위치 값, seed,
   적응 노드 정보, stage별 기록, 최적 epoch·검증 손실, 체크포인트 경로, test 지표
   (`loss`, `mae`, `rmse`, `mape_plus1`, `mape_excl_zero`), epoch별 history를 담는다.
 
@@ -509,15 +565,15 @@ python test.py <checkpoint_dir> --city {ulsan,porto} --weather_csv_path <csv> \
 <details>
 <summary>검사 목록</summary>
 
-- 도시별 실제 데이터: split 경계 일관성, logits shape·유한, gate 합 1, end-to-end gradient
-  연결(`predict_layer`, `gate_logit`, `snow_scale`, 임베딩), 날씨 민감도, label·lag가 절대
-  시간 격자와 일치.
-- `LinearTrendForecaster`: 모두 유효하면 `numpy.polyfit` 직선 외삽과 일치, 음수는 0으로
-  clamp, 무효 lag가 있으면 유효 lag 평균, 모두 무효면 `valid=False`.
-- `NodeHourGate`: 초기 가중치 `(0.7, 0.2, 0.1)`, 무효·꺼진 브랜치 가중치 0, 합 1.
+- 도시별 실제 데이터: split 경계 일관성, logits shape·유한·비음수, attention 합 1,
+  end-to-end gradient 연결, 날씨 민감도, label·lag가 절대 시간 격자와 일치.
+- 주기 lag가 모두 무효일 때 neural 후보로 대체.
+- 날씨·캘린더 채널이 lag 압축 뒤에도 유지되고 기준 LSTM과 일치.
 - ΔW=0 적응 경로가 `nn.LSTM`과 일치하고 비적응 노드는 비트 단위 동일.
+- 검색 후보가 `τ < t`만 사용.
+- Transformer 3×3에서 검색 창 3×3·5×5 선택이 forward에 반영.
+- 검색 pass: grid 없이 생성·예측·체크포인트 복원, `prediction = neural_pred`, `λ=1`.
 - masked Transformer 수용 영역: 1층은 반경 1, 2층은 반경 2 밖 수요에 무반응(eval·no_grad).
-- `save_pretrained`→`from_pretrained` 왕복 후 예측 동일.
 
 </details>
 
@@ -532,17 +588,16 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
 
 | 스크립트 | 동작 | 출력 |
 |---|---|---|
-| `DESCRIPTION=... run_seeds.sh <city> <loss> [seeds]` | 기본 5시드 `245 6835 851 5123 535` | `output/merged/runs/<city>_<loss>_seed<seed>.json`, `output/merged/logs/` |
-| `run_ablation.sh build` / `DESCRIPTION=... run_ablation.sh worker <gpu> <slot>` | 3시드 `245 6835 851`, ablation 큐. description에 ablation·도시·시드를 덧붙임 | `output/merged/runs/<city>_mae_<ab>_zero_seed<seed>.json` |
+| `DESCRIPTION=... run_seeds.sh <city> <loss> [seeds]` | 기본 5시드 `245 6835 851 5123 535`, 검색 켬(`model.use_retrieval=true`) | `output/merged/runs/<city>_<loss>_seed<seed>.json`, `output/merged/logs/` |
+| `run_ablation.sh build` / `DESCRIPTION=... run_ablation.sh worker <gpu> <slot>` | 3시드 `245 6835 851`, ablation 큐. `no-ir` 외에는 검색 켬 기준. description에 ablation·도시·시드를 덧붙임 | `output/merged/runs/<city>_mae_<ab>_zero_seed<seed>.json` |
 
 - `output`은 외장 디스크 `/mnt/hdd/jinsu_extention_disk/gir`을 가리키는 symlink이며
   git 추적 대상이 아니다.
 - 이전 실험 기록은 모두 `output/past/`에 있다.
 - **채택 모델**은 `output/adopted/`에 둔다: 결과 JSON은 `runs/`, 체크포인트·학습 로그·GPU 사용률
   기록은 `checkpoints/`의 같은 이름 폴더. 현재 채택 모델은 커밋 `b79e824`,
-  `local_radius=1`(3×3), 검색 pass, 5시드(245/6835/851/5123/535)
-  `maskedgrid3_{ulsan,porto}_seed{seed}_b79e824`이다. 그 뒤 구조(주기 LSTM·BranchAttention·검색)를
-  바꿨으므로 이 체크포인트는 해당 커밋의 코드로만 불러올 수 있다.
+  `local_radius=1`(3×3, 현재 기본값), 검색 pass, 5시드(245/6835/851/5123/535)
+  `maskedgrid3_{ulsan,porto}_seed{seed}_b79e824`이다.
 
 ---
 

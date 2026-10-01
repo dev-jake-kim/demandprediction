@@ -30,7 +30,7 @@ for seed in "${SEEDS[@]}"; do
   # 도시별 model 그룹을 선택하려면 --config-name이 필요하다.
   PYTHONUNBUFFERED=1 conda run --no-capture-output -n DA \
     python train.py --config-name "config_${DATASET}" \
-      train.seed="$seed" model.loss_type="$LOSS_TYPE" \
+      train.seed="$seed" model.loss_type="$LOSS_TYPE" model.use_retrieval=true \
       "description='${DESCRIPTION}'" \
       ablation=full run_json="$out" > "$log" 2>&1
   echo "[done] seed=$seed $(python3 -c "

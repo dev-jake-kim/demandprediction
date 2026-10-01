@@ -12,8 +12,9 @@ conda activate DA
 
 ## 모델
 
-로컬 히스토리 인코더(masked Transformer + LSTM)의 예측과 daily/weekly lag의 직선 외삽 예측을
-노드×시각별 softmax gate로 섞는 `MergedDemandModel`이다. 세부 사양은 `docs/SPEC.md`.
+로컬 히스토리 인코더 + daily/weekly 주기 브랜치 + 브랜치 어텐션을
+`MergedDemandModel`로 합쳤다. 기본값은 검색 pass(neural 예측만 사용)이고,
+`model.use_retrieval=true`를 명시하면 인과적 검색과 출력 게이트를 켠다.
 
 ## 학습 (train.py)
 
@@ -22,9 +23,10 @@ Hydra로 설정을 관리한다. 루트 config가 도시별로 분리돼 있다
 + `configs/model/merged_porto.yaml`, 둘 다 `configs/dataset/*.yaml` 공유).
 
 ```bash
-python train.py "description='실험 설명'"                              # ulsan
-python train.py --config-name config_porto "description='실험 설명'"  # porto
-python validate_merged.py --device cpu                                # 학습 전 빠른 구조/인과 검사
+python train.py "description='실험 설명'"                                  # ulsan, 검색 pass (기본값)
+python train.py --config-name config_porto "description='실험 설명'"      # porto, 검색 pass
+python train.py "description='실험 설명'" model.use_retrieval=true ablation=full   # 검색 켬
+python validate_merged.py --device cpu                     # 학습 전 빠른 구조/인과 검사
 ```
 
 `description`은 필수이며, 로그 맨 위에 `[Description]`과 `[Commit]`(HEAD 해시, 미커밋 변경 시

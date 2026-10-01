@@ -1,42 +1,37 @@
-"""Node-by-hour softmax fusion of local, daily, and weekly predictions."""
+"""Final neural/retrieval prediction gate."""
 
 from __future__ import annotations
 
-import math
-
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
-GATE_INIT = (0.7, 0.2, 0.1)  # local, daily, weekly
 
+class NeuralRetrievalGate(nn.Module):
+    """Combine neural and retrieval predictions with an optional gate."""
 
-class NodeHourGate(nn.Module):
-    """``(노드, 예측 시각)``별 softmax 가중치로 세 예측을 섞는다."""
-
-    def __init__(self, num_nodes: int) -> None:
+    def __init__(self, fusion_dim: int, use_softplus: bool = True) -> None:
         super().__init__()
-        init = torch.tensor([math.log(value) for value in GATE_INIT])
-        self.gate_logit = nn.Parameter(init.expand(num_nodes, 24, len(GATE_INIT)).clone())
+        self.neural_head = nn.Linear(fusion_dim, 1)
+        self.lambda_layer = nn.Linear(fusion_dim + 1, 1)
+        self.use_softplus = use_softplus
 
     def forward(
-        self,
-        local_pred: Tensor,
-        daily_pred: Tensor,
-        weekly_pred: Tensor,
-        hour: Tensor,
-        daily_valid: Tensor,
-        weekly_valid: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        """``[B,N]`` 예측 셋, ``[B]`` 시각·유효 -> (``[B,N]`` 예측, ``[B,N,3]`` 가중치)."""
+        self, h_attn: Tensor, ir_out: Tensor | None, *, bypass_gate: bool = False
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        raw = self.neural_head(h_attn).squeeze(-1)
+        neural_pred = F.softplus(raw) if self.use_softplus else raw
 
-        logits = self.gate_logit[:, hour].transpose(0, 1)  # [B,N,3]
-        usable = torch.stack(
-            [torch.ones_like(daily_valid), daily_valid, weekly_valid], dim=-1
-        ).bool()  # [B,3]
-        logits = logits.masked_fill(~usable[:, None, :], float('-inf'))
-        weights = torch.softmax(logits, dim=-1)
-        stacked = torch.stack([local_pred, daily_pred, weekly_pred], dim=-1)
-        return (weights * stacked).sum(dim=-1), weights
+        if bypass_gate:
+            lambda_weight = torch.ones_like(neural_pred)
+            return neural_pred, lambda_weight, neural_pred
+
+        assert ir_out is not None, "bypass_gate=False면 ir_out이 필요함"
+        lambda_weight = torch.sigmoid(
+            self.lambda_layer(torch.cat([h_attn, ir_out.unsqueeze(-1)], dim=-1))
+        ).squeeze(-1)
+        prediction = lambda_weight * neural_pred + (1.0 - lambda_weight) * ir_out
+        return neural_pred, lambda_weight, prediction
 
 
-__all__ = ["GATE_INIT", "NodeHourGate"]
+__all__ = ["NeuralRetrievalGate"]

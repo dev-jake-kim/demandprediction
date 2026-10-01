@@ -113,7 +113,7 @@ class UnifiedDemandDataset(Dataset):
     """One sample per target time from a ``[T, H, W]`` temporal grid.
 
     ``daily_mask`` and ``weekly_mask`` use ``True`` for invalid lags.
-    ``indices[i]`` is the absolute target time of sample ``i``.
+    ``sample_idx`` is the absolute index in the original temporal grid.
     """
 
     def __init__(
@@ -174,8 +174,29 @@ class UnifiedDemandDataset(Dataset):
 
         self.weather = load_weather_table(weather_csv_path, self.total_steps)
         self.weather_csv_path = Path(weather_csv_path).expanduser().resolve()
+        all_times = np.arange(self.total_steps, dtype=np.int64)
+        self.hour_table, self.day_of_week_table = _calendar_features(all_times)
+
         self.daily_values, self.daily_mask = self._make_lag_table(self.daily_lag_values)
         self.weekly_values, self.weekly_mask = self._make_lag_table(self.weekly_lag_values)
+        self.daily_context = self._make_lag_context(self.daily_lag_values)
+        self.weekly_context = self._make_lag_context(self.weekly_lag_values)
+
+    def _make_lag_context(self, lags: np.ndarray) -> dict[str, np.ndarray]:
+        """Build lag-time weather/calendar context arrays; invalid sources are zeroed."""
+
+        source_times = np.arange(self.total_steps, dtype=np.int64)[:, None] - lags[None, :]
+        valid = source_times >= 0
+        safe_times = np.clip(source_times, 0, self.total_steps - 1)
+
+        weather = np.where(valid[..., None], self.weather[safe_times], 0.0).astype(np.float32)
+        hour = np.where(valid, self.hour_table[safe_times], 0).astype(np.int64)
+        day_of_week = np.where(valid, self.day_of_week_table[safe_times], 0).astype(np.int64)
+        return {
+            'weather': np.ascontiguousarray(weather),
+            'hour': np.ascontiguousarray(hour),
+            'day_of_week': np.ascontiguousarray(day_of_week),
+        }
 
     def _make_lag_table(self, lags: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         source_times = np.arange(self.total_steps, dtype=np.int64)[:, None] - lags[None, :]
@@ -207,9 +228,16 @@ class UnifiedDemandDataset(Dataset):
             'weekly_demand': torch.from_numpy(self.weekly_values[target_time]),
             'weekly_mask': torch.from_numpy(self.weekly_mask[target_time]),
             'labels': torch.from_numpy(np.array(target, dtype=np.float32, copy=True)),
+            'sample_idx': torch.tensor(target_time, dtype=torch.long),
             'weather': torch.from_numpy(np.array(recent_weather, dtype=np.float32, copy=True)),
             'hour_of_day': torch.from_numpy(recent_hour),
             'day_of_week': torch.from_numpy(recent_day_of_week),
+            'daily_weather': torch.from_numpy(self.daily_context['weather'][target_time]),
+            'daily_hour': torch.from_numpy(self.daily_context['hour'][target_time]),
+            'daily_day_of_week': torch.from_numpy(self.daily_context['day_of_week'][target_time]),
+            'weekly_weather': torch.from_numpy(self.weekly_context['weather'][target_time]),
+            'weekly_hour': torch.from_numpy(self.weekly_context['hour'][target_time]),
+            'weekly_day_of_week': torch.from_numpy(self.weekly_context['day_of_week'][target_time]),
         }
 
     @property
