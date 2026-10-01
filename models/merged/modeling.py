@@ -150,6 +150,7 @@ class MergedDemandModel(PreTrainedModel):
                 retrieval_chunk_size=config.retrieval_chunk_size,
                 retrieval_train_end=config.retrieval_train_end,
                 future_mask_hours=config.retrieval_future_mask_hours,
+                query_measure=config.retrieval_query_measure,
             )
             if self.use_retrieval else None
         )
@@ -164,6 +165,8 @@ class MergedDemandModel(PreTrainedModel):
                 config.history_hidden,
                 config.retrieval_embedding_dim,
                 int(config.retrieval_value_cap),
+                fallback_tau=float(config.retrieval_fallback_tau),
+                learn_tau=bool(config.retrieval_fallback_learn_tau),
             )
             if self.use_retrieval else None
         )
@@ -266,12 +269,12 @@ class MergedDemandModel(PreTrainedModel):
         weather_cls = self._weather_features(weather) if self.weather_cls_dim else None
         h_neural = self.local_history(demand_history, recent_extra, weather_cls)
         if self.retrieval is not None:
-            retrieval_scores, retrieval_values, retrieval_query_mean = self.retrieval(sample_idx)
+            retrieval_scores, retrieval_values, retrieval_query_measure = self.retrieval(sample_idx)
             h_local = self.retrieval_fusion(
-                h_neural, retrieval_scores, retrieval_values, retrieval_query_mean
+                h_neural, retrieval_scores, retrieval_values, retrieval_query_measure
             )
         else:
-            retrieval_scores = retrieval_values = retrieval_query_mean = None
+            retrieval_scores = retrieval_values = retrieval_query_measure = None
             h_local = h_neural
         # Ablation은 브랜치 출력을 0으로 바꾸되 valid mask와 모듈 shape은 유지한다.
         h_daily, daily_valid = self.daily_branch(daily_demand, daily_mask, daily_extra)
@@ -296,7 +299,7 @@ class MergedDemandModel(PreTrainedModel):
             'h_local': h_local,
             'retrieval_scores': retrieval_scores,
             'retrieval_values': retrieval_values,
-            'retrieval_query_mean': retrieval_query_mean,
+            'retrieval_query_measure': retrieval_query_measure,
             'h_attn': h_attn,
             'daily_valid': daily_valid,
             'weekly_valid': weekly_valid,

@@ -228,6 +228,8 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | | `retrieval_k`, `retrieval_chunk_size` | 20, 256 |
 | | `retrieval_future_mask_hours` | 72 (train 모드에서 `[t, t+72h]` 후보 제외, `≥ time_step`) |
 | | `retrieval_embedding_dim` | 16 (수요 bucket embedding 차원) |
+| | `retrieval_query_measure` | `mean` (O 혼합의 m: `mean` 질의 평균 / `nonzero_count` 질의의 0 아닌 칸 수) |
+| | `retrieval_fallback_tau`, `retrieval_fallback_learn_tau` | 1.0, false (`w = e^{−m/τ}`, 학습 시 τ는 이 값에서 시작) |
 | 노드 적응 | `node_adaptive`, `node_adaptive_min_demand` | true, 0.1 |
 | 손실 | `loss_type` | `mae` |
 | | `loss_gamma`, `loss_eps`, `rmse_weight`, `split_threshold`, `split_high_weight` | 1.0, 0.5, 10.0, 1.0, 1.0 |
@@ -298,7 +300,7 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
 - `forward`는 HF `Trainer`용으로 `logits`와(라벨이 있으면) `loss`만 반환한다.
 - `forward_debug`는 같은 계산의 전체 결과를 반환한다: `logits`, `prediction`,
   `prediction_flat`, `attention_weights`, `h_neural`, `h_local`, `h_attn`, `retrieval_scores`,
-  `retrieval_values`, `retrieval_query_mean`, `daily_valid`, `weekly_valid`, `loss`, `loss_sum`.
+  `retrieval_values`, `retrieval_query_measure`, `daily_valid`, `weekly_valid`, `loss`, `loss_sum`.
   검색 끔에서는 세 검색 출력이 None,
   `h_local = h_neural`이다.
 - `configure_loss`는 손실을 교체하고 `config.loss_type`(및 `rmse_weight`)을 함께 갱신해
@@ -455,8 +457,10 @@ reshape한 것이 `logits`다. 검색 결과는 출력에서 섞지 않고 6.6�
     Ulsan(cap 7): `{0},{1},{2},{3},{4},{5,6},{≥7}`, Porto(cap 21): `…,{14–18},{19,20},{≥21}`.
   - `e_p = Σ_i sigmoid(a·s_i + b) · Embedding(bucket(V_i[p]))` (`Embedding` 16차원, 칸끼리 공유,
     `a=1`, `b=0`으로 시작하는 학습 스칼라). 빈 칸(`s = −inf`)의 가중치는 0이다.
-  - `C = [e_1 ⊕ … ⊕ e_{P_r}]`, `m` = 질의 Q(`[t−k, t)` × 3×3 raw 수요, 격자 밖 0) `k·P_r`개 값의 평균,
-    `O` = 0에서 시작하는 학습 벡터 `[P_r·16]`. `R = (1 − e^{−m})·C + e^{−m}·O`.
+  - `C = [e_1 ⊕ … ⊕ e_{P_r}]`. `m`은 질의 Q(`[t−k, t)` × 3×3 raw 수요, 격자 밖 0)의 크기로,
+    `retrieval_query_measure=mean`이면 `k·P_r`개 값의 평균, `nonzero_count`면 0이 아닌 칸 수(0~`k·P_r`).
+    `O` = 0에서 시작하는 학습 벡터 `[P_r·16]`. `w = e^{−m/τ}`, `R = (1 − w)·C + w·O`.
+    τ는 `retrieval_fallback_tau`이고, `retrieval_fallback_learn_tau=true`면 `log τ`를 학습한다.
     질의가 전부 0이면(m=0) 유사도가 모두 0이라 top-k가 동점 중 임의 후보가 되므로 `R = O`다.
   - `h_local = Linear(history_hidden + P_r·16 → history_hidden)([h_neural ⊕ R])`
   - `h_local`이 `BranchAttention`의 neural 후보·query로 `h_neural`을 대신한다.
@@ -618,7 +622,7 @@ python test.py <checkpoint_dir> --city {ulsan,porto} --weather_csv_path <csv> \
   거부, train 모드에서 `y_t`나 train 구간 밖 값을 바꿔도, eval 모드에서 `t` 이후 값을 바꿔도
   결과[t](유사도·V)가 그대로.
 - 검색 융합: bucket 경계·배정, 빈 후보 칸 무시, m=0이면 검색 결과와 무관하게 `O`만 사용. 검색 켬
-  eval forward가 eval 모드 표를 쓰고, m이 `demand_history` 창 평균과 같고, embedding·`a`·`O`에
+  eval forward가 eval 모드 표를 쓰고, m(평균·0 아닌 칸 수)이 `demand_history` 창에서 계산한 값과 같고, embedding·`a`·`O`·(학습 시) τ에
   gradient가 흐르며, 체크포인트 복원 후 예측이 같다.
 - Transformer 3×3에서 검색 창 3×3·5×5 선택이 forward에 반영.
 - 검색 끔: grid 없이 생성·예측·체크포인트 복원, `h_local = h_neural`, 검색 출력 None.

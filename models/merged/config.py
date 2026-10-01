@@ -36,6 +36,9 @@ class MergedDemandConfig(PretrainedConfig):
         retrieval_future_mask_hours: int = 72,
         retrieval_value_cap: int | None = None,
         retrieval_embedding_dim: int = 16,
+        retrieval_query_measure: str = 'mean',
+        retrieval_fallback_tau: float = 1.0,
+        retrieval_fallback_learn_tau: bool = False,
         temperature_min: float | None = None,
         temperature_max: float | None = None,
         precipitation_max: float | None = None,
@@ -85,6 +88,11 @@ class MergedDemandConfig(PretrainedConfig):
         # train 구간 상위 0.5% 수요 경계(train.py가 주입). 이 값 이상은 한 embedding bucket이다.
         self.retrieval_value_cap = retrieval_value_cap
         self.retrieval_embedding_dim = retrieval_embedding_dim
+        # O 혼합 가중치 w = e^{−m/τ}. m: 'mean'(질의 평균) | 'nonzero_count'(질의의 0 아닌 칸 수).
+        # learn_tau면 τ는 이 값에서 시작해 학습한다.
+        self.retrieval_query_measure = retrieval_query_measure
+        self.retrieval_fallback_tau = retrieval_fallback_tau
+        self.retrieval_fallback_learn_tau = retrieval_fallback_learn_tau
         # train 구간 통계. precipitation_max는 snow_scale=1 기준으로 고정한다.
         self.temperature_min = temperature_min
         self.temperature_max = temperature_max

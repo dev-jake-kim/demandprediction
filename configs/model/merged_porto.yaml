@@ -17,6 +17,10 @@ retrieval_k: 20
 retrieval_chunk_size: 256
 # 학습(train 모드)에서 [t, t+72h] 후보를 가린다. 평가(eval 모드)는 t 이전만 후보다.
 retrieval_future_mask_hours: 72
+# 검색 결과 C와 학습 벡터 O 혼합: (1-w)C + wO, w = e^(-m/τ). m은 mean | nonzero_count.
+retrieval_query_measure: mean
+retrieval_fallback_tau: 1.0
+retrieval_fallback_learn_tau: false
 # 날씨 특성은 임베딩 없이 3개 채널로 주입한다.
 weekday_dim: 7
 hour_dim: 5

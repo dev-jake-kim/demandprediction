@@ -412,30 +412,33 @@ def _check_independent_retrieval_radius() -> dict:
             daily_weather=weather, daily_hour=time, daily_day_of_week=time,
             weekly_weather=weather, weekly_hour=time, weekly_day_of_week=time,
         )
-        for radius in (1, 2):
+        # 반경 1은 m=평균·고정 τ, 반경 2는 m=0 아닌 칸 수·학습 τ로 검사한다.
+        for radius, measure, learn_tau in ((1, 'mean', False), (2, 'nonzero_count', True)):
             config = MergedDemandConfig(
                 height=3, width=3, time_step=2, local_radius=1, retrieval_local_radius=radius,
                 d_model=8, transformer_heads=2, transformer_layers=1,
                 retrieval_grid_path=str(path), retrieval_k=2, retrieval_train_end=10, retrieval_value_cap=7,
+                retrieval_query_measure=measure, retrieval_fallback_tau=0.5,
+                retrieval_fallback_learn_tau=learn_tau,
                 temperature_min=-5.0, temperature_max=30.0, precipitation_max=20.0,
             )
             model = MergedDemandModel(config).eval()
             with torch.no_grad():
                 output = model._compute(**inputs)
-            scores, values, query_mean = model.retrieval(sample_idx)
+            scores, values, _ = model.retrieval(sample_idx)
             if model.local_history.num_neighbors != 9:
                 raise AssertionError('Transformer window is not 3×3')
             if tuple(output['retrieval_values'].shape) != (1, 9, 2, (2 * radius + 1) ** 2):
                 raise AssertionError(f'Retrieval values do not use radius {radius}')
             if not (torch.equal(output['retrieval_scores'], scores) and torch.equal(output['retrieval_values'], values)):
                 raise AssertionError('eval forward did not use the eval-mode table')
-            # m은 입력 demand_history의 [t-k, t) × 반경 r 창(격자 밖 0) 평균과 같아야 한다.
+            # m은 입력 demand_history의 [t-k, t) × 반경 r 창(격자 밖 0)에서 계산한 값과 같아야 한다.
             window = 2 * radius + 1
-            expected_mean = torch.nn.functional.unfold(
-                history.reshape(-1, 1, 3, 3), window, padding=radius
-            ).mean(dim=1).mean(dim=0)  # [N]
-            if not torch.allclose(output['retrieval_query_mean'][0], expected_mean, atol=1e-6):
-                raise AssertionError('retrieval query mean does not match the demand_history window')
+            source = history if measure == 'mean' else (history > 0).float()
+            crops = torch.nn.functional.unfold(source.reshape(-1, 1, 3, 3), window, padding=radius)
+            expected_measure = crops.mean(dim=1).mean(dim=0) if measure == 'mean' else crops.sum(dim=(0, 1))
+            if not torch.allclose(output['retrieval_query_measure'][0], expected_measure, atol=1e-6):
+                raise AssertionError(f'retrieval query {measure} does not match the demand_history window')
             model.train()
             model._compute(**inputs)['logits'].sum().backward()
             fusion = model.retrieval_fusion
@@ -443,6 +446,7 @@ def _check_independent_retrieval_radius() -> dict:
                 ('embedding', fusion.value_embedding.weight),
                 ('score_scale', fusion.score_scale),
                 ('fallback_embedding', fusion.fallback_embedding),
+                *((('fallback_log_tau', fusion.fallback_log_tau),) if learn_tau else ()),
             ):
                 if param.grad is None or not bool(param.grad.abs().sum() > 0):
                     raise AssertionError(f'retrieval fusion {name} receives no gradient')
