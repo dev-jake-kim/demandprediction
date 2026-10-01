@@ -603,10 +603,12 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
   git 추적 대상이 아니다.
 - 이전 실험 기록은 모두 `output/past/`에 있다.
 - **채택 모델**은 `output/adopted/`에 둔다: 결과 JSON은 `runs/`, 체크포인트·학습 로그·GPU 사용률
-  기록은 `checkpoints/`의 같은 이름 폴더. 현재 채택 모델은 커밋 `b79e824`,
-  `local_radius=1`(3×3, 현재 기본값), 검색 pass, 5시드(245/6835/851/5123/535)
-  `maskedgrid3_{ulsan,porto}_seed{seed}_b79e824`이다. 이후 날씨 입력을 2채널(강수 + g·적설)로
-  바꿨으므로 이 체크포인트는 커밋 `b79e824`의 코드로만 불러올 수 있다.
+  기록은 `checkpoints/`의 같은 이름 폴더. 현재 채택 모델은 커밋 `8d28250`(날씨 2채널: 기온,
+  강수 + g·적설, min-max), `local_radius=1`(3×3), 검색 pass, 시드 245
+  `weathermerge_{ulsan,porto}_seed245_8d28250`이다.
+- 이전 채택 모델(커밋 `b79e824`, 날씨 3채널 z-score, 5시드
+  `maskedgrid3_{ulsan,porto}_seed{seed}_b79e824`)은 `output/past/adopted_b79e824/`에 있으며
+  커밋 `b79e824`의 코드로만 불러올 수 있다.
 
 ---
 
