@@ -71,6 +71,7 @@ class CausalRetrieval(nn.Module):
         self._crops: Tensor | None = None
         # 체크포인트에 저장하지 않는 장치별 사본.
         self._device_crops: dict[torch.device, Tensor] = {}
+        self._query_means: dict[torch.device, Tensor] = {}
         # (training, device) -> (scores [T,N,K], times [T,N,K]).
         self._tables: dict[tuple[bool, torch.device], tuple[Tensor, Tensor]] = {}
         if retrieval_grid_path is not None:
@@ -91,6 +92,7 @@ class CausalRetrieval(nn.Module):
         # [T, N, P]: 시점별 노드 창(격자 밖 0, 행 우선).
         self._crops = patches.transpose(1, 2).contiguous()
         self._device_crops.clear()
+        self._query_means.clear()
         self._tables.clear()
         self.grid_path = str(path)
 
@@ -101,6 +103,21 @@ class CausalRetrieval(nn.Module):
         if cached is None:
             cached = self._crops.to(device)
             self._device_crops[device] = cached
+        return cached
+
+    def query_means(self, device: torch.device) -> Tensor:
+        """``[T, N]`` 질의 창(``[t-k, t)`` × 3×3 raw 수요, 격자 밖 0)의 평균 m. ``t < k``는 0."""
+
+        device = torch.device(device)
+        cached = self._query_means.get(device)
+        if cached is None:
+            crops = self.crops(device)
+            total, k = crops.shape[0], self.time_step
+            cached = crops.new_zeros(total, crops.shape[1])
+            if total > k:
+                # unfold의 c번째 창 [c, c+k)는 시점 t = c + k의 질의다.
+                cached[k:] = crops.mean(dim=-1).unfold(0, k, 1)[: total - k].mean(dim=-1)
+            self._query_means[device] = cached
         return cached
 
     def candidate_mask(self, target_times: Tensor, candidate_times: Tensor, training: bool) -> Tensor:
@@ -172,33 +189,37 @@ class CausalRetrieval(nn.Module):
             self._tables[key] = cached
         return cached
 
-    def forward(self, sample_idx: Tensor) -> tuple[Tensor, Tensor]:
-        """``[B]`` 절대 예측 시점 -> ``(scores [B,N,K], values [B,N,K,P])``. 모드는 ``self.training``.
+    def forward(self, sample_idx: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """``[B]`` 절대 예측 시점 -> ``(scores [B,N,K], values [B,N,K,P], query_mean [B,N])``.
+        모드는 ``self.training``.
 
         허용 후보가 없는 칸은 score가 ``-inf``다(values는 의미 없음).
         """
 
         device = sample_idx.device
         table = self.table(self.training, device)
+        batch = sample_idx.shape[0]
         if table is None:
-            batch = sample_idx.shape[0]
             return (
                 torch.full((batch, self.num_nodes, 1), float('-inf'), device=device),
                 torch.zeros(batch, self.num_nodes, 1, self.num_neighbors, device=device),
+                torch.zeros(batch, self.num_nodes, device=device),
             )
         scores, times = table
         index = sample_idx.long()
         picked_times = times[index]  # [B, N, K]
         node_index = torch.arange(self.num_nodes, device=device).view(1, -1, 1)
         values = self.crops(device)[picked_times, node_index]  # [B, N, K, P]
-        return scores[index], values
+        return scores[index], values, self.query_means(device)[index]
 
 
 class RetrievalFusion(nn.Module):
-    """검색 후보마다 ``sigmoid(a·s + b) · Embedding(bucket(v))``를 만들어 후보 합을 구하고
-    ``h_neural``과 concat해 ``Linear``로 ``history_hidden``에 맞춘다.
+    """검색 후보마다 ``sigmoid(a·s + b) · Embedding(bucket(v))``를 만들어 후보 합 ``C``를 구하고,
+    질의 평균 ``m``으로 학습 벡터 ``O``와 섞은 ``(1 − e^{−m})·C + e^{−m}·O``를 ``h_neural``과
+    concat해 ``Linear``로 ``history_hidden``에 맞춘다.
 
     ``v``는 후보 τ의 3×3 창 수요 ``P``개이며 칸별로 embedding을 따로 합한 뒤 ``[P·E]``로 편다.
+    질의가 전부 0이면(m=0) 유사도가 모두 0이라 top-k가 무의미하므로 결과는 ``O``가 된다.
     """
 
     def __init__(
@@ -211,18 +232,22 @@ class RetrievalFusion(nn.Module):
         self.value_embedding = nn.Embedding(len(bounds), embedding_dim)
         self.score_scale = nn.Parameter(torch.tensor(1.0))
         self.score_bias = nn.Parameter(torch.tensor(0.0))
+        # O: 질의 수요가 적을수록 검색 결과 대신 쓰는 학습 벡터. 0에서 시작한다.
+        self.fallback_embedding = nn.Parameter(torch.zeros(num_neighbors * embedding_dim))
         self.fuse = nn.Linear(history_hidden + num_neighbors * embedding_dim, history_hidden)
 
     def bucketize(self, values: Tensor) -> Tensor:
         return torch.bucketize(values, self.bucket_bounds, right=True) - 1
 
-    def forward(self, h_neural: Tensor, scores: Tensor, values: Tensor) -> Tensor:
+    def forward(self, h_neural: Tensor, scores: Tensor, values: Tensor, query_mean: Tensor) -> Tensor:
         valid = torch.isfinite(scores)
         gate = torch.sigmoid(self.score_scale * scores.masked_fill(~valid, 0.0) + self.score_bias)
         gate = (gate * valid).to(h_neural.dtype)  # [B, N, K]
         embedded = self.value_embedding(self.bucketize(values))  # [B, N, K, P, E]
-        summed = (gate[..., None, None] * embedded).sum(dim=2)  # [B, N, P, E]
-        return self.fuse(torch.cat([h_neural, summed.flatten(2)], dim=-1))
+        retrieved = (gate[..., None, None] * embedded).sum(dim=2).flatten(2)  # C [B, N, P·E]
+        fallback_weight = torch.exp(-query_mean.to(h_neural.dtype)).unsqueeze(-1)  # e^{−m}
+        blended = (1.0 - fallback_weight) * retrieved + fallback_weight * self.fallback_embedding
+        return self.fuse(torch.cat([h_neural, blended], dim=-1))
 
 
 __all__ = ['CausalRetrieval', 'RetrievalFusion', 'demand_bucket_bounds']

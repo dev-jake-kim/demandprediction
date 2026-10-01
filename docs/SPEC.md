@@ -109,7 +109,7 @@ flowchart TD
         R1["Q: 최근 [t-k, t) 3×3 raw 창<br/>+ 절대 시점 sample_idx=t"]
         R2["후보 τ: K=[τ-k, τ) 3×3 raw 창<br/>V=τ 시점 3×3 수요<br/>train(): τ<train_end, τ∉[t, t+72h]<br/>eval(): τ<t"]
         R3["cosine top-k<br/>유사도 s [B,N,K], V [B,N,K,P_r]"]
-        R4["sigmoid(a·s+b) · Embedding(bucket(V)) 16차원<br/>후보 합 → [B,N,P_r·16]"]
+        R4["sigmoid(a·s+b) · Embedding(bucket(V)) 16차원<br/>후보 합 C [B,N,P_r·16]<br/>(1−e^−m)·C + e^−m·O (m = 질의 평균)"]
         R5["concat [h_neural ⊕ 검색 embedding]<br/>Linear(history_hidden + P_r·16 → history_hidden)<br/>h_local"]
         R1 --> R2 --> R3 --> R4 --> R5
     end
@@ -298,8 +298,8 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
 - `forward`는 HF `Trainer`용으로 `logits`와(라벨이 있으면) `loss`만 반환한다.
 - `forward_debug`는 같은 계산의 전체 결과를 반환한다: `logits`, `prediction`,
   `prediction_flat`, `attention_weights`, `h_neural`, `h_local`, `h_attn`, `retrieval_scores`,
-  `retrieval_values`, `daily_valid`, `weekly_valid`, `loss`, `loss_sum`. 검색 끔에서는
-  `retrieval_scores=retrieval_values=None`,
+  `retrieval_values`, `retrieval_query_mean`, `daily_valid`, `weekly_valid`, `loss`, `loss_sum`.
+  검색 끔에서는 세 검색 출력이 None,
   `h_local = h_neural`이다.
 - `configure_loss`는 손실을 교체하고 `config.loss_type`(및 `rmse_weight`)을 함께 갱신해
   체크포인트가 마지막 학습 손실을 기록하게 한다.
@@ -426,10 +426,10 @@ reshape한 것이 `logits`다. 검색 결과는 출력에서 섞지 않고 6.6�
 
 ### 6.6 검색 (`CausalRetrieval` + 융합, 선택 경로)
 
-`CausalRetrieval(sample_idx [B]) → (scores [B,N,K], values [B,N,K,P_r])` (모드는 `self.training`),
-`RetrievalFusion(h_neural, scores, values) → h_local [B,N,history_hidden]`
+`CausalRetrieval(sample_idx [B]) → (scores [B,N,K], values [B,N,K,P_r], query_mean [B,N])`
+(모드는 `self.training`), `RetrievalFusion(h_neural, scores, values, query_mean) → h_local [B,N,history_hidden]`
 (`models/merged/modules/retrieval.py`). `use_retrieval=true`일 때만 생성된다. 검색 자체는 학습
-파라미터·gradient가 없고, 융합의 `a`, `b`, `value_embedding`, `fuse`만 학습한다.
+파라미터·gradient가 없고, 융합의 `a`, `b`, `value_embedding`, `O`(`fallback_embedding`), `fuse`만 학습한다.
 
 - 예측 시점 `t`, 노드 `n=(x,y)`, 반경 `r = retrieval_local_radius ?? local_radius`,
   `P_r = (2r+1)²` (r=1이면 3×3, 9칸).
@@ -455,7 +455,10 @@ reshape한 것이 `logits`다. 검색 결과는 출력에서 섞지 않고 6.6�
     Ulsan(cap 7): `{0},{1},{2},{3},{4},{5,6},{≥7}`, Porto(cap 21): `…,{14–18},{19,20},{≥21}`.
   - `e_p = Σ_i sigmoid(a·s_i + b) · Embedding(bucket(V_i[p]))` (`Embedding` 16차원, 칸끼리 공유,
     `a=1`, `b=0`으로 시작하는 학습 스칼라). 빈 칸(`s = −inf`)의 가중치는 0이다.
-  - `h_local = Linear(history_hidden + P_r·16 → history_hidden)([h_neural ⊕ e_1 ⊕ … ⊕ e_{P_r}])`
+  - `C = [e_1 ⊕ … ⊕ e_{P_r}]`, `m` = 질의 Q(`[t−k, t)` × 3×3 raw 수요, 격자 밖 0) `k·P_r`개 값의 평균,
+    `O` = 0에서 시작하는 학습 벡터 `[P_r·16]`. `R = (1 − e^{−m})·C + e^{−m}·O`.
+    질의가 전부 0이면(m=0) 유사도가 모두 0이라 top-k가 동점 중 임의 후보가 되므로 `R = O`다.
+  - `h_local = Linear(history_hidden + P_r·16 → history_hidden)([h_neural ⊕ R])`
   - `h_local`이 `BranchAttention`의 neural 후보·query로 `h_neural`을 대신한다.
 
 <details>
@@ -465,7 +468,8 @@ reshape한 것이 `logits`다. 검색 결과는 출력에서 섞지 않고 6.6�
   CPU에 만든다. Q(t)는 이 격자의 `[t−k, t)` 창이고, 데이터셋의 `demand_history`와 같은 값이다.
 - top-k는 `(모드, t)`에만 의존하므로 모드별로 모든 t의 `(s, τ)` 표 `[T,N,K]`를 첫 사용 시 입력
   장치에서 한 번 계산해 두고(GPU에서 Ulsan 0.5초, Porto 1.5초), forward는 `sample_idx`로 표를,
-  τ로 창 수요를 gather만 한다. GPU→CPU 동기화가 없고 표는 체크포인트에 저장하지 않는다.
+  τ로 창 수요를 gather만 한다. 질의 평균 m도 장치별 `[T,N]` 표로 한 번 계산한다. GPU→CPU 동기화가
+  없고 표는 체크포인트에 저장하지 않는다.
 - bucket 하한은 persistent buffer `retrieval_fusion.bucket_bounds`로 체크포인트에 저장한다
   (`from_pretrained`의 meta-device 초기화는 비저장 buffer를 복원하지 않는다).
 - train 모드 후보 수는 `t`에 거의 무관하게 약 `train_end − k − 73`개로 일정하다.
@@ -613,8 +617,9 @@ python test.py <checkpoint_dir> --city {ulsan,porto} --weather_csv_path <csv> \
 - 검색: 모드별 top-k `(s, τ)` 표가 브루트포스 기준과 일치, `retrieval_future_mask_hours < time_step`
   거부, train 모드에서 `y_t`나 train 구간 밖 값을 바꿔도, eval 모드에서 `t` 이후 값을 바꿔도
   결과[t](유사도·V)가 그대로.
-- 검색 융합: bucket 경계·배정, 빈 후보 칸 무시. 검색 켬 eval forward가 eval 모드 표를 쓰고,
-  embedding·`a`에 gradient가 흐르며, 체크포인트 복원 후 예측이 같다.
+- 검색 융합: bucket 경계·배정, 빈 후보 칸 무시, m=0이면 검색 결과와 무관하게 `O`만 사용. 검색 켬
+  eval forward가 eval 모드 표를 쓰고, m이 `demand_history` 창 평균과 같고, embedding·`a`·`O`에
+  gradient가 흐르며, 체크포인트 복원 후 예측이 같다.
 - Transformer 3×3에서 검색 창 3×3·5×5 선택이 forward에 반영.
 - 검색 끔: grid 없이 생성·예측·체크포인트 복원, `h_local = h_neural`, 검색 출력 None.
 - masked Transformer 수용 영역: 1층은 반경 1, 2층은 반경 2 밖 수요에 무반응(eval·no_grad).

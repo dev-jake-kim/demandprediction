@@ -422,17 +422,28 @@ def _check_independent_retrieval_radius() -> dict:
             model = MergedDemandModel(config).eval()
             with torch.no_grad():
                 output = model._compute(**inputs)
-            scores, values = model.retrieval(sample_idx)
+            scores, values, query_mean = model.retrieval(sample_idx)
             if model.local_history.num_neighbors != 9:
                 raise AssertionError('Transformer window is not 3×3')
             if tuple(output['retrieval_values'].shape) != (1, 9, 2, (2 * radius + 1) ** 2):
                 raise AssertionError(f'Retrieval values do not use radius {radius}')
             if not (torch.equal(output['retrieval_scores'], scores) and torch.equal(output['retrieval_values'], values)):
                 raise AssertionError('eval forward did not use the eval-mode table')
+            # m은 입력 demand_history의 [t-k, t) × 반경 r 창(격자 밖 0) 평균과 같아야 한다.
+            window = 2 * radius + 1
+            expected_mean = torch.nn.functional.unfold(
+                history.reshape(-1, 1, 3, 3), window, padding=radius
+            ).mean(dim=1).mean(dim=0)  # [N]
+            if not torch.allclose(output['retrieval_query_mean'][0], expected_mean, atol=1e-6):
+                raise AssertionError('retrieval query mean does not match the demand_history window')
             model.train()
             model._compute(**inputs)['logits'].sum().backward()
             fusion = model.retrieval_fusion
-            for name, param in (('embedding', fusion.value_embedding.weight), ('score_scale', fusion.score_scale)):
+            for name, param in (
+                ('embedding', fusion.value_embedding.weight),
+                ('score_scale', fusion.score_scale),
+                ('fallback_embedding', fusion.fallback_embedding),
+            ):
                 if param.grad is None or not bool(param.grad.abs().sum() > 0):
                     raise AssertionError(f'retrieval fusion {name} receives no gradient')
             # 검색 켬 체크포인트 복원(bucket 경계 포함)이 같은 예측을 내는지 확인한다.
@@ -510,9 +521,24 @@ def _check_retrieval_fusion() -> dict:
     values = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
     other = values.clone()
     other[..., 1, :] = 100.0
-    if not torch.equal(fusion(h_neural, scores, values), fusion(h_neural, scores, other)):
+    busy = torch.tensor([[2.0]])
+    if not torch.equal(fusion(h_neural, scores, values, busy), fusion(h_neural, scores, other, busy)):
         raise AssertionError('candidate slot without a valid neighbor changed the fusion output')
-    return {'retrieval_buckets_cap7': demand_bucket_bounds(7), 'invalid_slot_ignored': True}
+    # m=0(질의 전부 0)이면 검색 결과와 무관하게 O만 쓴다.
+    with torch.no_grad():
+        fusion.fallback_embedding.normal_()
+    idle = torch.zeros(1, 1)
+    expected = fusion.fuse(torch.cat([h_neural, fusion.fallback_embedding.expand(1, 1, -1)], dim=-1))
+    other[..., 0, :] = 5.0
+    if not (
+        torch.allclose(fusion(h_neural, scores, values, idle), expected)
+        and torch.equal(fusion(h_neural, scores, values, idle), fusion(h_neural, scores, other, idle))
+    ):
+        raise AssertionError('zero query did not fall back to O')
+    return {
+        'retrieval_buckets_cap7': demand_bucket_bounds(7), 'invalid_slot_ignored': True,
+        'zero_query_uses_O': True,
+    }
 
 
 def _check_masked_grid_receptive_field() -> dict:
