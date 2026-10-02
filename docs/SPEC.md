@@ -24,8 +24,9 @@
 
 ## 1. 데이터 흐름
 
-기본 경로는 **검색 pass(`use_retrieval=false`)**다. 점선은
-`model.use_retrieval=true`일 때만 실행된다.
+기본 경로는 **검색 pass(`use_retrieval=false`)**다. 점선은 `model.use_retrieval=true`일 때만
+실행되며, 검색 결과는 `retrieval_injection`에 따라 출력 gate(`output_gate`) 또는 local 표현
+(`local_concat`) 중 한 곳에만 들어간다.
 
 ```mermaid
 flowchart TD
@@ -90,7 +91,7 @@ flowchart TD
         A1 --> A2 --> A3 --> A4 --> HA
     end
 
-    HN --> A1
+    HN -->|"검색 pass·output_gate"| A1
     HD --> A1
     HW --> A1
 
@@ -105,18 +106,31 @@ flowchart TD
     PRED --> LOSS["MAE 손실"]
     Y --> LOSS
 
-    subgraph RET["선택 경로: use_retrieval=true"]
-        R1["검색용 raw 창<br/>+ absolute sample_idx"]
-        R2["CausalRetrieval<br/>후보 τ < t, top-k 유사 과거"]
-        R3["ir_out [B,N]"]
+    subgraph RET["선택 경로: use_retrieval=true (6.6)"]
+        R1["질의 창 [t−k, t) + sample_idx=t"]
+        R2L["retrieval_query=local<br/>노드별 3×3 창, 노드마다 다른 τ<br/>유사도: raw cosine 또는<br/>encoder 거리 −‖μ_q−μ_τ‖²/(L·T)"]
+        R2G["retrieval_query=global<br/>지도 전체 창 [k·N] cosine<br/>top-k τ를 모든 노드가 공유"]
+        R3["후보 τ < t, top-k<br/>softmax(s) 가중평균 grid[τ, n]<br/>ir_out [B,N]"]
+        R1 --> R2L --> R3
+        R1 --> R2G --> R3
+    end
+
+    subgraph INJ_G["retrieval_injection=output_gate"]
         R4["NeuralRetrievalGate<br/>λ·neural + (1-λ)·ir_out"]
-        R1 --> R2 --> R3 --> R4
+    end
+
+    subgraph INJ_L["retrieval_injection=local_concat"]
+        R5["Linear(1→H)(log1p ir_out) ⊕ h_neural<br/>Linear(2H→H) → h_local"]
     end
 
     H -.->|"검색 켬"| R1
+    R3 -.-> R4
     HA -.->|"gate 입력"| R4
     O2 -.->|"neural_pred"| R4
     R4 -.->|"검색 켬 예측"| PRED
+    R3 -.-> R5
+    HN -.-> R5
+    R5 -.->|"h_neural 대신 (gate 우회)"| A1
 ```
 
 기호: `B` batch, `k=time_step=8`(입력 시간 창), `N=H×W` 노드 수, `D=d_model`,
