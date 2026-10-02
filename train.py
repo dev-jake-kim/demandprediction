@@ -580,12 +580,17 @@ def main(cfg: DictConfig) -> None:
         model.begin_node_adaptation()
         for param in deltas:
             param.requires_grad_(True)
-        # stage2.freeze_shared: 공유 가중치(ΔW 외 전부)를 고정하고 노드별 ΔW만 학습한다.
-        freeze_shared = bool(cfg.stage2.get('freeze_shared', False))
-        if freeze_shared:
+        # stage2.freeze: none | shared(ΔW만 학습) | pre_lstm(LSTM 입력부 고정, LSTM 이후만 학습).
+        stage2_freeze = str(cfg.stage2.get('freeze', 'none'))
+        if stage2_freeze == 'shared':
             for name, param in model.named_parameters():
                 if 'node_delta' not in name:
                     param.requires_grad_(False)
+        elif stage2_freeze == 'pre_lstm':
+            for param in model.pre_lstm_parameters():
+                param.requires_grad_(False)
+        elif stage2_freeze != 'none':
+            raise ValueError(f"stage2.freeze는 'none'|'shared'|'pre_lstm' (받음: {stage2_freeze!r})")
         stage2_loss = str(cfg.stage2.loss)
         model.configure_loss(stage2_loss, rmse_weight=float(cfg.stage2.rmse_weight))
         if stage2_loss == 'rmse_mape':
@@ -605,7 +610,7 @@ def main(cfg: DictConfig) -> None:
             metric_for_best_model=best_metric_key,
         )
         logger.info(
-            f'[stage2] ΔW 해제{" (공유 가중치 고정)" if freeze_shared else ""}, lr={cfg.stage2.learning_rate}, '
+            f'[stage2] ΔW 해제 (freeze={stage2_freeze}), lr={cfg.stage2.learning_rate}, '
             f'학습 파라미터 {trainable_count(trainer):,}개 '
             f'(ΔW {sum(p.numel() for p in deltas):,}개 포함)'
         )
@@ -643,7 +648,7 @@ def main(cfg: DictConfig) -> None:
         'objective': cfg.model.loss_type,
         'stage1_loss': cfg.model.loss_type,
         'final_loss': str(cfg.stage2.loss) if deltas and not joint else cfg.model.loss_type,
-        'stage2_freeze_shared': bool(cfg.stage2.get('freeze_shared', False)) if deltas and not joint else None,
+        'stage2_freeze': str(cfg.stage2.get('freeze', 'none')) if deltas and not joint else None,
         'node_adaptive_schedule': schedule if deltas else None,
         'ablation': cfg.ablation,
         'ablation_mode': ABLATION_MODE,

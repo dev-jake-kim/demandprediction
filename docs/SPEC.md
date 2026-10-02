@@ -308,6 +308,7 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
   gated면 게이트 logit 포함).
 - `begin_node_adaptation`은 ΔW 학습 시작 직전에 부른다(gated: `V ← W`, `s ← 1`;
   additive: 아무것도 안 함).
+- `pre_lstm_parameters`는 LSTM 입력을 만드는 파라미터를 반환한다(`stage2.freeze=pre_lstm`용, §8).
 
 <details>
 <summary>조립·손실 집계·초기화 세부</summary>
@@ -549,7 +550,7 @@ python train.py --config-name config_<city> "description='실험 설명'" \
 | stage | 학습 대상 | LR | 손실 | 저장 위치 |
 |---|---|---|---|---|
 | 1 | ΔW 제외 전부 (ΔW=0 고정) | `train.learning_rate` | `model.loss_type` | `<run>/stage1` |
-| 2 | 전부 (ΔW 해제). `stage2.freeze_shared=true`면 ΔW만 | `stage2.learning_rate` | `stage2.loss` | `<run>/stage2` |
+| 2 | 전부 (ΔW 해제). `stage2.freeze`로 일부 고정 가능 | `stage2.learning_rate` | `stage2.loss` | `<run>/stage2` |
 
 각 stage는 새 Trainer·optimizer·scheduler로 시작하고, 검증 기준 최적 epoch의 가중치를
 `load_best_model_at_end`로 불러온다. 선택 기준은 `eval_loss`이며, `rmse_mape`는 전체
@@ -571,8 +572,13 @@ python train.py --config-name config_<city> "description='실험 설명'" \
   하고, 저장된 ΔW는 모두 0이어야 한다. ΔW는 새 노드 목록으로 0부터 다시 만든다.
   optimizer·scheduler·step은 복원하지 않는다.
   stage 1 체크포인트는 `<run>/stage1/checkpoint-<step>`(stage 1 best epoch)이다.
-- **`stage2.freeze_shared`** (기본 false): true면 stage 2에서 ΔW를 제외한 공유 가중치를 모두 고정한다.
-  채택 모델 stage 1에서 5시드로 비교한 결과 울산 RMSE·MAE −0.1%(4/5), Porto는 차이 없음.
+- **`stage2.freeze`** (기본 `none`): stage 2에서 고정할 범위.
+  - `shared`: ΔW를 제외한 공유 가중치를 모두 고정(ΔW만 학습). 채택 모델 stage 1에서 5시드로 비교한
+    결과 울산 RMSE·MAE −0.1%(4/5), Porto는 차이 없음.
+  - `pre_lstm`: LSTM 입력을 만드는 부분(`MergedDemandModel.pre_lstm_parameters()`: `local_history`의
+    scalar/node embedding·sink·direction bias·Transformer·functional/weather projection, `snow_scale`,
+    weekday/hour embedding)을 고정한다. `history_lstm`·ΔW·daily/weekly LSTM·`branch_attention`·
+    `output_gate`는 학습한다. 고정 부분도 train 모드(dropout 켬)로 돈다.
 - **`node_adaptive_schedule`** (기본 `two_stage`): `joint`면 stage를 나누지 않고 처음부터 ΔW를 포함해
   `train.learning_rate`·`model.loss_type`으로 한 번에 학습한다(`stage2.*` 무시, `init_from` 금지).
   채택 설정 3시드 비교에서 ΔW가 초반부터 train에 과적합해(best epoch 7~12, 이후 val 상승)

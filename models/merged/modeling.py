@@ -192,6 +192,22 @@ class MergedDemandModel(PreTrainedModel):
 
         self.local_history.begin_node_adaptation()
 
+    def pre_lstm_parameters(self) -> list[nn.Parameter]:
+        """LSTM 입력을 만드는 파라미터(stage2.freeze=pre_lstm에서 고정).
+
+        ``local_history`` 중 ``history_lstm``·ΔW를 뺀 전부(embedding, sink, direction bias,
+        Transformer, functional/weather projection)와 LSTM extra 입력용 ``snow_scale``·요일/시간 embedding.
+        """
+
+        history = self.local_history
+        lstm_side = {id(param) for param in history.history_lstm.parameters()}
+        lstm_side |= {id(param) for param in history.node_delta_parameters()}
+        params = [param for param in history.parameters() if id(param) not in lstm_side]
+        params.append(self.snow_scale)
+        params.extend(self.weekday_embedding.parameters())
+        params.extend(self.hour_embedding.parameters())
+        return params
+
     def _init_weights(self, module: nn.Module) -> None:
         """PyTorch 기본 초기화를 유지하고 초기화되지 않은 노드 delta만 0으로 만든다.
 
