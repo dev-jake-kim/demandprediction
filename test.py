@@ -59,7 +59,8 @@ def evaluate(model: MergedDemandModel, loader: DataLoader, device: str) -> dict[
 
     with torch.no_grad():
         for batch in tqdm(loader, desc='evaluate'):
-            inputs = {key: batch[key].to(device) for key in INPUT_KEYS}
+            # 선택 입력(event_mask)은 데이터셋이 줄 때만 넘긴다.
+            inputs = {key: batch[key].to(device) for key in (*INPUT_KEYS, 'event_mask') if key in batch}
             out = model(**inputs)
             all_preds.append(out['logits'].float().cpu().numpy())
             all_labels.append(batch['labels'].numpy())
