@@ -21,6 +21,8 @@ retrieval_future_mask_hours: 72
 retrieval_spatial_sigma: null
 # 검색 결과 융합: average(softmax(s) 가중평균 label) | embedding(gate·bucket embedding 합) | vote(bucket별 s 합).
 retrieval_fusion: embedding
+# average_gate의 gate 상한: g = retrieval_gate_max · sigmoid(·).
+retrieval_gate_max: 1.0
 # embedding에서 검색 결과 C와 학습 벡터 O 혼합: (1-w)C + wO, w = e^(-m/τ). m은 mean | nonzero_count.
 retrieval_use_fallback: true
 retrieval_query_measure: mean

@@ -170,7 +170,10 @@ class MergedDemandModel(PreTrainedModel):
             )
         # average_gate는 BranchAttention 뒤에서 섞고, 나머지 모드는 h_neural에 concat한다.
         gate_after_attention = self.use_retrieval and config.retrieval_fusion == 'average_gate'
-        self.retrieval_gate = RetrievalGate(config.fusion_dim) if gate_after_attention else None
+        self.retrieval_gate = (
+            RetrievalGate(config.fusion_dim, gate_max=float(config.retrieval_gate_max))
+            if gate_after_attention else None
+        )
         self.retrieval_fusion = (
             RetrievalFusion(
                 config.history_hidden,

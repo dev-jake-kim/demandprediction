@@ -260,19 +260,25 @@ class RetrievalGate(nn.Module):
     """``retrieval_fusion='average_gate'``: BranchAttention 뒤의 노드 표현 z에 검색 결과를 섞는다.
 
     ``r = Linear(1 → fusion_dim)(log1p(softmax(s) 가중평균 label))``,
-    ``g = sigmoid(Linear(fusion_dim → 1)(z))``, 출력 ``g·r + (1 − g)·z``.
+    ``g = gate_max · sigmoid(Linear(fusion_dim → 1)(z))``, 출력 ``g·r + (1 − g)·z``.
+
+    ``gate_max < 1``이면 검색 결과만으로 예측하는 셀을 막는다. clamp가 아니라 상수배라 sigmoid의
+    gradient가 끊기는 구간이 없고, z 쪽 계수 ``1 − g``가 항상 ``1 − gate_max`` 이상이다.
     """
 
-    def __init__(self, fusion_dim: int) -> None:
+    def __init__(self, fusion_dim: int, gate_max: float = 1.0) -> None:
         super().__init__()
+        if not 0.0 < gate_max <= 1.0:
+            raise ValueError(f'retrieval_gate_max는 (0, 1] 범위여야 함 (받음: {gate_max})')
         self.value_projection = nn.Linear(1, fusion_dim)
         self.gate = nn.Linear(fusion_dim, 1)
+        self.gate_max = float(gate_max)
 
     def forward(self, z: Tensor, scores: Tensor, values: Tensor) -> tuple[Tensor, Tensor]:
         """``(z [B,N,F], scores, values) -> (blended [B,N,F], gate [B,N])``."""
 
         retrieved = self.value_projection(torch.log1p(weighted_label_mean(scores, values).to(z.dtype)))
-        gate = torch.sigmoid(self.gate(z))
+        gate = self.gate_max * torch.sigmoid(self.gate(z))
         return gate * retrieved + (1.0 - gate) * z, gate.squeeze(-1)
 
 

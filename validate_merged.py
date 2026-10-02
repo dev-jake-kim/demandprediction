@@ -450,6 +450,7 @@ def _check_independent_retrieval_radius() -> dict:
                 retrieval_query_measure=measure, retrieval_fallback_tau=0.5,
                 retrieval_fallback_learn_tau=learn_tau,
                 retrieval_spatial_sigma=1.0 if fusion_mode == 'average_gate' else None,
+                retrieval_gate_max=0.5,
                 temperature_min=-5.0, temperature_max=30.0, precipitation_max=20.0,
             )
             model = MergedDemandModel(config).eval()
@@ -618,12 +619,22 @@ def _check_retrieval_fusion() -> dict:
     if not torch.allclose(vote(h_neural, vote_scores, vote_values, busy), expected, atol=1e-6):
         raise AssertionError('vote fusion does not match the expected per-bucket similarity sums')
 
-    # average_gate: g(z)·r + (1 − g(z))·z, r = Linear(log1p(softmax(s) 가중평균 label)).
-    gate = RetrievalGate(4)
+    # average_gate: g = gate_max·σ(Linear(z)), g·r + (1 − g)·z, r = Linear(log1p(softmax(s) 가중평균 label)).
+    gate = RetrievalGate(4, gate_max=0.5)
     z = torch.randn(1, 1, 4)
     blended, g = gate(z, pair_scores, pair_values)
     r = gate.value_projection(torch.log1p(mean_label))
-    g_expected = torch.sigmoid(gate.gate(z))
+    g_expected = 0.5 * torch.sigmoid(gate.gate(z))
+    with torch.no_grad():
+        gate.gate.bias.fill_(100.0)  # σ ≈ 1이어도 g는 상한 0.5를 넘지 않는다.
+    if float(gate(z, pair_scores, pair_values)[1].max()) > 0.5:
+        raise AssertionError('average_gate exceeded retrieval_gate_max')
+    for bad in (0.0, 1.5):
+        try:
+            RetrievalGate(4, gate_max=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f'retrieval_gate_max={bad} was accepted')
     if not (
         torch.allclose(blended, g_expected * r + (1 - g_expected) * z, atol=1e-6)
         and torch.allclose(g, g_expected.squeeze(-1), atol=1e-6)

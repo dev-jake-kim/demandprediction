@@ -232,6 +232,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | | `retrieval_embedding_dim` | 16 (수요 bucket embedding 차원) |
 | | `retrieval_fusion`, `retrieval_use_fallback` | `embedding`, true (융합 방식 `average`/`embedding`/`vote`/`average_gate`, embedding에서 O 혼합 사용) |
 | | `retrieval_spatial_sigma` | null (유사도의 3×3 칸 가중치 `exp(−d²/2σ²)`, null이면 균등) |
+| | `retrieval_gate_max` | 1.0 (`average_gate`의 gate 상한, `g = gate_max·σ(·)`, (0, 1]) |
 | | `retrieval_query_measure` | `mean` (O 혼합의 m: `mean` 질의 평균 / `nonzero_count` 질의의 0 아닌 칸 수) |
 | | `retrieval_fallback_tau`, `retrieval_fallback_learn_tau` | 1.0, false (`w = e^{−m/τ}`, 학습 시 τ는 이 값에서 시작) |
 | 노드 적응 | `node_adaptive`, `node_adaptive_min_demand` | true, 0.1 |
@@ -480,8 +481,10 @@ attention mask로 표현한다.
     `h_local = Linear(history_hidden + (bucket 수 − 1) → history_hidden)([h_neural ⊕ vote[1:]])`.
     질의가 전부 0이면 s가 모두 0이라 vote도 0이다.
   - `average_gate`: `h_neural`은 그대로 두고, BranchAttention 출력 `z = h_attn`에 섞는다.
-    `r = Linear(1 → fusion_dim)(log1p(Σ_i softmax(s)_i · V_i))`, `g = sigmoid(Linear(fusion_dim → 1)(z))`,
-    `h_head = g·r + (1 − g)·z`.
+    `r = Linear(1 → fusion_dim)(log1p(Σ_i softmax(s)_i · V_i))`,
+    `g = retrieval_gate_max · sigmoid(Linear(fusion_dim → 1)(z))`, `h_head = g·r + (1 − g)·z`.
+    상한은 clamp가 아니라 상수배라 gate gradient가 끊기는 구간이 없고, z 쪽 계수 `1 − g`가 항상
+    `1 − retrieval_gate_max` 이상이다.
   - `average_gate` 외 모드는 `h_local`이 `BranchAttention`의 neural 후보·query로 `h_neural`을 대신한다.
 
 <details>
@@ -642,7 +645,7 @@ python test.py <checkpoint_dir> --city {ulsan,porto} --weather_csv_path <csv> \
   거부, train 모드에서 `y_t`나 train 구간 밖 값을 바꿔도, eval 모드에서 `t` 이후 값을 바꿔도
   결과[t](유사도·V)가 그대로.
 - 검색 융합: bucket 경계·배정, 빈 후보 칸 무시, m=0이면 검색 결과와 무관하게 `O`만 사용, average 식,
-  vote의 가장 가까운 bucket 반올림·bucket별 s 합·0번 제외, average_gate의 `g·r + (1−g)·z`. 중앙 가중
+  vote의 가장 가까운 bucket 반올림·bucket별 s 합·0번 제외, average_gate의 `g·r + (1−g)·z`와 gate 상한·범위 검사. 중앙 가중
   cosine(σ=1) 표가 브루트포스 기준과 일치. 검색 켬(embedding O 켬·끔, average, vote, average_gate+σ)
   eval forward가 eval 모드 표를 쓰고, V가 τ의 노드 자신 수요이고,
   m(평균·0 아닌 칸 수)이 `demand_history` 창에서 계산한 값과 같고, 융합 파라미터에 gradient가

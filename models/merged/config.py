@@ -40,6 +40,7 @@ class MergedDemandConfig(PretrainedConfig):
         retrieval_use_fallback: bool = True,
         retrieval_query_measure: str = 'mean',
         retrieval_spatial_sigma: float | None = None,
+        retrieval_gate_max: float = 1.0,
         retrieval_fallback_tau: float = 1.0,
         retrieval_fallback_learn_tau: bool = False,
         temperature_min: float | None = None,
@@ -97,6 +98,8 @@ class MergedDemandConfig(PretrainedConfig):
         self.retrieval_use_fallback = retrieval_use_fallback
         # 유사도의 3×3 칸 가중치 exp(−d²/2σ²) (중앙에 더 큰 가중). None이면 균등 cosine.
         self.retrieval_spatial_sigma = retrieval_spatial_sigma
+        # average_gate의 gate 상한: g = retrieval_gate_max · sigmoid(·), (0, 1].
+        self.retrieval_gate_max = retrieval_gate_max
         # O 혼합 가중치 w = e^{−m/τ}. m: 'mean'(질의 평균) | 'nonzero_count'(질의의 0 아닌 칸 수).
         # learn_tau면 τ는 이 값에서 시작해 학습한다.
         self.retrieval_query_measure = retrieval_query_measure
