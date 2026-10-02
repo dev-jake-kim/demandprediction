@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -36,6 +37,9 @@ INPUT_KEYS = (
     'weekly_weather',
     'weekly_hour',
     'weekly_day_of_week',
+    'context_extra',
+    'daily_context_extra',
+    'weekly_context_extra',
 )
 
 
@@ -94,6 +98,7 @@ def main() -> None:
     model = MergedDemandModel.from_pretrained(checkpoint_path).to(device)
 
     data_path = resolve_dataset_path(args.city, args.npy_path)
+    dataset_yaml = OmegaConf.load(Path(__file__).resolve().parent / 'configs' / 'dataset' / f'{args.city}.yaml')
     dataset = UnifiedDemandDataset(
         data_path,
         args.split,
@@ -106,6 +111,10 @@ def main() -> None:
         lag_radius=args.lag_radius,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
+        # 학습 때와 같은 추가 context: 채널 목록은 체크포인트 config, 시각·공휴일은 dataset yaml.
+        context_features=model.config.context_features,
+        start_time=dataset_yaml.get('start_time'),
+        holidays=list(dataset_yaml.get('holidays') or []),
     )
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers

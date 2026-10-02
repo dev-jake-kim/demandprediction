@@ -17,6 +17,8 @@ retrieval_k: 20
 retrieval_chunk_size: 256
 # observed_past는 target_time 이전 관측값만 후보로 삼는다.
 retrieval_scope: observed_past
+# 기능적 이웃: masked Transformer 수용 영역 밖에서 train 구간 상관이 가장 큰 노드 k개의 최근 수요 평균을 토큰에 더한다. 0이면 끔.
+functional_neighbor_k: 0
 # 날씨 특성은 임베딩 없이 3개 채널로 주입한다.
 weekday_dim: 7
 hour_dim: 5

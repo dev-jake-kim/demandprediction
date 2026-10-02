@@ -34,6 +34,10 @@ class MergedDemandConfig(PretrainedConfig):
         retrieval_chunk_size: int = 256,
         retrieval_scope: str = 'observed_past',
         retrieval_train_end: int | None = None,
+        context_extra_dim: int = 0,
+        context_features: list[str] | None = None,
+        functional_neighbor_k: int = 0,
+        functional_neighbors: list[list[int]] | None = None,
         temperature_min: float | None = None,
         temperature_max: float | None = None,
         precipitation_max: float | None = None,
@@ -79,6 +83,12 @@ class MergedDemandConfig(PretrainedConfig):
         self.retrieval_chunk_size = retrieval_chunk_size
         self.retrieval_scope = retrieval_scope
         self.retrieval_train_end = retrieval_train_end
+        # 데이터셋 추가 context 채널(train.py가 data.context_features에서 주입, test.py가 재구성에 씀).
+        self.context_extra_dim = context_extra_dim
+        self.context_features = list(context_features or [])
+        # 기능적 이웃(train.py가 train 구간 상관으로 골라 주입). k=0이면 끔.
+        self.functional_neighbor_k = functional_neighbor_k
+        self.functional_neighbors = functional_neighbors
         # train 구간 통계. precipitation_max는 snow_scale=1 기준으로 고정한다.
         self.temperature_min = temperature_min
         self.temperature_max = temperature_max

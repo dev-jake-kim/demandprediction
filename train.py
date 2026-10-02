@@ -17,6 +17,7 @@ import subprocess
 from pathlib import Path
 
 import hydra
+import numpy as np
 import torch
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
@@ -163,7 +164,29 @@ def build_dataset_kwargs(cfg: DictConfig) -> dict:
         'lag_radius': int(cfg.data.lag_radius),
         'train_ratio': float(cfg.dataset.train_ratio),
         'val_ratio': float(cfg.dataset.val_ratio),
+        'context_features': list(cfg.data.get('context_features') or []),
+        'start_time': cfg.dataset.get('start_time'),
+        'holidays': list(cfg.dataset.get('holidays') or []),
     }
+
+
+def select_functional_neighbors(train_ds: UnifiedDemandDataset, k: int, exclude_radius: int) -> list[list[int]]:
+    """노드마다 train 구간 수요 시계열 상관이 가장 큰 노드 ``k``개(자기 자신과 격자 거리
+    ``exclude_radius`` 이내, 즉 masked Transformer가 이미 보는 노드는 제외). 시간 리크를 막으려고
+    ``[time_step, train_end)``만 쓴다."""
+
+    series = train_ds.grid[train_ds.time_step : train_ds.train_end].reshape(-1, train_ds.num_nodes)
+    centered = series - series.mean(axis=0)
+    norms = np.sqrt((centered ** 2).sum(axis=0))
+    with np.errstate(invalid='ignore', divide='ignore'):
+        corr = (centered.T @ centered) / np.outer(norms, norms)
+    corr = np.nan_to_num(corr, nan=-np.inf)
+    rows, cols = np.divmod(np.arange(train_ds.num_nodes), train_ds.width)
+    near = (np.abs(rows[:, None] - rows[None, :]) <= exclude_radius) & (
+        np.abs(cols[:, None] - cols[None, :]) <= exclude_radius
+    )
+    corr[near] = -np.inf
+    return np.argsort(-corr, axis=1)[:, :k].tolist()
 
 
 def build_datasets(
@@ -352,6 +375,15 @@ def main(cfg: DictConfig) -> None:
             f'({len(node_adaptive_indices) / total_nodes * 100:.1f}%)에만 ΔW를 준다'
         )
 
+    # 기능적 이웃: masked Transformer 수용 영역(local_radius × transformer_layers) 밖에서 train 구간
+    # 상관이 가장 큰 노드 k개. k=0이면 끔.
+    functional_k = int(model_kwargs.get('functional_neighbor_k', 0))
+    functional_neighbors = None
+    if functional_k > 0:
+        exclude = int(model_kwargs['local_radius']) * int(model_kwargs['transformer_layers'])
+        functional_neighbors = select_functional_neighbors(train_ds, functional_k, exclude)
+        logger.info(f'[functional_neighbors] k={functional_k}, 격자 거리 {exclude} 이내 제외')
+
     model_config = MergedDemandConfig(
         height=train_ds.height,
         width=train_ds.width,
@@ -361,6 +393,9 @@ def main(cfg: DictConfig) -> None:
         **weather_stats,
         node_adaptive_indices=node_adaptive_indices,
         **model_kwargs,
+        context_extra_dim=len(dataset_kwargs['context_features']),
+        context_features=dataset_kwargs['context_features'],
+        functional_neighbors=functional_neighbors,
     )
     # Trainer 초기화보다 먼저 seed를 고정해 모델 초기화를 재현한다.
     set_seed(cfg.train.seed)

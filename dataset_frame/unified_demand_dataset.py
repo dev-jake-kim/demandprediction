@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Iterable, Literal, Sequence
 
 import numpy as np
 import pandas as pd
@@ -130,6 +130,9 @@ class UnifiedDemandDataset(Dataset):
         lag_radius: int = 0,
         train_ratio: float = 0.70,
         val_ratio: float = 0.15,
+        context_features: Sequence[str] = (),
+        start_time: str | None = None,
+        holidays: Sequence[str] = (),
     ) -> None:
         super().__init__()
         if not 0 < train_ratio < 1 or not 0 <= val_ratio < 1 or train_ratio + val_ratio >= 1:
@@ -176,11 +179,40 @@ class UnifiedDemandDataset(Dataset):
         self.weather_csv_path = Path(weather_csv_path).expanduser().resolve()
         all_times = np.arange(self.total_steps, dtype=np.int64)
         self.hour_table, self.day_of_week_table = _calendar_features(all_times)
+        self.context_features = tuple(context_features)
+        self.context_table = self._make_context_table(self.context_features, start_time, holidays)
 
         self.daily_values, self.daily_mask = self._make_lag_table(self.daily_lag_values)
         self.weekly_values, self.weekly_mask = self._make_lag_table(self.weekly_lag_values)
         self.daily_context = self._make_lag_context(self.daily_lag_values)
         self.weekly_context = self._make_lag_context(self.weekly_lag_values)
+
+    def _make_context_table(
+        self, features: Sequence[str], start_time: str | None, holidays: Sequence[str]
+    ) -> np.ndarray:
+        """시점별 추가 context ``[T, len(features)]``.
+
+        - ``holiday``: 그 시각의 날짜가 공휴일이면 1 (``start_time`` 기준 시각, ``holidays`` 날짜 목록).
+        - ``city_demand``: 도시 전체 수요 합의 ``log1p``를 train 구간 최댓값의 ``log1p``로 나눈 값.
+        """
+
+        columns: list[np.ndarray] = []
+        for name in features:
+            if name == 'holiday':
+                if start_time is None:
+                    raise ValueError('holiday context에는 start_time이 필요함')
+                times = pd.Timestamp(start_time) + pd.to_timedelta(np.arange(self.total_steps), unit='h')
+                holiday_set = {pd.Timestamp(day).date() for day in holidays}
+                columns.append(np.array([t.date() in holiday_set for t in times], dtype=np.float32))
+            elif name == 'city_demand':
+                totals = self.grid.reshape(self.total_steps, -1).sum(axis=1)
+                scale = np.log1p(totals[: self.bounds.train_end].max())
+                columns.append((np.log1p(totals) / scale).astype(np.float32))
+            else:
+                raise ValueError(f"알 수 없는 context feature {name!r} (가능: 'holiday', 'city_demand')")
+        if not columns:
+            return np.zeros((self.total_steps, 0), dtype=np.float32)
+        return np.ascontiguousarray(np.stack(columns, axis=1))
 
     def _make_lag_context(self, lags: np.ndarray) -> dict[str, np.ndarray]:
         """Build lag-time weather/calendar context arrays; invalid sources are zeroed."""
@@ -192,10 +224,12 @@ class UnifiedDemandDataset(Dataset):
         weather = np.where(valid[..., None], self.weather[safe_times], 0.0).astype(np.float32)
         hour = np.where(valid, self.hour_table[safe_times], 0).astype(np.int64)
         day_of_week = np.where(valid, self.day_of_week_table[safe_times], 0).astype(np.int64)
+        context = np.where(valid[..., None], self.context_table[safe_times], 0.0).astype(np.float32)
         return {
             'weather': np.ascontiguousarray(weather),
             'hour': np.ascontiguousarray(hour),
             'day_of_week': np.ascontiguousarray(day_of_week),
+            'context': np.ascontiguousarray(context),
         }
 
     def _make_lag_table(self, lags: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -238,6 +272,10 @@ class UnifiedDemandDataset(Dataset):
             'weekly_weather': torch.from_numpy(self.weekly_context['weather'][target_time]),
             'weekly_hour': torch.from_numpy(self.weekly_context['hour'][target_time]),
             'weekly_day_of_week': torch.from_numpy(self.weekly_context['day_of_week'][target_time]),
+            # 추가 context: 최근 창은 달력과 같은 [t−k, t), lag는 각 lag 시점 (무효 lag는 0).
+            'context_extra': torch.from_numpy(self.context_table[target_time - self.time_step : target_time].copy()),
+            'daily_context_extra': torch.from_numpy(self.daily_context['context'][target_time]),
+            'weekly_context_extra': torch.from_numpy(self.weekly_context['context'][target_time]),
         }
 
     @property

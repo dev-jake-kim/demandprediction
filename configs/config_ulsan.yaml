@@ -20,6 +20,8 @@ data:
   weekly_period: 168
   weekly_lags: 4
   lag_radius: 0
+  # 시점별 추가 context 채널: holiday(공휴일, dataset의 start_time·holidays 필요) | city_demand(도시 전체 수요).
+  context_features: []
 
 train:
 

@@ -105,10 +105,14 @@ class MergedDemandModel(PreTrainedModel):
         self.weekday_embedding = nn.Embedding(7, config.weekday_dim)
         self.hour_embedding = nn.Embedding(24, config.hour_dim)
         self.weather_cls_dim = WEATHER_CHANNELS if self.weather_injection == 'cls_add' else 0
+        # 데이터셋이 주는 시점별 추가 context(공휴일·도시 전체 수요 등, configs/config_<city>.yaml의
+        # data.context_features) 채널 수. 날씨·요일·시간 뒤에 그대로 붙인다.
+        self.context_extra_dim = int(config.context_extra_dim)
         self.extra_dim = (
             (WEATHER_CHANNELS if self.weather_injection == 'concat' else 0)
             + config.weekday_dim
             + config.hour_dim
+            + self.context_extra_dim
         )
 
         self.local_history = LocalHistoryEncoder(
@@ -128,6 +132,7 @@ class MergedDemandModel(PreTrainedModel):
             weather_cls_dim=self.weather_cls_dim,
             use_neighbors=self.use_neighbors,
             node_adaptive_indices=node_adaptive_indices,
+            functional_neighbors=config.functional_neighbors,
         )
         self.periodic_hidden = config.periodic_hidden
         self.daily_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim)
@@ -204,10 +209,13 @@ class MergedDemandModel(PreTrainedModel):
         features = torch.stack([temperature_norm, precipitation_norm], dim=-1)
         return features if self.use_weather else torch.zeros_like(features)
 
-    def _temporal_extra(self, weather: Tensor, hour: Tensor, day_of_week: Tensor) -> Tensor:
+    def _temporal_extra(
+        self, weather: Tensor, hour: Tensor, day_of_week: Tensor, context_extra: Tensor | None
+    ) -> Tensor:
         """한 브랜치의 시간 context를 만들고 ``[B, L, extra_dim]``을 반환한다.
 
-        날씨는 ``concat``에서만 포함하고, 요일·시간 임베딩은 브랜치 간 공유한다.
+        날씨는 ``concat``에서만 포함하고, 요일·시간 임베딩은 브랜치 간 공유한다. 데이터셋의 추가
+        context(``context_extra_dim``)가 있으면 맨 뒤에 붙인다.
         """
 
         parts: list[Tensor] = []
@@ -219,6 +227,10 @@ class MergedDemandModel(PreTrainedModel):
             weekday = torch.zeros_like(weekday)
             hour_vec = torch.zeros_like(hour_vec)
         parts.extend([weekday, hour_vec])
+        if self.context_extra_dim > 0:
+            if context_extra is None or context_extra.shape[-1] != self.context_extra_dim:
+                raise ValueError(f'context_extra [B,L,{self.context_extra_dim}]가 필요함')
+            parts.append(context_extra.to(weekday.dtype))
         return torch.cat(parts, dim=-1)
 
     def _compute(
@@ -240,12 +252,15 @@ class MergedDemandModel(PreTrainedModel):
         weekly_hour: Tensor,
         weekly_day_of_week: Tensor,
         labels: Tensor | None = None,
+        context_extra: Tensor | None = None,
+        daily_context_extra: Tensor | None = None,
+        weekly_context_extra: Tensor | None = None,
     ) -> dict[str, Tensor | None]:
         """모델 계산을 수행하고 예측·중간 결과·선택적 손실을 반환한다."""
 
-        recent_extra = self._temporal_extra(weather, hour_of_day, day_of_week)
-        daily_extra = self._temporal_extra(daily_weather, daily_hour, daily_day_of_week)
-        weekly_extra = self._temporal_extra(weekly_weather, weekly_hour, weekly_day_of_week)
+        recent_extra = self._temporal_extra(weather, hour_of_day, day_of_week, context_extra)
+        daily_extra = self._temporal_extra(daily_weather, daily_hour, daily_day_of_week, daily_context_extra)
+        weekly_extra = self._temporal_extra(weekly_weather, weekly_hour, weekly_day_of_week, weekly_context_extra)
 
         weather_cls = self._weather_features(weather) if self.weather_cls_dim else None
         h_neural = self.local_history(demand_history, recent_extra, weather_cls)
@@ -310,6 +325,9 @@ class MergedDemandModel(PreTrainedModel):
         weekly_hour: Tensor,
         weekly_day_of_week: Tensor,
         labels: Tensor | None = None,
+        context_extra: Tensor | None = None,
+        daily_context_extra: Tensor | None = None,
+        weekly_context_extra: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """``Trainer``용으로 ``{'loss', 'logits'}``만 반환한다.
 
@@ -333,6 +351,9 @@ class MergedDemandModel(PreTrainedModel):
             weekly_hour=weekly_hour,
             weekly_day_of_week=weekly_day_of_week,
             labels=labels,
+            context_extra=context_extra,
+            daily_context_extra=daily_context_extra,
+            weekly_context_extra=weekly_context_extra,
         )
         slim: dict[str, Tensor] = {'logits': output['logits']}
         if 'loss' in output:

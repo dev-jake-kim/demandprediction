@@ -34,6 +34,7 @@ class LocalHistoryEncoder(nn.Module):
         weather_cls_dim: int = 0,
         use_neighbors: bool = True,
         node_adaptive_indices: Sequence[int] | None = None,
+        functional_neighbors: Sequence[Sequence[int]] | None = None,
     ) -> None:
         super().__init__()
         if extra_dim < 0:
@@ -62,6 +63,15 @@ class LocalHistoryEncoder(nn.Module):
         self.sink_embedding = nn.Parameter(torch.randn(transformer_layers, d_model) * 0.02)
         self.node_embedding = nn.Parameter(torch.randn(self.num_nodes, d_model) * 0.02)
         self.direction_bias = nn.Parameter(torch.zeros(transformer_heads, self.num_neighbors))
+        # 기능적 이웃: 노드마다 train 구간 상관이 큰 먼 노드 K개. 그 최근 수요 평균을 토큰에 더한다.
+        self._functional_neighbor_list = (
+            None if functional_neighbors is None else [[int(v) for v in row] for row in functional_neighbors]
+        )
+        self._cached_functional_index: Tensor | None = None
+        if self._functional_neighbor_list is not None:
+            if len(self._functional_neighbor_list) != self.num_nodes:
+                raise ValueError('functional_neighbors는 노드마다 한 행이어야 함')
+            self.functional_projection = nn.Linear(1, d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -216,6 +226,14 @@ class LocalHistoryEncoder(nn.Module):
 
         log_values = torch.log1p(torch.clamp(demands, min=0.0)).reshape(batch, steps, nodes, 1)
         tokens = self.scalar_embedding(log_values) + self.node_embedding
+        if self._functional_neighbor_list is not None:
+            index = self._cached_functional_index
+            if index is None or index.device != demands.device:
+                index = torch.as_tensor(self._functional_neighbor_list, dtype=torch.long, device=demands.device)
+                self._cached_functional_index = index
+            flat = torch.clamp(demands, min=0.0).reshape(batch, steps, nodes)
+            neighbor_mean = flat[:, :, index].mean(dim=-1)  # [B, k, N]
+            tokens = tokens + self.functional_projection(torch.log1p(neighbor_mean).unsqueeze(-1))
         if self.weather_projection is not None:
             if weather_cls is None:
                 raise ValueError("weather_cls_dim>0인데 weather_cls가 None임")
