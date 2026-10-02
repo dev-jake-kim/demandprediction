@@ -513,9 +513,23 @@ def main(cfg: DictConfig) -> None:
     deltas = model.node_delta_parameters()
     stage_records: dict[str, dict] = {}
     stage1_metrics: dict[str, float] | None = None
+    # node_adaptive_schedule: two_stage(기본, stage 1 ΔW 고정 → stage 2 ΔW 해제) | joint(처음부터 ΔW 포함 한 번에 학습).
+    schedule = str(cfg.get('node_adaptive_schedule', 'two_stage'))
+    if schedule not in ('two_stage', 'joint'):
+        raise ValueError(f"node_adaptive_schedule은 'two_stage'|'joint' (받음: {schedule!r})")
+    joint = bool(deltas) and schedule == 'joint'
+    if joint and init_from:
+        raise ValueError('node_adaptive_schedule=joint에서는 stage2.init_from을 쓸 수 없다')
 
-    if not deltas:
+    if not deltas or joint:
+        for param in deltas:
+            param.requires_grad_(True)
         trainer = build_trainer(None, train_cfg['learning_rate'])
+        if joint:
+            logger.info(
+                f'[joint] 처음부터 ΔW 포함 학습, lr={train_cfg["learning_rate"]}, '
+                f'학습 파라미터 {trainable_count(trainer):,}개 (ΔW {sum(p.numel() for p in deltas):,}개 포함)'
+            )
         trainer.train()
         best_metric_key = 'loss'
     else:
@@ -605,7 +619,7 @@ def main(cfg: DictConfig) -> None:
         for name, param in model.named_parameters():
             if 'node_delta' in name:
                 logger.info(
-                    f'[stage2] {name}: norm={param.norm():.4f} '
+                    f'[ΔW] {name}: norm={param.norm():.4f} '
                     f'max_abs={param.abs().max():.4f}'
                 )
 
@@ -620,8 +634,9 @@ def main(cfg: DictConfig) -> None:
         # stage별 목적함수를 별도로 기록한다.
         'objective': cfg.model.loss_type,
         'stage1_loss': cfg.model.loss_type,
-        'final_loss': str(cfg.stage2.loss) if deltas else cfg.model.loss_type,
-        'stage2_freeze_shared': bool(cfg.stage2.get('freeze_shared', False)) if deltas else None,
+        'final_loss': str(cfg.stage2.loss) if deltas and not joint else cfg.model.loss_type,
+        'stage2_freeze_shared': bool(cfg.stage2.get('freeze_shared', False)) if deltas and not joint else None,
+        'node_adaptive_schedule': schedule if deltas else None,
         'ablation': cfg.ablation,
         'ablation_mode': ABLATION_MODE,
         # ablation 라벨이 아닌 실제 적용된 스위치를 기록한다.
@@ -648,8 +663,8 @@ def main(cfg: DictConfig) -> None:
         'node_adaptive_nodes': len(node_adaptive_indices) if node_adaptive_indices else 0,
         'node_adaptive_indices': node_adaptive_indices,
         'node_delta_params': sum(p.numel() for p in deltas),
-        'stages': ['stage1', 'stage2'] if deltas else ['single'],
-        'stage2_loss': str(cfg.stage2.loss) if deltas else None,
+        'stages': ['joint'] if joint else (['stage1', 'stage2'] if deltas else ['single']),
+        'stage2_loss': str(cfg.stage2.loss) if deltas and not joint else None,
         'stage1_init_from': str(init_from) if init_from else None,
         'stage1': stage_records.get('stage1'),
         'stage1_test': stage1_metrics,
