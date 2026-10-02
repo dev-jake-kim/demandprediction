@@ -125,5 +125,11 @@ val·test의 각 (t, n) 질의(입력 0 제외)에 대해:
 | 경로 | 역할 |
 |---|---|
 | `models/retrieval_encoder/` | encoder, loss, (t, n) 데이터셋, 균형 샘플러 |
-| `train_retrieval_encoder.py` | Hydra 학습 스크립트 (`configs/retrieval_encoder_<city>.yaml`, `configs/dataset/<city>.yaml` 공유) |
+| `train_retrieval_encoder.py` | Hydra 학습 스크립트 (`configs/retrieval_encoder.yaml`, 도시는 `dataset=<city>`로 바꾸며 `configs/dataset/<city>.yaml` 공유) |
 | `output/retrieval_encoder/<city>_seed<seed>/` | encoder 가중치, 학습 로그, 평가 JSON |
+
+## 9. 메인 모델 연결
+
+`model.retrieval_encoder_path=<encoder.pt 절대경로>`를 주면 메인 모델 검색기(`CausalRetrieval`)의
+유사도만 raw 창 cosine에서 이 encoder의 `s = −‖μ_q − μ_τ‖² / (L·T)`로 바뀐다. 후보 범위(`τ < t`),
+top-k, softmax 가중평균, 출력 gate는 그대로다([`SPEC.md`](SPEC.md) §6.6).

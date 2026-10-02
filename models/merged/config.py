@@ -34,6 +34,7 @@ class MergedDemandConfig(PretrainedConfig):
         retrieval_chunk_size: int = 256,
         retrieval_scope: str = 'observed_past',
         retrieval_train_end: int | None = None,
+        retrieval_encoder_path: str | None = None,
         temperature_min: float | None = None,
         temperature_max: float | None = None,
         precipitation_max: float | None = None,
@@ -79,6 +80,9 @@ class MergedDemandConfig(PretrainedConfig):
         self.retrieval_chunk_size = retrieval_chunk_size
         self.retrieval_scope = retrieval_scope
         self.retrieval_train_end = retrieval_train_end
+        # 단독 학습한 검색 encoder(train_retrieval_encoder.py의 encoder.pt). 있으면 검색 유사도를
+        # raw 창 cosine 대신 encoder latent 거리로 바꾼다.
+        self.retrieval_encoder_path = retrieval_encoder_path
         # train 구간 통계. precipitation_max는 snow_scale=1 기준으로 고정한다.
         self.temperature_min = temperature_min
         self.temperature_max = temperature_max

@@ -149,6 +149,7 @@ class MergedDemandModel(PreTrainedModel):
                 retrieval_chunk_size=config.retrieval_chunk_size,
                 retrieval_scope=config.retrieval_scope,
                 retrieval_train_end=config.retrieval_train_end,
+                retrieval_encoder_path=config.retrieval_encoder_path,
             )
             if self.use_retrieval else None
         )

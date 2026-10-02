@@ -225,6 +225,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | 검색 | `use_retrieval` | **false** |
 | | `retrieval_local_radius` | 미지정 → `local_radius` |
 | | `retrieval_k`, `retrieval_chunk_size`, `retrieval_scope` | 20, 256, `observed_past` |
+| | `retrieval_encoder_path` | null (단독 학습 검색 encoder `encoder.pt`; 있으면 유사도를 encoder latent 거리로) |
 | 노드 적응 | `node_adaptive`, `node_adaptive_min_demand` | true, 0.1 |
 | 손실 | `loss_type` | `mae` |
 | | `loss_gamma`, `loss_eps`, `rmse_weight`, `split_threshold`, `split_high_weight` | 1.0, 0.5, 10.0, 1.0, 1.0 |
@@ -437,7 +438,11 @@ attention mask로 표현한다.
   창은 `[τ−k, τ)`.
 - 후보 범위: `τ ∈ [k, end)`, `end = t`(`observed_past`) 또는 `min(t, retrieval_train_end)`
   (`train_prefix`). 예측 시점과 미래는 후보가 될 수 없다.
-- 코사인 유사도 top-`retrieval_k`를 `retrieval_chunk_size` 단위로 병합하고,
+- 유사도는 기본이 raw 창 코사인이다. `retrieval_encoder_path`가 있으면 단독 학습한 검색 encoder
+  ([`RETRIEVAL_ENCODER.md`](RETRIEVAL_ENCODER.md))의 μ로 `s = −‖μ_q − μ_τ‖² / (L·T)`를 쓴다.
+  μ 표 `[T,N,L]`는 첫 forward에서 입력 장치에 encoder(eval, 입력 잡음 없음)로 한 번 계산하고,
+  encoder 가중치는 메인 체크포인트에 넣지 않고 경로로만 기록한다. 후보 범위·top-k·softmax는 같다.
+- top-`retrieval_k`를 `retrieval_chunk_size` 단위로 병합하고,
   softmax(score) 가중으로 각 τ의 수요 `grid[τ]`를 평균한다. 후보가 없으면 0.
 - 결과는 `t`별 CPU cache에 저장해 재사용한다.
 - grid 경로가 없으면 0을 반환한다.
@@ -580,6 +585,8 @@ python test.py <checkpoint_dir> --city {ulsan,porto} --weather_csv_path <csv> \
 - 날씨·캘린더 채널이 lag 압축 뒤에도 유지되고 기준 LSTM과 일치.
 - ΔW=0 적응 경로가 `nn.LSTM`과 일치하고 비적응 노드는 비트 단위 동일.
 - 검색 후보가 `τ < t`만 사용.
+- encoder 유사도 검색(`retrieval_encoder_path`): 브루트포스 latent 거리 검색과 일치, `t` 이후 값과 무관,
+  encoder eval 출력에 잡음 없음(train에는 있음), 메인 모델 체크포인트 복원 후 예측 동일.
 - Transformer 3×3에서 검색 창 3×3·5×5 선택이 forward에 반영.
 - 검색 pass: grid 없이 생성·예측·체크포인트 복원, `prediction = neural_pred`, `λ=1`.
 - masked Transformer 수용 영역: 1층은 반경 1, 2층은 반경 2 밖 수요에 무반응(eval·no_grad).

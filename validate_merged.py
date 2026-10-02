@@ -304,6 +304,90 @@ def _check_retrieval_boundary() -> dict:
     return {'retrieval_candidate_boundary': 'tau < target_time'}
 
 
+def _check_encoder_retrieval() -> dict:
+    """retrieval_encoder_path: encoder latent 거리 검색이 브루트포스와 같고, t 이후 값과 무관하며,
+    eval에서 잡음이 꺼지고, 메인 모델 체크포인트 복원 후에도 같은 예측을 내는지 확인한다."""
+
+    from models.retrieval_encoder import RetrievalEncoder, encode_all, save_retrieval_encoder, window_table
+
+    torch.manual_seed(0)
+    height = width = 3
+    k, top, target = 2, 3, 9
+    grid = np.random.default_rng(1).integers(0, 4, size=(14, height, width)).astype(np.float32)
+    with tempfile.TemporaryDirectory(prefix='merged_encoder_') as temp_dir:
+        grid_path = Path(temp_dir) / 'grid.npy'
+        np.save(grid_path, grid, allow_pickle=False)
+        encoder = RetrievalEncoder(torch.randn(9, 4), time_step=k, num_neighbors=9, input_noise_std=0.5)
+        encoder_path = Path(temp_dir) / 'encoder.pt'
+        save_retrieval_encoder(encoder, encoder_path)
+
+        # eval에서는 잡음을 끈다: 같은 입력을 두 번 넣으면 같은 μ.
+        windows = torch.rand(4, k, 9)
+        nodes = torch.arange(4)
+        encoder.eval()
+        if not torch.equal(encoder(windows, nodes)[0], encoder(windows, nodes)[0]):
+            raise AssertionError('encoder eval output is noisy')
+        encoder.train()
+        if torch.equal(encoder(windows, nodes)[0], encoder(windows, nodes)[0]):
+            raise AssertionError('encoder train output has no input noise')
+        encoder.eval()
+
+        def build(values: np.ndarray) -> CausalRetrieval:
+            np.save(grid_path, values, allow_pickle=False)
+            return CausalRetrieval(
+                height=height, width=width, time_step=k, local_radius=1, retrieval_grid_path=grid_path,
+                retrieval_k=top, retrieval_chunk_size=4, retrieval_scope='observed_past',
+                retrieval_train_end=None, retrieval_encoder_path=encoder_path,
+            )
+
+        history = torch.from_numpy(grid[target - k:target]).unsqueeze(0)
+        actual = build(grid)(history, torch.tensor([target]))[0]
+        # 브루트포스: μ 표로 같은 노드의 τ ∈ [k, t) 거리 top-k, softmax(s) 가중평균.
+        mu = encode_all(encoder, window_table(torch.from_numpy(grid), 1), k)
+        flat = torch.from_numpy(grid).reshape(len(grid), -1)
+        expected = torch.zeros(height * width)
+        for node in range(height * width):
+            scores = encoder.similarity(mu[target, node], mu[k:target, node])
+            top_scores, top_index = scores.topk(top)
+            expected[node] = (torch.softmax(top_scores, 0) * flat[k + top_index, node]).sum()
+        if not torch.allclose(actual, expected, atol=1e-5):
+            raise AssertionError('encoder retrieval differs from brute-force latent-distance search')
+        changed = grid.copy()
+        changed[target:] = 100.0
+        if not torch.equal(build(changed)(history, torch.tensor([target]))[0], actual):
+            raise AssertionError('encoder retrieval used target or future values')
+
+        np.save(grid_path, grid, allow_pickle=False)
+        config = MergedDemandConfig(
+            height=height, width=width, time_step=k, local_radius=1, d_model=8, transformer_heads=2,
+            transformer_layers=1, retrieval_grid_path=str(grid_path), retrieval_k=top,
+            retrieval_encoder_path=str(encoder_path),
+            temperature_min=-5.0, temperature_max=30.0, precipitation_max=20.0,
+        )
+        batch = {
+            'demand_history': history, 'daily_demand': torch.ones(1, 2, 9, 1),
+            'daily_mask': torch.zeros(1, 2, dtype=torch.bool), 'weekly_demand': torch.ones(1, 2, 9, 1),
+            'weekly_mask': torch.zeros(1, 2, dtype=torch.bool), 'sample_idx': torch.tensor([target]),
+            'weather': torch.zeros(1, k, 3), 'hour_of_day': torch.zeros(1, k, dtype=torch.long),
+            'day_of_week': torch.zeros(1, k, dtype=torch.long), 'daily_weather': torch.zeros(1, 2, 3),
+            'daily_hour': torch.zeros(1, 2, dtype=torch.long), 'daily_day_of_week': torch.zeros(1, 2, dtype=torch.long),
+            'weekly_weather': torch.zeros(1, 2, 3), 'weekly_hour': torch.zeros(1, 2, dtype=torch.long),
+            'weekly_day_of_week': torch.zeros(1, 2, dtype=torch.long),
+        }
+        model = MergedDemandModel(config).eval()
+        checkpoint = Path(temp_dir) / 'checkpoint'
+        with torch.no_grad():
+            before = model.forward_debug(**batch)
+            model.save_pretrained(checkpoint)
+            after = MergedDemandModel.from_pretrained(checkpoint).eval().forward_debug(**batch)
+        if not torch.allclose(before['ir_out'][0], expected, atol=1e-5):
+            raise AssertionError('main model ir_out does not use the encoder similarity')
+        if not torch.equal(before['logits'], after['logits']):
+            raise AssertionError('encoder-retrieval checkpoint round trip changed predictions')
+    return {'encoder_retrieval_matches_bruteforce': True, 'encoder_eval_noise_off': True,
+            'encoder_retrieval_roundtrip': True}
+
+
 def _check_independent_retrieval_radius() -> dict:
     """Verify retrieval radius is independent of the Transformer radius."""
     with tempfile.TemporaryDirectory(prefix='merged_window_') as temp_dir:
@@ -428,6 +512,7 @@ def main() -> None:
     results.append(_check_periodic_extra_channels())
     results.append(_check_node_adaptive_identity())
     results.append(_check_retrieval_boundary())
+    results.append(_check_encoder_retrieval())
     results.append(_check_independent_retrieval_radius())
     results.append(_check_retrieval_pass())
     results.append(_check_masked_grid_receptive_field())
