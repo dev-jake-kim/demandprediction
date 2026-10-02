@@ -1,0 +1,50 @@
+# 검색 encoder 단독 학습 (train_retrieval_encoder.py, docs/RETRIEVAL_ENCODER.md).
+# 도시는 dataset=<city> 오버라이드로 바꾼다. 분할·time_step은 본 모델과 같은 configs/dataset/<city>.yaml.
+defaults:
+  - dataset: ulsan
+  - _self_
+
+description: ???
+seed: 245
+device: cuda
+# 3×3 창(반경 1). 본 모델 검색기의 창과 같다.
+local_radius: 1
+# frozen node embedding을 가져올 채택 모델 체크포인트 (local_history.node_embedding).
+node_embedding_checkpoint: output/adopted/checkpoints/timestep8_${dataset.city}_seed245_39185a1
+
+# UnifiedDemandDataset 생성 인자(분할 경계를 본 모델과 같게 만들기 위한 값, encoder는 lag를 쓰지 않는다).
+data:
+  daily_period: 24
+  daily_lags: 6
+  weekly_period: 168
+  weekly_lags: 4
+  lag_radius: 0
+
+encoder:
+  hidden_dim: 16
+  latent_dim: 16
+  # 학습 때만 log1p 입력에 더하는 Gaussian 잡음의 표준편차 (eval·검색에서는 끈다).
+  input_noise_std: 0.1
+  # s = −‖z_i − z_j‖² / (L·T)
+  temperature: 0.1
+
+train:
+  batch_size: 128
+  learning_rate: 1.0e-3
+  weight_decay: 0.05
+  max_epochs: 40
+  # val 검색 MAE가 이 epoch 수 동안 좋아지지 않으면 멈춘다.
+  patience: 6
+  kl_beta: 0.1
+  kl_warmup_epochs: 5
+  # bucket g의 뽑힐 확률 ∝ count_g^balance_power
+  balance_power: 0.5
+  # bucket cap: train 구간 수요 상위 비율
+  value_cap_top_fraction: 0.005
+
+eval:
+  top_k: 20
+
+hydra:
+  run:
+    dir: output/retrieval_encoder/${dataset.city}_seed${seed}
