@@ -550,6 +550,10 @@ python train.py --config-name config_<city> "description='실험 설명'" \
   stage 1 체크포인트는 `<run>/stage1/checkpoint-<step>`(stage 1 best epoch)이다.
 - **`stage2.freeze_shared`** (기본 false): true면 stage 2에서 ΔW를 제외한 공유 가중치를 모두 고정한다.
   채택 모델 stage 1에서 5시드로 비교한 결과 울산 RMSE·MAE −0.1%(4/5), Porto는 차이 없음.
+- **`node_adaptive_schedule`** (기본 `two_stage`): `joint`면 stage를 나누지 않고 처음부터 ΔW를 포함해
+  `train.learning_rate`·`model.loss_type`으로 한 번에 학습한다(`stage2.*` 무시, `init_from` 금지).
+  채택 설정 3시드 비교에서 ΔW가 초반부터 train에 과적합해(best epoch 7~12, 이후 val 상승)
+  울산 MAE +1.8%·MAPE +1.7%, Porto RMSE +6.3%·MAE +2.6%로 2-stage보다 나빴다.
 - **`limit_samples`**: 각 split 앞쪽 N개만 쓰는 스모크용.
 - **결과 JSON**: `run_json`이 있으면 그 경로, 없으면
   `output/<project_name>/runs/<city>_<loss_type>_<ablation>[_nodeadaptive]_seed<seed>.json`.
