@@ -266,7 +266,11 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
   `venue`, `precision`, `source`는 기록용). `start`·`end`는 `dataset.start_time`과 같은 현지 시각
   `YYYY-MM-DD HH:MM`. 시각 `h`의 `[h, h+1)`이 `[start, end)`와 겹치면 그 노드·시각을 1로 하는
   `[T, N]` 표를 만든다. 샘플은 `event_mask [k, N]`을 날씨와 같은 창 `[t−k+1, t+1)`로 받는다
-  (일정은 미리 공개되므로 예측 시각 `t`를 포함). 울산 표는 `data/raw/ulsan_events.csv`.
+  (일정은 미리 공개되므로 예측 시각 `t`를 포함). 울산 표는 `data/raw/ulsan_events.csv`: 2024-10~2025-03
+  뉴스(Google News RSS 기사 LLM 추출)와 태화강 국가정원 공식 행사 캘린더에서 수요 반응이 확인된 5개
+  카테고리(대형 축제·불꽃/낙화·지역 축제/마켓·빛축제/크리스마스·대중 콘서트)만, 격자 안 장소, 노드별 겹침 합침
+  164구간(train 153 / val 5 / test 6). 채택 설정 3시드 결과: 전체 test 지표는 변화 없음(RMSE +0.05%,
+  MAPE +0.44%), test 이벤트 셀 RMSE −7.6%(구간 중)·−5.4%(종료 직후).
 - `train`: batch Ulsan 24 / Porto 8 (train·eval 동일), `num_train_epochs=120`,
   `optim=adamw_torch_fused`, `learning_rate=1e-3`, `weight_decay=0.05`, `max_grad_norm=5.0`,
   `lr_scheduler_type=constant`, `warmup_ratio=0`, epoch 단위 log/eval/save,
