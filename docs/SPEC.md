@@ -578,7 +578,8 @@ python train.py --config-name config_<city> "description='실험 설명'" \
   - `pre_lstm`: LSTM 입력을 만드는 부분(`MergedDemandModel.pre_lstm_parameters()`: `local_history`의
     scalar/node embedding·sink·direction bias·Transformer·functional/weather projection, `snow_scale`,
     weekday/hour embedding)을 고정한다. `history_lstm`·ΔW·daily/weekly LSTM·`branch_attention`·
-    `output_gate`는 학습한다. 고정 부분도 train 모드(dropout 켬)로 돈다.
+    `output_gate`는 학습한다. 고정 부분도 train 모드(dropout 켬)로 돈다. 채택 stage 1에서 5시드 비교 결과
+    대조군(`none`) 대비 울산 RMSE −0.03%·MAPE +0.12%, Porto RMSE +0.15%·MAPE −0.25%로 차이 없음.
 - **`node_adaptive_schedule`** (기본 `two_stage`): `joint`면 stage를 나누지 않고 처음부터 ΔW를 포함해
   `train.learning_rate`·`model.loss_type`으로 한 번에 학습한다(`stage2.*` 무시, `init_from` 금지).
   채택 설정 3시드 비교에서 ΔW가 초반부터 train에 과적합해(best epoch 7~12, 이후 val 상승)
