@@ -76,3 +76,21 @@ class DemandSplitLoss(nn.Module):
         squared = diff ** 2
         is_low = y_true <= self.threshold
         return torch.where(is_low, relative, self.high_weight * squared)
+
+
+class MseMapeLoss(nn.Module):
+    """Elementwise ``error**2 + mape_weight * abs(error) / (abs(y_true) + 1)``.
+
+    The squared term pulls predictions toward the conditional mean (RMSE); the relative term
+    pulls low-demand cells toward zero (MAPE(+1)). ``mape_weight`` trades the two off.
+    """
+
+    def __init__(self, mape_weight: float = 1.0) -> None:
+        super().__init__()
+        if not math.isfinite(mape_weight) or mape_weight < 0:
+            raise ValueError(f'mape_weight는 0 이상이어야 함: got {mape_weight}')
+        self.mape_weight = mape_weight
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        diff = y_true - y_pred
+        return diff ** 2 + self.mape_weight * diff.abs() / (y_true.abs() + 1.0)

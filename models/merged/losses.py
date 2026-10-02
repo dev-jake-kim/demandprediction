@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from torch import nn
 
-from ..losses import CombinedLoss, DemandSplitLoss, RmseMapeLoss
+from ..losses import CombinedLoss, DemandSplitLoss, MseMapeLoss, RmseMapeLoss
 
 # Scalar objectives bypass elementwise aggregation in the model.
 SCALAR_LOSS_TYPES = frozenset({'rmse_mape'})
@@ -22,10 +22,11 @@ def build_loss(
     rmse_weight: float = 10.0,
     split_threshold: float = 1.0,
     split_high_weight: float = 1.0,
+    mape_weight: float = 1.0,
 ) -> nn.Module:
     """Build a configured training objective by name.
 
-    ``combined``, ``mae``, and ``demand_split`` return elementwise losses;
+    ``combined``, ``mae``, ``demand_split`` and ``mse_mape`` return elementwise losses;
     ``rmse_mape`` returns a scalar.
     """
 
@@ -37,10 +38,12 @@ def build_loss(
         return RmseMapeLoss(rmse_weight=rmse_weight)
     if loss_type == 'demand_split':
         return DemandSplitLoss(threshold=split_threshold, high_weight=split_high_weight)
+    if loss_type == 'mse_mape':
+        return MseMapeLoss(mape_weight=mape_weight)
     raise ValueError(
         f"알 수 없는 loss_type: {loss_type!r} "
-        f"(가능: 'combined', 'mae', 'rmse_mape', 'demand_split')"
+        f"(가능: 'combined', 'mae', 'rmse_mape', 'demand_split', 'mse_mape')"
     )
 
 
-__all__ = ['CombinedLoss', 'DemandSplitLoss', 'RmseMapeLoss', 'SCALAR_LOSS_TYPES', 'build_loss']
+__all__ = ['CombinedLoss', 'DemandSplitLoss', 'MseMapeLoss', 'RmseMapeLoss', 'SCALAR_LOSS_TYPES', 'build_loss']

@@ -66,6 +66,7 @@ class MergedDemandConfig(PretrainedConfig):
         rmse_weight: float = 10.0,
         split_threshold: float = 1.0,
         split_high_weight: float = 1.0,
+        mape_weight: float = 1.0,
         **kwargs,
     ) -> None:
         self.height = height
@@ -128,6 +129,8 @@ class MergedDemandConfig(PretrainedConfig):
         self.rmse_weight = rmse_weight
         self.split_threshold = split_threshold
         self.split_high_weight = split_high_weight
+        # mse_mape 손실의 상대오차 항 가중치(error² + mape_weight·|error|/(y+1)).
+        self.mape_weight = mape_weight
         super().__init__(**kwargs)
 
 

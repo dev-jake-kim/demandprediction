@@ -83,6 +83,8 @@ stage2:
 
   loss: mae
   rmse_weight: 10.0
+  # loss=mse_mape의 상대오차 항 가중치(error² + mape_weight·|error|/(y+1)).
+  mape_weight: 1.0
   # stage 2 고정 범위: none | shared(ΔW만 학습) | pre_lstm(LSTM 입력부 고정, LSTM 이후만 학습).
   freeze: none
   # init_from은 optimizer 상태 없이 가중치만 이어받는다.

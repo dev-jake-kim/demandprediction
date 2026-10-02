@@ -165,11 +165,15 @@ class MergedDemandModel(PreTrainedModel):
 
         self.post_init()
 
-    def configure_loss(self, loss_type: str, *, rmse_weight: float | None = None) -> None:
+    def configure_loss(
+        self, loss_type: str, *, rmse_weight: float | None = None, mape_weight: float | None = None
+    ) -> None:
         """학습 손실을 교체하고 ``config``의 손실 설정을 동기화한다."""
 
         if rmse_weight is not None:
             self.config.rmse_weight = float(rmse_weight)
+        if mape_weight is not None:
+            self.config.mape_weight = float(mape_weight)
         self.loss_fn = build_loss(
             loss_type,
             gamma=self.config.loss_gamma,
@@ -177,6 +181,7 @@ class MergedDemandModel(PreTrainedModel):
             rmse_weight=self.config.rmse_weight,
             split_threshold=self.config.split_threshold,
             split_high_weight=self.config.split_high_weight,
+            mape_weight=self.config.mape_weight,
         )
         self.loss_is_scalar = loss_type in SCALAR_LOSS_TYPES
         # property 금지: PreTrainedModel.__init__이 같은 이름에 대입한다.

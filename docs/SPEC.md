@@ -338,7 +338,7 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
   meta device 초기화와 호환).
 - 버퍼 `local_history.neighbor_direction`은 persistent로
   체크포인트에 저장된다. 검색 CPU cache는 저장하지 않는다.
-- 손실 집계: 요소별 손실(`combined`, `mae`, `demand_split`)은 전체 원소 평균을 `loss`로,
+- 손실 집계: 요소별 손실(`combined`, `mae`, `demand_split`, `mse_mape`)은 전체 원소 평균을 `loss`로,
   합을 `loss_sum`으로 낸다. `rmse_mape`는 손실 객체가 스칼라를 직접 반환한다.
 - `_init_weights`는 PyTorch 기본 초기화를 유지하고, 체크포인트에서 오지 않은 노드별
   ΔW만 0으로 채운다. HF 기본 재초기화(std 0.02)는 적용하지 않는다.
@@ -529,6 +529,7 @@ W_hh(n), b(n)도 같은 식 (공유 b = b_ih + b_hh)
 | `combined` | `d² + γ·(d/(y_true+ε))²` (`γ=loss_gamma`, `ε=loss_eps`) |
 | `rmse_mape` | `rmse_weight·RMSE + MAPE(+1)` |
 | `demand_split` | `y ≤ split_threshold`: `|d|/(|y|+1)`, 그 외: `split_high_weight·d²` |
+| `mse_mape` | `d² + mape_weight·|d|/(|y|+1)` (제곱항은 평균 쪽, 상대항은 저수요 칸을 0 쪽으로; stage 2는 `stage2.mape_weight`) |
 
 `compute_merged_metrics(preds, labels)`:
 

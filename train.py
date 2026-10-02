@@ -605,7 +605,11 @@ def main(cfg: DictConfig) -> None:
         elif stage2_freeze != 'none':
             raise ValueError(f"stage2.freeze는 'none'|'shared'|'pre_lstm' (받음: {stage2_freeze!r})")
         stage2_loss = str(cfg.stage2.loss)
-        model.configure_loss(stage2_loss, rmse_weight=float(cfg.stage2.rmse_weight))
+        model.configure_loss(
+            stage2_loss,
+            rmse_weight=float(cfg.stage2.rmse_weight),
+            mape_weight=float(cfg.stage2.mape_weight),
+        )
         if stage2_loss == 'rmse_mape':
             rmse_weight = float(cfg.stage2.rmse_weight)
             metrics_fn = make_rmse_mape_metrics(rmse_weight)
