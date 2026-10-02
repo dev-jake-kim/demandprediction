@@ -132,6 +132,7 @@ class MergedDemandModel(PreTrainedModel):
             weather_cls_dim=self.weather_cls_dim,
             use_neighbors=self.use_neighbors,
             node_adaptive_indices=node_adaptive_indices,
+            node_adaptive_mode=config.node_adaptive_mode,
             functional_neighbors=config.functional_neighbors,
         )
         self.periodic_hidden = config.periodic_hidden
@@ -182,9 +183,14 @@ class MergedDemandModel(PreTrainedModel):
         self.config.loss_type = loss_type
 
     def node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
-        """노드별 weight offset 파라미터 전부(node_adaptive가 꺼져 있으면 빈 튜플)."""
+        """노드별 ΔW 파라미터 전부(node_adaptive가 꺼져 있으면 빈 튜플, gated면 게이트 logit 포함)."""
 
         return self.local_history.node_delta_parameters()
+
+    def begin_node_adaptation(self) -> None:
+        """ΔW 학습 시작 직전 호출(gated: V ← 공유 W, s ← 1; additive: 아무것도 안 함)."""
+
+        self.local_history.begin_node_adaptation()
 
     def _init_weights(self, module: nn.Module) -> None:
         """PyTorch 기본 초기화를 유지하고 초기화되지 않은 노드 delta만 0으로 만든다.

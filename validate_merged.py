@@ -266,12 +266,50 @@ def _check_node_adaptive_identity() -> dict:
     if actual != expected:
         raise AssertionError(f'node_delta 파라미터 수가 예상과 다름: {actual} != {expected}')
 
+    # gated: s=0이면 공유 경로와 같고, begin_node_adaptation(V←W, s←1) 직후에도 출력이 같아야 한다.
+    torch.manual_seed(0)
+    gated = LocalHistoryEncoder(
+        height=height,
+        width=width,
+        time_step=time_step,
+        local_radius=1,
+        d_model=8,
+        num_fourier_bands=2,
+        transformer_layers=1,
+        transformer_heads=2,
+        transformer_ffn=16,
+        history_hidden=5,
+        dropout=0.0,
+        node_adaptive_indices=adaptive,
+        node_adaptive_mode='gated',
+    )
+    gated.eval()
+    with torch.no_grad():
+        gated_before = gated(demands)
+        gated.begin_node_adaptation()
+        gated_after = gated(demands)
+        gated.node_adaptive = False
+        gated_reference = gated(demands)
+        gated.node_adaptive = True
+    gated_gap = max(
+        float((gated_before - gated_reference).abs().max()),
+        float((gated_after - gated_reference).abs().max()),
+    )
+    if gated_gap > 1e-5:
+        raise AssertionError(f'gated: s=0 또는 V=W 직후 출력이 공유 경로와 다름: max|diff|={gated_gap:.3e}')
+    if float(gated.node_delta_started) != 1.0:
+        raise AssertionError('gated: begin_node_adaptation 후 s가 1이 아님')
+    gated_params = sum(param.numel() for param in gated.node_delta_parameters())
+    if gated_params != expected + len(adaptive):
+        raise AssertionError(f'gated 파라미터 수가 예상과 다름: {gated_params} != {expected + len(adaptive)}')
+
     return {
         'node_adaptive_zero_delta_matches_nn_lstm': True,
         'max_abs_diff': gap,
         'non_adaptive_nodes_bit_identical': untouched == 0.0,
         'adaptive_nodes': len(adaptive),
         'node_delta_params': actual,
+        'gated_identity_max_abs_diff': gated_gap,
     }
 
 

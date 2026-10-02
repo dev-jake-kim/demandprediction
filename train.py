@@ -280,7 +280,7 @@ def load_stage1_with_new_nodes(init_from: str, config: MergedDemandConfig) -> Me
     source_config = MergedDemandConfig.from_pretrained(init_from)
     # 체크포인트를 다시 지정하기 전에 저장된 목적함수와 구조를 검증한다.
     ignored = {
-        'node_adaptive_indices', 'node_adaptive_min_demand', 'node_adaptive',
+        'node_adaptive_indices', 'node_adaptive_min_demand', 'node_adaptive', 'node_adaptive_mode',
         'architectures', 'dtype',
     }
     saved = source_config.to_dict()
@@ -522,6 +522,7 @@ def main(cfg: DictConfig) -> None:
         raise ValueError('node_adaptive_schedule=joint에서는 stage2.init_from을 쓸 수 없다')
 
     if not deltas or joint:
+        model.begin_node_adaptation()
         for param in deltas:
             param.requires_grad_(True)
         trainer = build_trainer(None, train_cfg['learning_rate'])
@@ -576,6 +577,7 @@ def main(cfg: DictConfig) -> None:
             # stage 1 Trainer가 optimizer와 모델 wrapper를 계속 붙들고 있지 않게 놓아준다.
             del stage1
 
+        model.begin_node_adaptation()
         for param in deltas:
             param.requires_grad_(True)
         # stage2.freeze_shared: 공유 가중치(ΔW 외 전부)를 고정하고 노드별 ΔW만 학습한다.
@@ -615,6 +617,7 @@ def main(cfg: DictConfig) -> None:
     test_metrics = trainer.predict(eval_test_set, metric_key_prefix='test').metrics
     logger.info(f'Test metrics: {test_metrics}')
 
+    node_gate = model.local_history.node_gate()
     if deltas:
         for name, param in model.named_parameters():
             if 'node_delta' in name:
@@ -622,6 +625,11 @@ def main(cfg: DictConfig) -> None:
                     f'[ΔW] {name}: norm={param.norm():.4f} '
                     f'max_abs={param.abs().max():.4f}'
                 )
+        if node_gate is not None:
+            logger.info(
+                f'[ΔW] gate g: mean={node_gate.mean():.4f} min={node_gate.min():.4f} '
+                f'max={node_gate.max():.4f}'
+            )
 
     history, best_epoch, best_val = _summarize_history(trainer.state.log_history, best_metric_key)
     result = {
@@ -663,6 +671,9 @@ def main(cfg: DictConfig) -> None:
         'node_adaptive_nodes': len(node_adaptive_indices) if node_adaptive_indices else 0,
         'node_adaptive_indices': node_adaptive_indices,
         'node_delta_params': sum(p.numel() for p in deltas),
+        'node_adaptive_mode': model.config.node_adaptive_mode if node_adaptive else None,
+        # gated일 때 노드별 g[n](node_adaptive_indices 순서).
+        'node_gate': node_gate.detach().cpu().tolist() if node_gate is not None else None,
         'stages': ['joint'] if joint else (['stage1', 'stage2'] if deltas else ['single']),
         'stage2_loss': str(cfg.stage2.loss) if deltas and not joint else None,
         'stage1_init_from': str(init_from) if init_from else None,

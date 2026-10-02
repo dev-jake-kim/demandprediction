@@ -56,7 +56,7 @@ flowchart TD
         L4["sink 출력 버림<br/>노드 출력만 다음 층으로"]
         L5["최종 노드 출력 [B,N,k,D]<br/>+ 최근 context 14"]
         L6["공유 history LSTM"]
-        L7["적응 노드만 W + ΔW LSTM<br/>stage 2에서 ΔW 학습"]
+        L7["적응 노드만 W + ΔW LSTM<br/>(gated: g·W + (1−g)·V)<br/>stage 2에서 ΔW 학습"]
         HN["h_neural [B,N,history_hidden]"]
         L1 --> L2 --> L3 --> L4
         L4 -->|"transformer_layers번 반복"| L2
@@ -227,7 +227,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | | `retrieval_k`, `retrieval_chunk_size`, `retrieval_scope` | 20, 256, `observed_past` |
 | 기능적 이웃 | `functional_neighbor_k`, `functional_neighbor_mode` | 0 (끔), `raw` — masked Transformer 수용 영역(`local_radius × transformer_layers`) 밖에서 train 구간 상관(`raw` 원 시계열 / `residual` 요일×시각 평균을 뺀 잔차)이 가장 큰 노드 k개를 train.py가 골라 `functional_neighbors`로 주입. 그 최근 수요 평균의 `Linear(1→D)(log1p)`를 노드 토큰에 더한다 |
 | 추가 context | `context_extra_dim`, `context_features` | 0, [] — train.py가 `data.context_features`에서 주입. 채널은 날씨·요일·시간 뒤에 붙는다 |
-| 노드 적응 | `node_adaptive`, `node_adaptive_min_demand` | true, 0.1 |
+| 노드 적응 | `node_adaptive`, `node_adaptive_min_demand`, `node_adaptive_mode` | true, 0.1, `additive` |
 | 손실 | `loss_type` | `mae` |
 | | `loss_gamma`, `loss_eps`, `rmse_weight`, `split_threshold`, `split_high_weight` | 1.0, 0.5, 10.0, 1.0, 1.0 |
 
@@ -304,7 +304,10 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
   검색 pass에서는 `ir_out=None`, `lambda_weight=1`이다.
 - `configure_loss`는 손실을 교체하고 `config.loss_type`(및 `rmse_weight`)을 함께 갱신해
   체크포인트가 마지막 학습 손실을 기록하게 한다.
-- `node_delta_parameters`는 노드별 ΔW 파라미터를 반환한다(적응 꺼짐이면 빈 튜플).
+- `node_delta_parameters`는 노드별 ΔW 파라미터를 반환한다(적응 꺼짐이면 빈 튜플,
+  gated면 게이트 logit 포함).
+- `begin_node_adaptation`은 ΔW 학습 시작 직전에 부른다(gated: `V ← W`, `s ← 1`;
+  additive: 아무것도 안 함).
 
 <details>
 <summary>조립·손실 집계·초기화 세부</summary>
@@ -313,7 +316,7 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
   `fusion_dim,retrieval_k,retrieval_chunk_size>0`, `d_model % transformer_heads == 0`,
   `weekday_dim,hour_dim>0`, `temperature_min/max`·`precipitation_max`가 있고
   `temperature_max > temperature_min`, `precipitation_max > 0`,
-  `weather_injection ∈ {concat, cls_add}`, `node_adaptive=true`면
+  `weather_injection ∈ {concat, cls_add}`, `node_adaptive_mode ∈ {additive, gated}`, `node_adaptive=true`면
   `node_adaptive_indices` 필수. 값 검사는 파이썬 리스트에서 한다(`from_pretrained`의
   meta device 초기화와 호환).
 - 버퍼 `local_history.neighbor_direction`은 persistent로
@@ -465,13 +468,30 @@ b(n)    = b_ih + b_hh + Δb[n]   Δb: [A, 4h]
   `from_pretrained`로 복원된다(버퍼로 두지 않는다).
 - `node_adaptive=false`면 ΔW 파라미터가 생성되지 않는다.
 
+**`node_adaptive_mode=gated`** (선택, 기본 `additive`는 위 식): 같은 모양의 `node_delta_*`를
+offset이 아닌 노드 고유 가중치 `V[n]`으로 쓰고, 노드별 스칼라 게이트로 공유 가중치와 섞는다.
+
+```text
+g[n]    = sigmoid(node_delta_gate_logit[n])            gate_logit: [A], 0으로 초기화 (g=0.5)
+W_ih(n) = W_ih + s·(1 − g[n])·(V_ih[n] − W_ih)        s=1이면 g·W_ih + (1−g)·V_ih[n]
+W_hh(n), b(n)도 같은 식 (공유 b = b_ih + b_hh)
+```
+
+- `s`는 persistent 버퍼 `node_delta_started`(0 또는 1)다. 생성 시 0이라 stage 1에서는
+  공유 가중치와 같은 함수다.
+- `begin_node_adaptation()`이 stage 2(또는 joint) 시작 직전에 `V[n] ← W`(현재 공유 가중치)로
+  복사하고 `s ← 1`로 둔다. 그래서 stage 2 시작 시점의 출력은 stage 1과 같다.
+  `additive`에서는 아무것도 하지 않는다.
+- 게이트는 노드당 스칼라 1개로 `ih`·`hh`·bias에 같이 쓴다. 파라미터는 additive보다 `A`개 많다.
+
 <details>
 <summary>세부</summary>
 
 - 선택 노드는 LSTM 셀(i, f, g, o 순서)을 직접 반복 계산한다. 입력 투영
   `x·W_ih(n)ᵀ + b(n)`은 전 시점을 한 번에 계산한다.
 - 비선택 노드는 공유 `nn.LSTM`(cuDNN) 결과를 그대로 쓴다.
-- ΔW=0일 때 두 경로의 일치는 `validate_merged.py`가 검사한다.
+- ΔW=0(additive)·`s=0`(gated)일 때 두 경로의 일치와, gated에서 `begin_node_adaptation()`
+  직후 출력 불변은 `validate_merged.py`가 검사한다.
 
 </details>
 

@@ -34,6 +34,7 @@ class LocalHistoryEncoder(nn.Module):
         weather_cls_dim: int = 0,
         use_neighbors: bool = True,
         node_adaptive_indices: Sequence[int] | None = None,
+        node_adaptive_mode: str = "additive",
         functional_neighbors: Sequence[Sequence[int]] | None = None,
     ) -> None:
         super().__init__()
@@ -92,6 +93,9 @@ class LocalHistoryEncoder(nn.Module):
         self.history_hidden = history_hidden
 
         self.node_adaptive = node_adaptive_indices is not None
+        if node_adaptive_mode not in ("additive", "gated"):
+            raise ValueError(f"node_adaptive_mode는 'additive'|'gated' (받음: {node_adaptive_mode!r})")
+        self.node_adaptive_mode = node_adaptive_mode
         if self.node_adaptive:
             # meta device 초기화에서도 검사할 수 있도록 파이썬 리스트로 다룬다.
             index_list = [int(value) for value in node_adaptive_indices]
@@ -117,6 +121,11 @@ class LocalHistoryEncoder(nn.Module):
             )
             # One delta bias offsets the combined ``bias_ih + bias_hh``.
             self.node_delta_bias = nn.Parameter(torch.zeros(num_adaptive, n_gates))
+            if node_adaptive_mode == "gated":
+                # gated: node_delta_*는 노드 고유 가중치 V[n]. g[n] = sigmoid(logit[n]).
+                self.node_delta_gate_logit = nn.Parameter(torch.zeros(num_adaptive))
+                # s: 0이면 공유 가중치와 같은 함수(stage 1). begin_node_adaptation이 1로 둔다.
+                self.register_buffer("node_delta_started", torch.zeros(()), persistent=True)
 
     def node_adaptive_index(self, device: torch.device) -> Tensor:
         """ΔW를 받는 노드 id 텐서. config에서 온 파이썬 리스트로 매번 만들되 device별로 캐시한다."""
@@ -134,11 +143,35 @@ class LocalHistoryEncoder(nn.Module):
 
         if not self.node_adaptive:
             return ()
-        return (
+        deltas = (
             self.node_delta_weight_ih,
             self.node_delta_weight_hh,
             self.node_delta_bias,
         )
+        if self.node_adaptive_mode == "gated":
+            deltas += (self.node_delta_gate_logit,)
+        return deltas
+
+    @torch.no_grad()
+    def begin_node_adaptation(self) -> None:
+        """ΔW 학습 시작 직전 호출. gated면 V[n] ← 현재 공유 가중치, s ← 1 (출력 불변)."""
+
+        if not self.node_adaptive or self.node_adaptive_mode != "gated":
+            return
+        lstm = self.history_lstm
+        self.node_delta_weight_ih.copy_(lstm.weight_ih_l0.expand_as(self.node_delta_weight_ih))
+        self.node_delta_weight_hh.copy_(lstm.weight_hh_l0.expand_as(self.node_delta_weight_hh))
+        self.node_delta_bias.copy_(
+            (lstm.bias_ih_l0 + lstm.bias_hh_l0).expand_as(self.node_delta_bias)
+        )
+        self.node_delta_started.fill_(1.0)
+
+    def node_gate(self) -> Tensor | None:
+        """gated면 노드별 g[n] = sigmoid(logit) ``[A]``, 아니면 None."""
+
+        if not self.node_adaptive or self.node_adaptive_mode != "gated":
+            return None
+        return self.node_delta_gate_logit.sigmoid()
 
     def _node_adaptive_hidden(self, sequence: Tensor) -> Tensor:
         """Compute adaptive-node hidden states with per-node LSTM offsets.
@@ -148,11 +181,18 @@ class LocalHistoryEncoder(nn.Module):
         """
 
         batch, num_adaptive, steps, _ = sequence.shape
-        weight_ih = self.history_lstm.weight_ih_l0 + self.node_delta_weight_ih  # (A,4h,F)
-        weight_hh = self.history_lstm.weight_hh_l0 + self.node_delta_weight_hh  # (A,4h,h)
-        bias = (
-            self.history_lstm.bias_ih_l0 + self.history_lstm.bias_hh_l0 + self.node_delta_bias
-        )  # (A,4h)
+        lstm = self.history_lstm
+        shared_bias = lstm.bias_ih_l0 + lstm.bias_hh_l0
+        if self.node_adaptive_mode == "gated":
+            # W + s·(1−g)·(V − W); s=1이면 g·W + (1−g)·V.
+            mix = self.node_delta_started * (1.0 - self.node_delta_gate_logit.sigmoid())  # (A,)
+            weight_ih = lstm.weight_ih_l0 + mix[:, None, None] * (self.node_delta_weight_ih - lstm.weight_ih_l0)
+            weight_hh = lstm.weight_hh_l0 + mix[:, None, None] * (self.node_delta_weight_hh - lstm.weight_hh_l0)
+            bias = shared_bias + mix[:, None] * (self.node_delta_bias - shared_bias)
+        else:
+            weight_ih = lstm.weight_ih_l0 + self.node_delta_weight_ih  # (A,4h,F)
+            weight_hh = lstm.weight_hh_l0 + self.node_delta_weight_hh  # (A,4h,h)
+            bias = shared_bias + self.node_delta_bias  # (A,4h)
 
         gates_x = torch.einsum("bakf,agf->bakg", sequence, weight_ih) + bias.unsqueeze(1)
 

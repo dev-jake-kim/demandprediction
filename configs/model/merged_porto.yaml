@@ -40,6 +40,8 @@ use_softplus: true
 # node_adaptive는 stage 1에서 ΔW를 고정하고 stage 2에서 학습한다.
 node_adaptive: true
 node_adaptive_min_demand: 0.1
+# additive: W + ΔW[n] | gated: g[n]·W + (1−g[n])·V[n] (V는 stage 2 시작 때 W로 복사)
+node_adaptive_mode: additive
 
 
 loss_type: mae
