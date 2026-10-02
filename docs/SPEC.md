@@ -526,7 +526,7 @@ python train.py --config-name config_<city> "description='실험 설명'" \
 | stage | 학습 대상 | LR | 손실 | 저장 위치 |
 |---|---|---|---|---|
 | 1 | ΔW 제외 전부 (ΔW=0 고정) | `train.learning_rate` | `model.loss_type` | `<run>/stage1` |
-| 2 | 전부 (ΔW 해제) | `stage2.learning_rate` | `stage2.loss` | `<run>/stage2` |
+| 2 | 전부 (ΔW 해제). `stage2.freeze_shared=true`면 ΔW만 | `stage2.learning_rate` | `stage2.loss` | `<run>/stage2` |
 
 각 stage는 새 Trainer·optimizer·scheduler로 시작하고, 검증 기준 최적 epoch의 가중치를
 `load_best_model_at_end`로 불러온다. 선택 기준은 `eval_loss`이며, `rmse_mape`는 전체
@@ -547,6 +547,9 @@ python train.py --config-name config_<city> "description='실험 설명'" \
   stage 1을 건너뛴다. 저장·요청 config는 적응 노드 관련 필드와 메타데이터 외에 같아야
   하고, 저장된 ΔW는 모두 0이어야 한다. ΔW는 새 노드 목록으로 0부터 다시 만든다.
   optimizer·scheduler·step은 복원하지 않는다.
+  stage 1 체크포인트는 `<run>/stage1/checkpoint-<step>`(stage 1 best epoch)이다.
+- **`stage2.freeze_shared`** (기본 false): true면 stage 2에서 ΔW를 제외한 공유 가중치를 모두 고정한다.
+  채택 모델 stage 1에서 5시드로 비교한 결과 울산 RMSE·MAE −0.1%(4/5), Porto는 차이 없음.
 - **`limit_samples`**: 각 split 앞쪽 N개만 쓰는 스모크용.
 - **결과 JSON**: `run_json`이 있으면 그 경로, 없으면
   `output/<project_name>/runs/<city>_<loss_type>_<ablation>[_nodeadaptive]_seed<seed>.json`.
