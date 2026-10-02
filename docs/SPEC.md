@@ -225,6 +225,8 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | 검색 | `use_retrieval` | **false** |
 | | `retrieval_local_radius` | 미지정 → `local_radius` |
 | | `retrieval_k`, `retrieval_chunk_size`, `retrieval_scope` | 20, 256, `observed_past` |
+| 기능적 이웃 | `functional_neighbor_k`, `functional_neighbor_mode` | 0 (끔), `raw` — masked Transformer 수용 영역(`local_radius × transformer_layers`) 밖에서 train 구간 상관(`raw` 원 시계열 / `residual` 요일×시각 평균을 뺀 잔차)이 가장 큰 노드 k개를 train.py가 골라 `functional_neighbors`로 주입. 그 최근 수요 평균의 `Linear(1→D)(log1p)`를 노드 토큰에 더한다 |
+| 추가 context | `context_extra_dim`, `context_features` | 0, [] — train.py가 `data.context_features`에서 주입. 채널은 날씨·요일·시간 뒤에 붙는다 |
 | 노드 적응 | `node_adaptive`, `node_adaptive_min_demand` | true, 0.1 |
 | 손실 | `loss_type` | `mae` |
 | | `loss_gamma`, `loss_eps`, `rmse_weight`, `split_threshold`, `split_high_weight` | 1.0, 0.5, 10.0, 1.0, 1.0 |
@@ -255,7 +257,10 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 - `project_name=merged`, `seed=2026`, `device=cuda`.
 - `dataset.train_ratio=0.70`, `dataset.val_ratio=0.15`.
 - `data`: `daily_period=24`, `daily_lags=6`, `weekly_period=168`, `weekly_lags=4`,
-  `lag_radius=0`.
+  `lag_radius=0`, `context_features=[]`(선택: `holiday` 공휴일 0/1 — `configs/dataset/<city>.yaml`의
+  `start_time`·`holidays` 필요, 울산은 2025-01-27 임시공휴일 포함 / `city_demand` 도시 전체 수요
+  `log1p(합)/log1p(train 최댓값)`). 최근 창은 `[t−k, t)`, lag는 각 lag 시점 값이며 `context_extra`,
+  `daily_context_extra`, `weekly_context_extra`로 모델에 들어간다.
 - `train`: batch Ulsan 24 / Porto 8 (train·eval 동일), `num_train_epochs=120`,
   `optim=adamw_torch_fused`, `learning_rate=1e-3`, `weight_decay=0.05`, `max_grad_norm=5.0`,
   `lr_scheduler_type=constant`, `warmup_ratio=0`, epoch 단위 log/eval/save,
