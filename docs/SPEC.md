@@ -648,6 +648,11 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
     `time_step`을 따른다).
   - 커밋 `b79e824`, 날씨 3채널 z-score, 5시드 `maskedgrid3_{ulsan,porto}_seed{seed}_b79e824`:
     `output/past/adopted_b79e824/`. 커밋 `b79e824`의 코드로만 불러올 수 있다.
+- **후보 모델**(나중에 다시 볼 실험)은 `output/candidate/`에 둔다(`runs/`, `checkpoints/` 구조는 채택 모델과 같다):
+  - `center_nzTauLearn1_ulsan_seed245_k5_d84854f` (울산 시드 245): 검색 top-5, 노드 label
+    `sigmoid(a·s+b)·Embedding(bucket)` 합 C를 `(1−w)·C + w·O`(`w = e^{−m/τ}`, m = 질의의 0 아닌 칸 수,
+    τ 학습)로 섞어 `h_neural`에 concat. 채택 모델 대비 RMSE +0.37%, MAE −0.07%, MAPE −1.12%.
+    커밋 `d84854f`의 코드로만 불러올 수 있다(현재 코드는 이 융합을 되돌렸다).
 
 ---
 
