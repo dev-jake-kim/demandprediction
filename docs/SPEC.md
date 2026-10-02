@@ -172,7 +172,7 @@ UnifiedDemandDataset(
 | `demand_history` | `[k,H,W]` float32 | 수요 `[t-k, t)` (raw) |
 | `labels` | `[H,W]` float32 | 수요 `t` |
 | `sample_idx` | `[]` long | 절대 시간 인덱스 `t` |
-| `weather` | `[k,3]` float32 | 기온·강수·적설 `[t-k+1, t+1)` (예측 시점 날씨 포함) |
+| `weather` | `[k,3]` float32 | 기온·강수·적설 CSV 행 `[t-k+1+ℓ, t+1+ℓ)` (예측 시점 날씨 포함, `ℓ = data.weather_lead`, 기본 0) |
 | `hour_of_day`, `day_of_week` | `[k]` long | `[t-k, t)`의 시각(0–23)·요일(0–6) |
 | `daily_demand` / `weekly_demand` | `[L,N,1]` float32 | lag 시점의 raw 수요 |
 | `daily_mask` / `weekly_mask` | `[L]` bool | **True = 무효 lag** |
@@ -190,6 +190,11 @@ UnifiedDemandDataset(
   lag 원천 시점이 `<0`이면 수요·context를 0으로 채우고 mask를 True로 둔다.
 - 날씨 CSV: cp949, 열 `기온(°C)`, `강수량(mm)`, `적설(cm)` 순서. 강수·적설 결측은 0으로
   채우고 기온 결측은 허용하지 않는다. 결과는 유한해야 한다.
+- 기상청 ASOS 시간 자료의 강수는 정시 기준 **직전 1시간 누적**이고(행 `h` = `[h−1, h)`), 수요 격자의
+  시각 `h`는 `[h, h+1)` 호출 수다. `ℓ=0`이면 최근 창 마지막 행이 `[t−1, t)` 강수라 예측 시각 `t`의
+  강수를 보지 못한다. `data.weather_lead=1`이면 행을 한 칸 당겨 마지막 행이 `[t, t+1)` 강수(예보 가정)가
+  된다. 마지막 시각 뒤는 마지막 행을 반복한다. lag 시점 날씨는 바꾸지 않는다. 값은 checkpoint config
+  `weather_lead`에 저장되어 `test.py`가 따른다.
 - 데이터셋은 정규화하지 않는다. 수요 `log1p`와 날씨 정규화는 모델이 한다.
 
 </details>

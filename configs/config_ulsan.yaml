@@ -24,6 +24,8 @@ data:
   context_features: []
   # 이벤트(공연·축제 등) 표 CSV(node,start,end). 주면 공유 이벤트 임베딩을 Transformer 입력 토큰에 더한다. 예: data/raw/ulsan_events.csv
   event_csv: null
+  # 최근 창 날씨 행을 당기는 칸 수. ASOS 강수는 직전 1시간 누적이라 1이면 예측 시각 [t, t+1) 강수까지 본다(예보 가정).
+  weather_lead: 0
 
 train:
 

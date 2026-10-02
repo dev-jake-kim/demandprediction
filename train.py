@@ -171,6 +171,7 @@ def build_dataset_kwargs(cfg: DictConfig) -> dict:
         'event_csv_path': (
             str((Path.cwd() / str(cfg.data.event_csv)).resolve()) if cfg.data.get('event_csv') else None
         ),
+        'weather_lead': int(cfg.data.get('weather_lead', 0) or 0),
     }
 
 
@@ -415,6 +416,7 @@ def main(cfg: DictConfig) -> None:
         functional_neighbors=functional_neighbors,
         use_event_embedding=dataset_kwargs['event_csv_path'] is not None,
         event_csv_path=dataset_kwargs['event_csv_path'],
+        weather_lead=dataset_kwargs['weather_lead'],
     )
     if dataset_kwargs['event_csv_path'] is not None:
         logger.info(

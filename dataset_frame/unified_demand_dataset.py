@@ -134,6 +134,7 @@ class UnifiedDemandDataset(Dataset):
         start_time: str | None = None,
         holidays: Sequence[str] = (),
         event_csv_path: str | Path | None = None,
+        weather_lead: int = 0,
     ) -> None:
         super().__init__()
         if not 0 < train_ratio < 1 or not 0 <= val_ratio < 1 or train_ratio + val_ratio >= 1:
@@ -178,6 +179,15 @@ class UnifiedDemandDataset(Dataset):
 
         self.weather = load_weather_table(weather_csv_path, self.total_steps)
         self.weather_csv_path = Path(weather_csv_path).expanduser().resolve()
+        # 최근 창 날씨를 weather_lead 행 당긴 표 (ASOS 강수는 직전 1시간 누적이라 1이면 [t, t+1) 강수까지 본다).
+        if weather_lead < 0:
+            raise ValueError('weather_lead must be non-negative')
+        self.weather_lead = int(weather_lead)
+        self.recent_weather_table = (
+            self.weather if self.weather_lead == 0 else np.concatenate(
+                [self.weather[self.weather_lead:], np.repeat(self.weather[-1:], self.weather_lead, axis=0)]
+            )
+        )
         all_times = np.arange(self.total_steps, dtype=np.int64)
         self.hour_table, self.day_of_week_table = _calendar_features(all_times)
         self.context_features = tuple(context_features)
@@ -281,8 +291,8 @@ class UnifiedDemandDataset(Dataset):
         history = self.grid[target_time - self.time_step : target_time]
         target = self.grid[target_time]
 
-        # Weather includes the target-time forecast window [t-k+1, t+1); calendar uses [t-k, t).
-        recent_weather = self.weather[target_time - self.time_step + 1 : target_time + 1]
+        # Weather includes the target-time forecast window [t-k+1, t+1) of the (lead-shifted) table; calendar uses [t-k, t).
+        recent_weather = self.recent_weather_table[target_time - self.time_step + 1 : target_time + 1]
         recent_times = np.arange(target_time - self.time_step, target_time, dtype=np.int64)
         recent_hour, recent_day_of_week = _calendar_features(recent_times)
 
