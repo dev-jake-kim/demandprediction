@@ -226,6 +226,8 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | | `retrieval_local_radius` | 미지정 → `local_radius` |
 | | `retrieval_k`, `retrieval_chunk_size`, `retrieval_scope` | 20, 256, `observed_past` |
 | | `retrieval_encoder_path` | null (단독 학습 검색 encoder `encoder.pt`; 있으면 유사도를 encoder latent 거리로) |
+| | `retrieval_query` | `local` (노드별 3×3 창) / `global` (지도 전체 창, 고른 시점을 모든 노드가 공유) |
+| | `retrieval_injection` | `output_gate` (λ 혼합) / `local_concat` (`h_neural`에 concat, gate 우회) |
 | 노드 적응 | `node_adaptive`, `node_adaptive_min_demand` | true, 0.1 |
 | 손실 | `loss_type` | `mae` |
 | | `loss_gamma`, `loss_eps`, `rmse_weight`, `split_threshold`, `split_high_weight` | 1.0, 0.5, 10.0, 1.0, 1.0 |
@@ -296,8 +298,8 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
 - `forward`는 HF `Trainer`용으로 `logits`와(라벨이 있으면) `loss`만 반환한다.
 - `forward_debug`는 같은 계산의 전체 결과를 반환한다: `logits`, `prediction`,
   `prediction_flat`, `neural_pred`, `ir_out`, `lambda_weight`, `attention_weights`,
-  `h_neural`, `h_attn`, `daily_valid`, `weekly_valid`, `loss`, `loss_sum`.
-  검색 pass에서는 `ir_out=None`, `lambda_weight=1`이다.
+  `h_neural`, `h_local`, `h_attn`, `daily_valid`, `weekly_valid`, `loss`, `loss_sum`.
+  검색 pass에서는 `ir_out=None`, `lambda_weight=1`, `h_local = h_neural`이다.
 - `configure_loss`는 손실을 교체하고 `config.loss_type`(및 `rmse_weight`)을 함께 갱신해
   체크포인트가 마지막 학습 손실을 기록하게 한다.
 - `node_delta_parameters`는 노드별 ΔW 파라미터를 반환한다(적응 꺼짐이면 빈 튜플).
@@ -418,10 +420,13 @@ attention mask로 표현한다.
 `forward(h_attn, ir_out | None, *, bypass_gate=False) → (neural_pred [B,N], lambda [B,N], prediction [B,N])`
 
 - `neural_pred = Softplus(neural_head(h_attn))` (`use_softplus=false`면 raw).
-- 검색 pass(`bypass_gate=True`): `prediction = neural_pred`, `lambda = 1`.
-  `lambda_layer`는 사용하지 않는다.
-- 검색 켬: `λ = σ(lambda_layer([h_attn, ir_out]))`,
+- 검색 pass 또는 `retrieval_injection=local_concat`(`bypass_gate=True`): `prediction = neural_pred`,
+  `lambda = 1`. `lambda_layer`는 사용하지 않는다.
+- 검색 켬 + `output_gate`: `λ = σ(lambda_layer([h_attn, ir_out]))`,
   `prediction = λ·neural_pred + (1−λ)·ir_out`.
+- `retrieval_injection=local_concat`이면 검색 결과를 출력이 아니라 local 표현에 섞는다:
+  `h_local = Linear(2·history_hidden → history_hidden)([h_neural ⊕ Linear(1 → history_hidden)(log1p(ir_out))])`
+  (`RetrievalLocalFusion`)이 BranchAttention에서 `h_neural`을 대신한다.
 - `prediction`을 `[B,H,W]`로 reshape한 것이 `logits`다.
 
 ### 6.6 `CausalRetrieval` (선택 경로)
@@ -434,8 +439,12 @@ attention mask로 표현한다.
 
 - 생성 시 `retrieval_grid_path`의 `[T,H,W]` 격자를 읽어 모든 시점의 이웃 창
   (`P_r=(2r+1)²`, `r = retrieval_local_radius ?? local_radius`)을 CPU에 만든다.
-- query: 최근 수요에서 노드별 `[k·P_r]` raw 창(격자 밖 0)을 잘라 L2 정규화. 후보 시점 τ의
-  창은 `[τ−k, τ)`.
+- query (`retrieval_query=local`): 최근 수요에서 노드별 `[k·P_r]` raw 창(격자 밖 0)을 잘라 L2 정규화.
+  후보 시점 τ의 창은 `[τ−k, τ)`. 노드마다 고른 시점이 다르다.
+- query (`retrieval_query=global`): 지도 전체 `[t−k, t)`(`k·N` 값)를 한 벡터로 펴 L2 정규화하고, 같은 방식의
+  후보 `[τ−k, τ)`와 cosine top-k를 고른다. 고른 시점 τ와 softmax 가중치는 **모든 노드가 공유**하고,
+  노드 n의 값은 `Σ w·grid[τ, n]`이다(위치마다 값은 다르다). 결과는 t에만 의존하므로 모든 t의 표
+  `[T,N]`을 첫 forward에서 입력 장치에 한 번 계산한다(Ulsan 0.14초). encoder 유사도와는 함께 쓸 수 없다.
 - 후보 범위: `τ ∈ [k, end)`, `end = t`(`observed_past`) 또는 `min(t, retrieval_train_end)`
   (`train_prefix`). 예측 시점과 미래는 후보가 될 수 없다.
 - 유사도는 기본이 raw 창 코사인이다. `retrieval_encoder_path`가 있으면 단독 학습한 검색 encoder
@@ -587,6 +596,8 @@ python test.py <checkpoint_dir> --city {ulsan,porto} --weather_csv_path <csv> \
 - 검색 후보가 `τ < t`만 사용.
 - encoder 유사도 검색(`retrieval_encoder_path`): 브루트포스 latent 거리 검색과 일치, `t` 이후 값과 무관,
   encoder eval 출력에 잡음 없음(train에는 있음), 메인 모델 체크포인트 복원 후 예측 동일.
+- global 검색: 브루트포스 지도 전체 cosine 검색과 일치, 모든 노드가 같은 시점 공유, `t` 이후 값과 무관,
+  encoder와 함께 쓰면 거부. `local_concat` 주입: gate 우회(`λ=1`), 융합 Linear에 gradient, 체크포인트 복원 동일.
 - Transformer 3×3에서 검색 창 3×3·5×5 선택이 forward에 반영.
 - 검색 pass: grid 없이 생성·예측·체크포인트 복원, `prediction = neural_pred`, `λ=1`.
 - masked Transformer 수용 영역: 1층은 반경 1, 2층은 반경 2 밖 수요에 무반응(eval·no_grad).

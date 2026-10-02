@@ -1,4 +1,4 @@
-"""Final neural/retrieval prediction gate."""
+"""Final neural/retrieval prediction gate and local-representation retrieval fusion."""
 
 from __future__ import annotations
 
@@ -34,4 +34,21 @@ class NeuralRetrievalGate(nn.Module):
         return neural_pred, lambda_weight, prediction
 
 
-__all__ = ["NeuralRetrievalGate"]
+class RetrievalLocalFusion(nn.Module):
+    """``retrieval_injection='local_concat'``: 검색 결과를 local 표현에 섞는다.
+
+    ``h_local = Linear(2H → H)([h_neural ⊕ Linear(1 → H)(log1p(ir_out))])``, ``H = history_hidden``.
+    ``h_local``이 BranchAttention에서 ``h_neural``을 대신한다.
+    """
+
+    def __init__(self, history_hidden: int) -> None:
+        super().__init__()
+        self.value_projection = nn.Linear(1, history_hidden)
+        self.fuse = nn.Linear(2 * history_hidden, history_hidden)
+
+    def forward(self, h_neural: Tensor, ir_out: Tensor) -> Tensor:
+        r_emb = self.value_projection(torch.log1p(ir_out.clamp_min(0.0)).unsqueeze(-1).to(h_neural.dtype))
+        return self.fuse(torch.cat([h_neural, r_emb], dim=-1))
+
+
+__all__ = ["NeuralRetrievalGate", "RetrievalLocalFusion"]

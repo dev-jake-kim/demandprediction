@@ -21,6 +21,7 @@ from .modules import (
     LocalHistoryEncoder,
     NeuralRetrievalGate,
     PeriodicLSTMEncoder,
+    RetrievalLocalFusion,
 )
 
 WEATHER_CHANNELS = 2  # 기온, 강수 + g·적설
@@ -150,8 +151,19 @@ class MergedDemandModel(PreTrainedModel):
                 retrieval_scope=config.retrieval_scope,
                 retrieval_train_end=config.retrieval_train_end,
                 retrieval_encoder_path=config.retrieval_encoder_path,
+                query_space=config.retrieval_query,
             )
             if self.use_retrieval else None
+        )
+        if config.retrieval_injection not in ('output_gate', 'local_concat'):
+            raise ValueError(
+                f"retrieval_injection은 'output_gate'|'local_concat' (받음: {config.retrieval_injection!r})"
+            )
+        self.retrieval_injection = config.retrieval_injection
+        # local_concat: 검색 결과를 h_neural에 concat해 BranchAttention 앞에서 섞고, 출력 gate는 우회한다.
+        self.retrieval_fusion = (
+            RetrievalLocalFusion(config.history_hidden)
+            if self.use_retrieval and self.retrieval_injection == 'local_concat' else None
         )
         self.output_gate = NeuralRetrievalGate(config.fusion_dim, use_softplus=self.use_softplus)
         self.loss_fn: nn.Module
@@ -250,6 +262,8 @@ class MergedDemandModel(PreTrainedModel):
 
         weather_cls = self._weather_features(weather) if self.weather_cls_dim else None
         h_neural = self.local_history(demand_history, recent_extra, weather_cls)
+        ir_out = self.retrieval(demand_history, sample_idx) if self.retrieval is not None else None
+        h_local = h_neural if self.retrieval_fusion is None else self.retrieval_fusion(h_neural, ir_out)
         # Ablation은 브랜치 출력을 0으로 바꾸되 valid mask와 모듈 shape은 유지한다.
         h_daily, daily_valid = self.daily_branch(daily_demand, daily_mask, daily_extra)
         if not self.use_daily:
@@ -258,15 +272,13 @@ class MergedDemandModel(PreTrainedModel):
         if not self.use_weekly:
             h_weekly = torch.zeros_like(h_weekly)
         h_attn, attention_weights = self.branch_attention(
-            h_neural, h_daily, h_weekly, daily_valid, weekly_valid
+            h_local, h_daily, h_weekly, daily_valid, weekly_valid
         )
 
-        if self.retrieval is not None:
-            ir_out = self.retrieval(demand_history, sample_idx)
+        if ir_out is not None and self.retrieval_injection == 'output_gate':
             neural_pred, lambda_weight, prediction = self.output_gate(h_attn, ir_out)
         else:
-            # 검색 pass에서는 zero retrieval을 gate에 넣지 않고 우회한다.
-            ir_out = None
+            # 검색 끔이나 local_concat에서는 gate를 우회한다(λ = 1).
             neural_pred, lambda_weight, prediction = self.output_gate(h_attn, None, bypass_gate=True)
         prediction_grid = prediction.reshape(-1, self.height, self.width)
 
@@ -279,6 +291,7 @@ class MergedDemandModel(PreTrainedModel):
             'lambda_weight': lambda_weight,
             'attention_weights': attention_weights,
             'h_neural': h_neural,
+            'h_local': h_local,
             'h_attn': h_attn,
             'daily_valid': daily_valid,
             'weekly_valid': weekly_valid,

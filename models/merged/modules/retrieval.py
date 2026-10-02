@@ -1,8 +1,14 @@
 """Raw local-window retrieval with a causal time boundary.
 
-유사도는 기본이 raw 창 cosine이고, ``retrieval_encoder_path``가 있으면 단독 학습한 검색 encoder의
-latent 거리 ``−‖μ_q − μ_τ‖² / (L·T)``로 바꾼다(docs/RETRIEVAL_ENCODER.md). 후보 범위·top-k·
-softmax 가중평균·값(노드 자신의 τ 시점 수요)은 같다.
+질의(``query_space``):
+
+- ``local``: 노드마다 자기 주변 창 ``[t−k, t)``로 따로 검색한다(노드마다 고른 시점이 다르다).
+  유사도는 기본이 raw 창 cosine이고, ``retrieval_encoder_path``가 있으면 단독 학습한 검색 encoder의
+  latent 거리 ``−‖μ_q − μ_τ‖² / (L·T)``로 바꾼다(docs/RETRIEVAL_ENCODER.md).
+- ``global``: 지도 전체 ``[t−k, t)``(``k·N`` 값)를 한 벡터로 펴 cosine top-k 시점을 고르고, 그 시점들을
+  모든 노드가 공유한다. 노드마다 자기 위치의 ``grid[τ, n]``을 같은 가중치로 평균한다.
+
+후보 범위·top-k·softmax 가중평균·값(노드 자신의 τ 시점 수요)은 두 질의에서 같다.
 """
 
 from __future__ import annotations
@@ -32,10 +38,18 @@ class CausalRetrieval(nn.Module):
         retrieval_scope: Literal["observed_past", "train_prefix"],
         retrieval_train_end: int | None,
         retrieval_encoder_path: str | Path | None = None,
+        query_space: Literal["local", "global"] = "local",
     ) -> None:
         super().__init__()
         if retrieval_scope not in {"observed_past", "train_prefix"}:
             raise ValueError("retrieval_scope must be 'observed_past' or 'train_prefix'")
+        if query_space not in {"local", "global"}:
+            raise ValueError("retrieval_query must be 'local' or 'global'")
+        if query_space == "global" and retrieval_encoder_path is not None:
+            raise ValueError("retrieval_encoder_path는 노드별(local) 질의 전용이다")
+        self.query_space = query_space
+        # global 질의: 모든 t의 결과 [T, N]과 고른 시점·유사도 [T, K] (첫 forward에서 계산).
+        self._global: tuple[Tensor, Tensor, Tensor] | None = None
         self.height = height
         self.width = width
         self.num_nodes = height * width
@@ -107,11 +121,65 @@ class CausalRetrieval(nn.Module):
         return self._encoded
 
     @torch.no_grad()
+    def global_table(self, device: torch.device) -> tuple[Tensor, Tensor, Tensor]:
+        """지도 전체 질의의 ``(retrieved [T, N], times [T, K], scores [T, K])``.
+
+        질의·후보 벡터는 창 ``[τ−k, τ)``의 전체 격자를 편 ``[k·N]``을 L2 정규화한 것이다. 후보는
+        ``τ ∈ [k, end)`` (``end = t`` 또는 ``min(t, retrieval_train_end)``)이고, 고른 시점 τ는 모든 노드가
+        공유한다. 후보가 없는 행(``t ≤ k``)은 retrieved 0, times −1, scores −inf다.
+        """
+
+        device = torch.device(device)
+        if self._global is not None and self._global[0].device == device:
+            return self._global
+        assert self._grid is not None
+        grid = self._grid.to(device).reshape(self._grid.shape[0], -1)  # [T, N]
+        total, k = grid.shape[0], self.time_step
+        top = self.retrieval_k
+        retrieved = grid.new_zeros(total, grid.shape[1])
+        times = torch.full((total, top), -1, dtype=torch.long, device=device)
+        scores = grid.new_full((total, top), float("-inf"))
+        if total > k:
+            windows = grid.unfold(0, k, 1)[: total - k]  # [C, N, k], 창 [c, c+k) → 시점 c + k
+            keys = windows.reshape(total - k, -1)
+            keys = keys / keys.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            limit = None
+            if self.retrieval_scope == "train_prefix":
+                if self.retrieval_train_end is None:
+                    raise ValueError("retrieval_train_end is required for train_prefix retrieval")
+                limit = int(self.retrieval_train_end)
+            candidate_times = torch.arange(k, total, device=device)
+            for start in range(0, total - k, self.retrieval_chunk_size):
+                stop = min(start + self.retrieval_chunk_size, total - k)
+                query_times = candidate_times[start:stop]
+                similarity = keys[start:stop] @ keys.T  # [Q, C]
+                end = query_times if limit is None else query_times.clamp_max(limit)
+                allowed = candidate_times.unsqueeze(0) < end.unsqueeze(1)
+                similarity = similarity.masked_fill(~allowed, float("-inf"))
+                take = min(top, similarity.shape[-1])
+                best_scores, best_index = similarity.topk(take, dim=-1)
+                valid = torch.isfinite(best_scores)
+                weights = torch.softmax(best_scores, dim=-1).nan_to_num(0.0)  # 후보 없음 → 0
+                best_times = torch.where(valid, candidate_times[best_index], -1)
+                values = grid[best_times.clamp_min(0)] * valid.unsqueeze(-1)  # [Q, K, N]
+                retrieved[query_times] = (weights.unsqueeze(-1) * values).sum(dim=1)
+                times[query_times, :take] = best_times
+                scores[query_times, :take] = best_scores
+        self._global = (retrieved, times, scores)
+        return self._global
+
+    @torch.no_grad()
     def forward(self, demands: Tensor, sample_idx: Tensor) -> Tensor:
         """``[B, k, H, W]`` 최근 수요로 인과 후보를 검색해 ``[B, N]`` raw 값을 반환한다."""
 
         if demands.ndim != 4 or tuple(demands.shape[1:]) != (self.time_step, self.height, self.width):
             raise ValueError("Unexpected retrieval query shape")
+        if self.query_space == "global":
+            if self._grid is None:
+                return demands.new_zeros((demands.shape[0], self.num_nodes))
+            retrieved, _, _ = self.global_table(demands.device)
+            index = sample_idx.to(device=demands.device, dtype=torch.long).clamp(0, retrieved.shape[0] - 1)
+            return retrieved[index]
         local_crop = self._crop(demands)
         batch, steps, nodes, neighbors = local_crop.shape
         if self._grid is None or self._crops is None:

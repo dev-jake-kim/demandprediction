@@ -388,6 +388,94 @@ def _check_encoder_retrieval() -> dict:
             'encoder_retrieval_roundtrip': True}
 
 
+def _check_global_retrieval() -> dict:
+    """global 질의: 지도 전체 cosine 검색이 브루트포스와 같고(모든 노드가 같은 시점 공유), t 이후 값과
+    무관하며, local_concat 주입이 gate를 우회하고 gradient·체크포인트 복원이 정상인지 확인한다."""
+
+    height, width, k, top, target = 3, 3, 2, 3, 9
+    grid = np.random.default_rng(2).integers(0, 5, size=(14, height, width)).astype(np.float32)
+    with tempfile.TemporaryDirectory(prefix='merged_global_') as temp_dir:
+        grid_path = Path(temp_dir) / 'grid.npy'
+
+        def build(values: np.ndarray) -> CausalRetrieval:
+            np.save(grid_path, values, allow_pickle=False)
+            return CausalRetrieval(
+                height=height, width=width, time_step=k, local_radius=1, retrieval_grid_path=grid_path,
+                retrieval_k=top, retrieval_chunk_size=4, retrieval_scope='observed_past',
+                retrieval_train_end=None, query_space='global',
+            )
+
+        history = torch.from_numpy(grid[target - k:target]).unsqueeze(0)
+        retrieval = build(grid)
+        actual = retrieval(history, torch.tensor([target]))[0]
+        flat = torch.from_numpy(grid).reshape(len(grid), -1).double()
+
+        def key(t: int) -> torch.Tensor:
+            window = flat[t - k:t].T.reshape(-1)  # [N, k] 순서(구현과 같음; cosine은 순서 무관)
+            return window / window.norm().clamp_min(1e-8)
+
+        scores = torch.stack([key(target) @ key(tau) for tau in range(k, target)])
+        best_scores, best_index = scores.topk(top)
+        expected = (torch.softmax(best_scores, 0).unsqueeze(1) * flat[k + best_index]).sum(0)
+        if not torch.allclose(actual.double(), expected, atol=1e-5):
+            raise AssertionError('global retrieval differs from brute-force full-map cosine search')
+        _, times, _ = retrieval.global_table(torch.device('cpu'))
+        if times.shape != (len(grid), top) or sorted(times[target].tolist()) != sorted((k + best_index).tolist()):
+            raise AssertionError('global retrieval does not share one set of time indices across nodes')
+        changed = grid.copy()
+        changed[target:] = 100.0
+        if not torch.equal(build(changed)(history, torch.tensor([target]))[0], actual):
+            raise AssertionError('global retrieval used target or future values')
+        try:
+            CausalRetrieval(
+                height=height, width=width, time_step=k, local_radius=1, retrieval_grid_path=None,
+                retrieval_k=top, retrieval_chunk_size=4, retrieval_scope='observed_past',
+                retrieval_train_end=None, retrieval_encoder_path='x.pt', query_space='global',
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('global query accepted a per-node retrieval encoder')
+
+        np.save(grid_path, grid, allow_pickle=False)
+        config = MergedDemandConfig(
+            height=height, width=width, time_step=k, local_radius=1, d_model=8, transformer_heads=2,
+            transformer_layers=1, retrieval_grid_path=str(grid_path), retrieval_k=top,
+            retrieval_query='global', retrieval_injection='local_concat',
+            temperature_min=-5.0, temperature_max=30.0, precipitation_max=20.0,
+        )
+        batch = {
+            'demand_history': history, 'daily_demand': torch.ones(1, 2, 9, 1),
+            'daily_mask': torch.zeros(1, 2, dtype=torch.bool), 'weekly_demand': torch.ones(1, 2, 9, 1),
+            'weekly_mask': torch.zeros(1, 2, dtype=torch.bool), 'sample_idx': torch.tensor([target]),
+            'weather': torch.zeros(1, k, 3), 'hour_of_day': torch.zeros(1, k, dtype=torch.long),
+            'day_of_week': torch.zeros(1, k, dtype=torch.long), 'daily_weather': torch.zeros(1, 2, 3),
+            'daily_hour': torch.zeros(1, 2, dtype=torch.long), 'daily_day_of_week': torch.zeros(1, 2, dtype=torch.long),
+            'weekly_weather': torch.zeros(1, 2, 3), 'weekly_hour': torch.zeros(1, 2, dtype=torch.long),
+            'weekly_day_of_week': torch.zeros(1, 2, dtype=torch.long),
+        }
+        model = MergedDemandModel(config)
+        out = model.forward_debug(**batch)
+        if not (torch.equal(out['logits'].flatten(1), out['neural_pred']) and torch.all(out['lambda_weight'] == 1)):
+            raise AssertionError('local_concat injection did not bypass the output gate')
+        if not torch.allclose(out['ir_out'][0], expected.float(), atol=1e-5):
+            raise AssertionError('main model ir_out does not use the global retrieval')
+        out['logits'].sum().backward()
+        grad = model.retrieval_fusion.value_projection.weight.grad
+        if grad is None or not bool(grad.abs().sum() > 0):
+            raise AssertionError('local_concat retrieval fusion receives no gradient')
+        model.eval()
+        checkpoint = Path(temp_dir) / 'checkpoint'
+        with torch.no_grad():
+            before = model.forward_debug(**batch)['logits']
+            model.save_pretrained(checkpoint)
+            after = MergedDemandModel.from_pretrained(checkpoint).eval().forward_debug(**batch)['logits']
+        if not torch.equal(before, after):
+            raise AssertionError('global/local_concat checkpoint round trip changed predictions')
+    return {'global_retrieval_matches_bruteforce': True, 'global_shared_time_index': True,
+            'local_concat_bypasses_gate': True, 'global_local_concat_roundtrip': True}
+
+
 def _check_independent_retrieval_radius() -> dict:
     """Verify retrieval radius is independent of the Transformer radius."""
     with tempfile.TemporaryDirectory(prefix='merged_window_') as temp_dir:
@@ -513,6 +601,7 @@ def main() -> None:
     results.append(_check_node_adaptive_identity())
     results.append(_check_retrieval_boundary())
     results.append(_check_encoder_retrieval())
+    results.append(_check_global_retrieval())
     results.append(_check_independent_retrieval_radius())
     results.append(_check_retrieval_pass())
     results.append(_check_masked_grid_receptive_field())

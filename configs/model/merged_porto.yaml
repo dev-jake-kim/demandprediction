@@ -19,6 +19,10 @@ retrieval_chunk_size: 256
 retrieval_scope: observed_past
 # 단독 학습한 검색 encoder(encoder.pt) 절대경로. null이면 raw 창 cosine 유사도.
 retrieval_encoder_path: null
+# 검색 질의: local(노드별 3×3 창) | global(지도 전체 창, 고른 시점을 모든 노드가 공유).
+retrieval_query: local
+# 검색 결과 주입: output_gate(λ·neural + (1−λ)·ir_out) | local_concat(h_neural에 concat 후 Linear).
+retrieval_injection: output_gate
 # 날씨 특성은 임베딩 없이 3개 채널로 주입한다.
 weekday_dim: 7
 hour_dim: 5

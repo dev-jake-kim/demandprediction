@@ -35,6 +35,8 @@ class MergedDemandConfig(PretrainedConfig):
         retrieval_scope: str = 'observed_past',
         retrieval_train_end: int | None = None,
         retrieval_encoder_path: str | None = None,
+        retrieval_query: str = 'local',
+        retrieval_injection: str = 'output_gate',
         temperature_min: float | None = None,
         temperature_max: float | None = None,
         precipitation_max: float | None = None,
@@ -83,6 +85,10 @@ class MergedDemandConfig(PretrainedConfig):
         # 단독 학습한 검색 encoder(train_retrieval_encoder.py의 encoder.pt). 있으면 검색 유사도를
         # raw 창 cosine 대신 encoder latent 거리로 바꾼다.
         self.retrieval_encoder_path = retrieval_encoder_path
+        # 검색 질의: 'local'(노드별 주변 창) | 'global'(지도 전체 창, 고른 시점을 모든 노드가 공유).
+        self.retrieval_query = retrieval_query
+        # 검색 결과 주입: 'output_gate'(λ·neural + (1−λ)·ir_out) | 'local_concat'(h_neural에 concat).
+        self.retrieval_injection = retrieval_injection
         # train 구간 통계. precipitation_max는 snow_scale=1 기준으로 고정한다.
         self.temperature_min = temperature_min
         self.temperature_max = temperature_max
