@@ -563,9 +563,6 @@ def main(cfg: DictConfig) -> None:
         'weather_stats': weather_stats,
         'device': str(trainer.args.device),
         'retrieval_scope': cfg.model.retrieval_scope,
-        'retrieval_encoder_path': cfg.model.retrieval_encoder_path,
-        'retrieval_query': cfg.model.retrieval_query,
-        'retrieval_injection': cfg.model.retrieval_injection,
         # stage별 목적함수를 별도로 기록한다.
         'objective': cfg.model.loss_type,
         'stage1_loss': cfg.model.loss_type,
