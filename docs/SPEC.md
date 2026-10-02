@@ -194,7 +194,8 @@ UnifiedDemandDataset(
   시각 `h`는 `[h, h+1)` 호출 수다. `ℓ=0`이면 최근 창 마지막 행이 `[t−1, t)` 강수라 예측 시각 `t`의
   강수를 보지 못한다. `data.weather_lead=1`이면 행을 한 칸 당겨 마지막 행이 `[t, t+1)` 강수(예보 가정)가
   된다. 마지막 시각 뒤는 마지막 행을 반복한다. lag 시점 날씨는 바꾸지 않는다. 값은 checkpoint config
-  `weather_lead`에 저장되어 `test.py`가 따른다.
+  `weather_lead`에 저장되어 `test.py`가 따른다. 울산 3시드(채택 설정)에서 `ℓ=1`은 RMSE −0.10%,
+  MAPE +0.28%로 차이 없음(기본 0 유지).
 - 데이터셋은 정규화하지 않는다. 수요 `log1p`와 날씨 정규화는 모델이 한다.
 
 </details>
