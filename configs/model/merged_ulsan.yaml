@@ -43,13 +43,14 @@ node_adaptive_min_demand: 0.1
 node_adaptive_mode: additive
 
 
-loss_type: mae
+# 울산: RMSE(평균)와 MAPE(0 쪽)를 함께 맞추는 mse_mape(λ=2). Porto는 mae.
+loss_type: mse_mape
 loss_gamma: 1.0
 loss_eps: 0.5
 # rmse_weight는 loss_type='rmse_mape'에서만 사용한다.
 rmse_weight: 10.0
 # mape_weight는 loss_type='mse_mape'에서만 사용한다(error² + mape_weight·|error|/(y+1)).
-mape_weight: 1.0
+mape_weight: 2.0
 
 # split_*은 loss_type='demand_split'에서만 사용한다.
 split_threshold: 1.0

@@ -235,7 +235,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | 추가 context | `context_extra_dim`, `context_features` | 0, [] — train.py가 `data.context_features`에서 주입. 채널은 날씨·요일·시간 뒤에 붙는다 |
 | 이벤트 | `use_event_embedding`, `event_csv_path` | false, null — train.py가 `data.event_csv`가 있으면 켜고 절대경로를 저장. 공연·축제 등 모든 이벤트에 **같은** 학습 임베딩 `event_embedding [D]`(0 초기화)을 이벤트 시각·노드의 Transformer 입력 토큰에 더한다(§6.2) |
 | 노드 적응 | `node_adaptive`, `node_adaptive_min_demand`, `node_adaptive_mode` | true, 0.1, `additive` |
-| 손실 | `loss_type` | `mae` |
+| 손실 | `loss_type`, `mape_weight` | 울산 `mse_mape`, 2.0 / Porto `mae` (stage 2도 같은 손실: `stage2.loss`, `stage2.mape_weight`) |
 | | `loss_gamma`, `loss_eps`, `rmse_weight`, `split_threshold`, `split_high_weight` | 1.0, 0.5, 10.0, 1.0, 1.0 |
 
 ### 4.2 기능 스위치
@@ -667,9 +667,12 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
   있다(시드별 CSV, 노드별 지표 `regional_metrics/`). 수치는 `docs/ADFORMER_REFERENCE.md`.
 - **채택 모델**은 `output/adopted/`에 둔다: 결과 JSON은 `runs/`, 체크포인트·학습 로그·GPU 사용률
   기록은 `checkpoints/`의 같은 이름 폴더. 현재 채택 모델은 날씨 2채널(기온, 강수 + g·적설,
-  min-max), `local_radius=1`(3×3), 검색 pass, **입력 시간 창 8시간**, 5시드
-  (245/6835/851/5123/535) `timestep8_{ulsan,porto}_seed{seed}_{39185a1|d02824a}`이다
-  (시드 245는 커밋 `39185a1`, 나머지는 `d02824a`; 두 커밋의 모델 코드는 같다).
+  min-max), `local_radius=1`(3×3), 검색 pass, **입력 시간 창 8시간**, 5시드(245/6835/851/5123/535)다.
+  - 울산: 손실 `mse_mape`(λ=2, stage 1·2), `msemape2_ulsan_seed{seed}_471594f`. ADFormer 8h 대비
+    RMSE 0.7123(−2.29%), MAPE 15.219(−2.39%). MAE 손실은 중앙값을 예측해 평균 대비 23% 과소예측하고
+    RMSE가 막혔다(이전 울산 채택 `timestep8_ulsan_*`는 `output/past/adopted_ulsan_mae_d02824a/`).
+  - Porto: 손실 `mae`, `timestep8_porto_seed{seed}_{39185a1|d02824a}`
+    (시드 245는 커밋 `39185a1`, 나머지는 `d02824a`; 두 커밋의 모델 코드는 같다).
 - 이전 채택 모델:
   - 커밋 `8d28250`, 입력 창 24시간, 시드 245 `weathermerge_{ulsan,porto}_seed245_8d28250`:
     `output/past/adopted_8d28250/`. 현재 코드로 불러올 수 있다(`test.py`는 체크포인트의
