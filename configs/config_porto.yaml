@@ -80,6 +80,8 @@ stage2:
 
   loss: mae
   rmse_weight: 10.0
+  # true면 stage 2에서 공유 가중치를 고정하고 노드별 ΔW만 학습한다.
+  freeze_shared: false
   # init_from은 optimizer 상태 없이 가중치만 이어받는다.
   # null이면 stage 1부터 학습한다.
   init_from: null

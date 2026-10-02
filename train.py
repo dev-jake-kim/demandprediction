@@ -564,6 +564,12 @@ def main(cfg: DictConfig) -> None:
 
         for param in deltas:
             param.requires_grad_(True)
+        # stage2.freeze_shared: 공유 가중치(ΔW 외 전부)를 고정하고 노드별 ΔW만 학습한다.
+        freeze_shared = bool(cfg.stage2.get('freeze_shared', False))
+        if freeze_shared:
+            for name, param in model.named_parameters():
+                if 'node_delta' not in name:
+                    param.requires_grad_(False)
         stage2_loss = str(cfg.stage2.loss)
         model.configure_loss(stage2_loss, rmse_weight=float(cfg.stage2.rmse_weight))
         if stage2_loss == 'rmse_mape':
@@ -583,7 +589,7 @@ def main(cfg: DictConfig) -> None:
             metric_for_best_model=best_metric_key,
         )
         logger.info(
-            f'[stage2] ΔW 해제, lr={cfg.stage2.learning_rate}, '
+            f'[stage2] ΔW 해제{" (공유 가중치 고정)" if freeze_shared else ""}, lr={cfg.stage2.learning_rate}, '
             f'학습 파라미터 {trainable_count(trainer):,}개 '
             f'(ΔW {sum(p.numel() for p in deltas):,}개 포함)'
         )
@@ -615,6 +621,7 @@ def main(cfg: DictConfig) -> None:
         'objective': cfg.model.loss_type,
         'stage1_loss': cfg.model.loss_type,
         'final_loss': str(cfg.stage2.loss) if deltas else cfg.model.loss_type,
+        'stage2_freeze_shared': bool(cfg.stage2.get('freeze_shared', False)) if deltas else None,
         'ablation': cfg.ablation,
         'ablation_mode': ABLATION_MODE,
         # ablation 라벨이 아닌 실제 적용된 스위치를 기록한다.
