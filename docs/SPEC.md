@@ -483,6 +483,9 @@ W_hh(n), b(n)도 같은 식 (공유 b = b_ih + b_hh)
   복사하고 `s ← 1`로 둔다. 그래서 stage 2 시작 시점의 출력은 stage 1과 같다.
   `additive`에서는 아무것도 하지 않는다.
 - 게이트는 노드당 스칼라 1개로 `ih`·`hh`·bias에 같이 쓴다. 파라미터는 additive보다 `A`개 많다.
+- 채택 stage 1 체크포인트에서 stage 2만 5시드로 비교(대조군 additive): 울산 RMSE +0.12%·MAPE −0.13%,
+  Porto RMSE +0.64%(0/5). `g`는 학습 후에도 0.48~0.50에 머물렀다(초기 `V=W`라 logit 기울기가 0에서
+  시작하고, 공용 lr 1e-4로는 logit이 거의 움직이지 않음). 채택하지 않았다.
 
 <details>
 <summary>세부</summary>
