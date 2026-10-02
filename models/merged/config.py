@@ -38,6 +38,7 @@ class MergedDemandConfig(PretrainedConfig):
         context_features: list[str] | None = None,
         functional_neighbor_k: int = 0,
         functional_neighbors: list[list[int]] | None = None,
+        functional_neighbor_mode: str = 'raw',
         temperature_min: float | None = None,
         temperature_max: float | None = None,
         precipitation_max: float | None = None,
@@ -89,6 +90,7 @@ class MergedDemandConfig(PretrainedConfig):
         # 기능적 이웃(train.py가 train 구간 상관으로 골라 주입). k=0이면 끔.
         self.functional_neighbor_k = functional_neighbor_k
         self.functional_neighbors = functional_neighbors
+        self.functional_neighbor_mode = functional_neighbor_mode
         # train 구간 통계. precipitation_max는 snow_scale=1 기준으로 고정한다.
         self.temperature_min = temperature_min
         self.temperature_max = temperature_max

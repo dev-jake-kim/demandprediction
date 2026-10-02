@@ -170,12 +170,21 @@ def build_dataset_kwargs(cfg: DictConfig) -> dict:
     }
 
 
-def select_functional_neighbors(train_ds: UnifiedDemandDataset, k: int, exclude_radius: int) -> list[list[int]]:
+def select_functional_neighbors(
+    train_ds: UnifiedDemandDataset, k: int, exclude_radius: int, residual: bool = False
+) -> list[list[int]]:
     """노드마다 train 구간 수요 시계열 상관이 가장 큰 노드 ``k``개(자기 자신과 격자 거리
     ``exclude_radius`` 이내, 즉 masked Transformer가 이미 보는 노드는 제외). 시간 리크를 막으려고
-    ``[time_step, train_end)``만 쓴다."""
+    ``[time_step, train_end)``만 쓴다. ``residual``이면 노드별 요일×시각 평균을 뺀 잔차의 상관을 써서
+    모든 노드가 공유하는 일·주 주기 대신 실제로 함께 움직이는 노드를 고른다."""
 
-    series = train_ds.grid[train_ds.time_step : train_ds.train_end].reshape(-1, train_ds.num_nodes)
+    start, end = train_ds.time_step, train_ds.train_end
+    series = np.array(train_ds.grid[start:end].reshape(-1, train_ds.num_nodes), dtype=np.float64)
+    if residual:
+        slot = train_ds.day_of_week_table[start:end] * 24 + train_ds.hour_table[start:end]
+        for value in np.unique(slot):
+            at = slot == value
+            series[at] -= series[at].mean(axis=0)
     centered = series - series.mean(axis=0)
     norms = np.sqrt((centered ** 2).sum(axis=0))
     with np.errstate(invalid='ignore', divide='ignore'):
@@ -381,8 +390,12 @@ def main(cfg: DictConfig) -> None:
     functional_neighbors = None
     if functional_k > 0:
         exclude = int(model_kwargs['local_radius']) * int(model_kwargs['transformer_layers'])
-        functional_neighbors = select_functional_neighbors(train_ds, functional_k, exclude)
-        logger.info(f'[functional_neighbors] k={functional_k}, 격자 거리 {exclude} 이내 제외')
+        residual = model_kwargs.get('functional_neighbor_mode', 'raw') == 'residual'
+        functional_neighbors = select_functional_neighbors(train_ds, functional_k, exclude, residual)
+        logger.info(
+            f'[functional_neighbors] k={functional_k}, 격자 거리 {exclude} 이내 제외, '
+            f'상관 기준 {"요일×시각 잔차" if residual else "원 시계열"}'
+        )
 
     model_config = MergedDemandConfig(
         height=train_ds.height,
