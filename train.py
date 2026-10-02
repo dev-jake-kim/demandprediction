@@ -17,7 +17,6 @@ import subprocess
 from pathlib import Path
 
 import hydra
-import numpy as np
 import torch
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
@@ -33,9 +32,6 @@ logger = logging.getLogger(__name__)
 SDPA_BATCH_LIMIT = 65535
 
 ABLATION_MODE = 'zero'
-
-# 검색 label embedding에서 하나의 bucket으로 묶는 train 구간 상위 수요 비율.
-RETRIEVAL_CAP_TOP_FRACTION = 0.005
 
 
 class LoggingCallback(TrainerCallback):
@@ -201,18 +197,6 @@ def make_rmse_mape_metrics(rmse_weight: float):
     return compute_stage2_metrics
 
 
-def select_retrieval_value_cap(
-    train_ds: UnifiedDemandDataset, top_fraction: float = RETRIEVAL_CAP_TOP_FRACTION
-) -> int:
-    """train 구간 셀·시간 수요에서 ``value ≥ cap``의 비율이 ``top_fraction`` 이하가 되는 최소 정수 cap."""
-
-    values = np.asarray(train_ds.grid[: train_ds.train_end]).reshape(-1).astype(np.int64)
-    counts = np.bincount(values)
-    at_least = np.cumsum(counts[::-1])[::-1] / values.size  # at_least[c] = P(value ≥ c)
-    passing = np.nonzero(at_least <= top_fraction)[0]
-    return int(passing[0]) if passing.size else int(values.max()) + 1
-
-
 def select_node_adaptive_indices(train_ds: UnifiedDemandDataset, min_demand: float) -> list[int]:
     """train 구간 평균 수요가 ``min_demand``를 넘는 노드를 선택한다.
 
@@ -374,7 +358,6 @@ def main(cfg: DictConfig) -> None:
         time_step=train_ds.time_step,
         retrieval_grid_path=str(data_path),
         retrieval_train_end=train_ds.train_end,
-        retrieval_value_cap=select_retrieval_value_cap(train_ds),
         **weather_stats,
         node_adaptive_indices=node_adaptive_indices,
         **model_kwargs,
@@ -579,8 +562,7 @@ def main(cfg: DictConfig) -> None:
         'weather_path': str(dataset_kwargs['weather_csv_path']),
         'weather_stats': weather_stats,
         'device': str(trainer.args.device),
-        'retrieval_future_mask_hours': cfg.model.retrieval_future_mask_hours,
-        'retrieval_value_cap': model_config.retrieval_value_cap,
+        'retrieval_scope': cfg.model.retrieval_scope,
         # stage별 목적함수를 별도로 기록한다.
         'objective': cfg.model.loss_type,
         'stage1_loss': cfg.model.loss_type,

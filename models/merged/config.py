@@ -32,17 +32,8 @@ class MergedDemandConfig(PretrainedConfig):
         retrieval_grid_path: str | None = None,
         retrieval_k: int = 20,
         retrieval_chunk_size: int = 256,
+        retrieval_scope: str = 'observed_past',
         retrieval_train_end: int | None = None,
-        retrieval_future_mask_hours: int = 72,
-        retrieval_value_cap: int | None = None,
-        retrieval_embedding_dim: int = 16,
-        retrieval_fusion: str = 'embedding',
-        retrieval_use_fallback: bool = True,
-        retrieval_query_measure: str = 'mean',
-        retrieval_spatial_sigma: float | None = None,
-        retrieval_gate_max: float = 1.0,
-        retrieval_fallback_tau: float = 1.0,
-        retrieval_fallback_learn_tau: bool = False,
         temperature_min: float | None = None,
         temperature_max: float | None = None,
         precipitation_max: float | None = None,
@@ -86,25 +77,8 @@ class MergedDemandConfig(PretrainedConfig):
         self.retrieval_grid_path = retrieval_grid_path
         self.retrieval_k = retrieval_k
         self.retrieval_chunk_size = retrieval_chunk_size
+        self.retrieval_scope = retrieval_scope
         self.retrieval_train_end = retrieval_train_end
-        # train 모드에서 [t, t + 이 값] 후보를 가린다. time_step 이상이어야 누수가 없다.
-        self.retrieval_future_mask_hours = retrieval_future_mask_hours
-        # train 구간 상위 0.5% 수요 경계(train.py가 주입). 이 값 이상은 한 embedding bucket이다.
-        self.retrieval_value_cap = retrieval_value_cap
-        self.retrieval_embedding_dim = retrieval_embedding_dim
-        # 검색 결과 융합: 'average'(softmax(s) 가중평균 label) | 'embedding'(gate·bucket embedding 합).
-        # retrieval_use_fallback은 embedding에서 O 혼합을 쓸지 정한다.
-        self.retrieval_fusion = retrieval_fusion
-        self.retrieval_use_fallback = retrieval_use_fallback
-        # 유사도의 3×3 칸 가중치 exp(−d²/2σ²) (중앙에 더 큰 가중). None이면 균등 cosine.
-        self.retrieval_spatial_sigma = retrieval_spatial_sigma
-        # average_gate의 gate 상한: g = retrieval_gate_max · sigmoid(·), (0, 1].
-        self.retrieval_gate_max = retrieval_gate_max
-        # O 혼합 가중치 w = e^{−m/τ}. m: 'mean'(질의 평균) | 'nonzero_count'(질의의 0 아닌 칸 수).
-        # learn_tau면 τ는 이 값에서 시작해 학습한다.
-        self.retrieval_query_measure = retrieval_query_measure
-        self.retrieval_fallback_tau = retrieval_fallback_tau
-        self.retrieval_fallback_learn_tau = retrieval_fallback_learn_tau
         # train 구간 통계. precipitation_max는 snow_scale=1 기준으로 고정한다.
         self.temperature_min = temperature_min
         self.temperature_max = temperature_max
