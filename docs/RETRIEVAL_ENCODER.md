@@ -36,7 +36,7 @@ Gaussian `q(z|x) = N(μ, diag σ²)`로 encode하고, 같은 정답 라벨 집�
 ## 3. Encoder (Gaussian posterior)
 
 ```text
-x [B, 8, 9] → log1p → Linear(9 → D) → + node_embedding[n] (frozen, 8 시점에 같은 값) → [B, 8, D]
+x [B, 8, 9] → log1p → (+ ε_x, 학습 때만) → Linear(9 → D) → + node_embedding[n] (frozen, 8 시점에 같은 값) → [B, 8, D]
             → LSTM(D → 16, batch_first) → 마지막 hidden h [B, 16]
             → μ = Linear(16 → 16)(h),  log σ² = Linear(16 → 16)(h)       (latent 차원 L = 16)
 학습:  z = μ + σ ⊙ ε,  ε ~ N(0, I)   (reparameterization)
@@ -49,6 +49,11 @@ x [B, 8, 9] → log1p → Linear(9 → D) → + node_embedding[n] (frozen, 8 시
   buffer로 두어 gradient를 받지 않고 optimizer에도 들어가지 않는다.
 - 학습 파라미터: 입력 Linear, LSTM, μ·log σ² head. decoder(입력 복원)는 두지 않는다.
 - `log σ²`는 `[−6, 2]`로 clamp해 수치 안정성을 지킨다.
+- **입력 잡음**: 학습 때만 Linear 입력(`log1p(x)`)에 원소별 독립 Gaussian 잡음
+  `ε_x ~ N(0, input_noise_std²)`를 더한다(8 시점 × 9칸 각각, 기본 `input_noise_std = 0.1`).
+  `log1p` 척도에서 수요 0→1 차이가 0.69이므로 0.1은 한 단위 차이의 약 15%다. 검색(질의·후보 embedding)
+  과 평가 때는 더하지 않는다. 입력이 조금 흔들려도 같은 집단으로 묶이도록 해, 비슷한 창이 비슷한
+  embedding을 갖게 한다.
 
 ## 4. Loss: Gaussian 거리 기반 contrastive + KL
 
