@@ -53,12 +53,15 @@ class CausalRetrieval(nn.Module):
         retrieval_train_end: int | None,
         future_mask_hours: int,
         query_measure: str = 'mean',
+        spatial_sigma: float | None = None,
     ) -> None:
         super().__init__()
         if query_measure not in ('mean', 'nonzero_count'):
             raise ValueError(
                 f"retrieval_query_measure는 'mean'|'nonzero_count' (받음: {query_measure!r})"
             )
+        if spatial_sigma is not None and spatial_sigma <= 0:
+            raise ValueError(f'retrieval_spatial_sigma는 양수 또는 null이어야 함 (받음: {spatial_sigma})')
         if future_mask_hours < time_step:
             raise ValueError(
                 f'retrieval_future_mask_hours({future_mask_hours})는 time_step({time_step}) 이상이어야 '
@@ -76,6 +79,13 @@ class CausalRetrieval(nn.Module):
         self.retrieval_train_end = retrieval_train_end
         self.future_mask_hours = future_mask_hours
         self.query_measure = query_measure
+        # 유사도의 칸별 가중치 w_p = exp(−d_p² / 2σ²) (d_p: 창 중심과의 거리, 행 우선). None이면 모두 1.
+        # from_pretrained의 meta-device 초기화에서도 값이 남도록 tensor가 아닌 float로 둔다.
+        offsets = range(-local_radius, local_radius + 1)
+        self.spatial_weights = [
+            1.0 if spatial_sigma is None else math.exp(-(dy * dy + dx * dx) / (2.0 * spatial_sigma ** 2))
+            for dy in offsets for dx in offsets
+        ]
         self._crops: Tensor | None = None
         # 체크포인트에 저장하지 않는 장치별 사본.
         self._device_crops: dict[torch.device, Tensor] = {}
@@ -163,7 +173,9 @@ class CausalRetrieval(nn.Module):
             return scores, times
         # windows[c] = 창 수요 [c, c+k) -> 시점 τ = c + k의 K이자 같은 t의 Q.
         windows = crops.unfold(0, k, 1)[:count]  # [C, N, P, k]
-        keys = F.normalize(windows.reshape(count, nodes, neighbors * k), dim=-1)
+        # 가중 cosine Σ w x y / (√Σ w x² · √Σ w y²): 칸마다 √w를 곱한 뒤 L2 정규화한다.
+        scale = torch.tensor(self.spatial_weights, device=device).sqrt().view(1, 1, neighbors, 1)
+        keys = F.normalize((windows * scale).reshape(count, nodes, neighbors * k), dim=-1)
         keys = keys.permute(1, 0, 2).contiguous()  # [N, C, D]
         candidate_times = torch.arange(k, total, device=device)
 
@@ -232,7 +244,36 @@ class CausalRetrieval(nn.Module):
         return scores[index], values, self.query_measures(device)[index]
 
 
-FUSION_MODES = ('average', 'embedding', 'vote')
+FUSION_MODES = ('average', 'embedding', 'vote', 'average_gate')
+
+
+def weighted_label_mean(scores: Tensor, values: Tensor) -> Tensor:
+    """``softmax(s)``로 유효 후보 label을 가중평균한다 ``[B,N,K] -> [B,N,1]``. 후보가 없으면 0."""
+
+    valid = torch.isfinite(scores)
+    # 허용 후보가 하나도 없으면 softmax가 NaN -> 0 (검색 결과 0).
+    weights = torch.softmax(scores, dim=-1).nan_to_num(0.0)
+    return (weights * values.masked_fill(~valid, 0.0)).sum(dim=-1, keepdim=True)
+
+
+class RetrievalGate(nn.Module):
+    """``retrieval_fusion='average_gate'``: BranchAttention 뒤의 노드 표현 z에 검색 결과를 섞는다.
+
+    ``r = Linear(1 → fusion_dim)(log1p(softmax(s) 가중평균 label))``,
+    ``g = sigmoid(Linear(fusion_dim → 1)(z))``, 출력 ``g·r + (1 − g)·z``.
+    """
+
+    def __init__(self, fusion_dim: int) -> None:
+        super().__init__()
+        self.value_projection = nn.Linear(1, fusion_dim)
+        self.gate = nn.Linear(fusion_dim, 1)
+
+    def forward(self, z: Tensor, scores: Tensor, values: Tensor) -> tuple[Tensor, Tensor]:
+        """``(z [B,N,F], scores, values) -> (blended [B,N,F], gate [B,N])``."""
+
+        retrieved = self.value_projection(torch.log1p(weighted_label_mean(scores, values).to(z.dtype)))
+        gate = torch.sigmoid(self.gate(z))
+        return gate * retrieved + (1.0 - gate) * z, gate.squeeze(-1)
 
 
 class RetrievalFusion(nn.Module):
@@ -260,8 +301,10 @@ class RetrievalFusion(nn.Module):
         learn_tau: bool = False,
     ) -> None:
         super().__init__()
-        if mode not in FUSION_MODES:
-            raise ValueError(f'retrieval_fusion은 {FUSION_MODES} 중 하나 (받음: {mode!r})')
+        if mode not in ('average', 'embedding', 'vote'):
+            raise ValueError(
+                f"RetrievalFusion mode는 'average'|'embedding'|'vote' (average_gate는 RetrievalGate, 받음: {mode!r})"
+            )
         self.mode = mode
         self.use_fallback = use_fallback and mode == 'embedding'
         if mode == 'average':
@@ -314,9 +357,7 @@ class RetrievalFusion(nn.Module):
     def forward(self, h_neural: Tensor, scores: Tensor, values: Tensor, query_measure: Tensor) -> Tensor:
         valid = torch.isfinite(scores)
         if self.mode == 'average':
-            # 허용 후보가 하나도 없으면 softmax가 NaN -> 0 (검색 결과 0).
-            weights = torch.softmax(scores, dim=-1).nan_to_num(0.0)
-            averaged = (weights * values.masked_fill(~valid, 0.0)).sum(dim=-1, keepdim=True)
+            averaged = weighted_label_mean(scores, values)
             r_emb = self.value_projection(torch.log1p(averaged.to(h_neural.dtype)))
             return self.fuse(torch.cat([h_neural, r_emb], dim=-1))
         if self.mode == 'vote':
@@ -335,4 +376,11 @@ class RetrievalFusion(nn.Module):
         return self.fuse(torch.cat([h_neural, retrieved], dim=-1))
 
 
-__all__ = ['FUSION_MODES', 'CausalRetrieval', 'RetrievalFusion', 'demand_bucket_bounds']
+__all__ = [
+    'FUSION_MODES',
+    'CausalRetrieval',
+    'RetrievalFusion',
+    'RetrievalGate',
+    'demand_bucket_bounds',
+    'weighted_label_mean',
+]

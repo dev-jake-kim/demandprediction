@@ -17,6 +17,8 @@ retrieval_k: 20
 retrieval_chunk_size: 256
 # 학습(train 모드)에서 [t, t+72h] 후보를 가린다. 평가(eval 모드)는 t 이전만 후보다.
 retrieval_future_mask_hours: 72
+# 유사도의 3×3 칸 가중치 exp(-d²/2σ²) (중앙에 더 큰 가중). null이면 균등 cosine.
+retrieval_spatial_sigma: null
 # 검색 결과 융합: average(softmax(s) 가중평균 label) | embedding(gate·bucket embedding 합) | vote(bucket별 s 합).
 retrieval_fusion: embedding
 # embedding에서 검색 결과 C와 학습 벡터 O 혼합: (1-w)C + wO, w = e^(-m/τ). m은 mean | nonzero_count.

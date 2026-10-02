@@ -111,6 +111,8 @@ flowchart TD
         R3["cosine top-k<br/>유사도 s [B,N,K], V [B,N,K]"]
         R4["retrieval_fusion<br/>average: softmax(s) 가중평균 V → Linear(1→H)<br/>embedding: Σ sigmoid(a·s+b)·Embedding(bucket(V)) 16차원<br/>(+ O 혼합 (1−w)·C + w·O)<br/>vote: bucket별 Σ s, 0번 bucket 제외"]
         R5["concat [h_neural ⊕ 검색 벡터]<br/>Linear → history_hidden<br/>h_local"]
+        R6["average_gate: BranchAttention 뒤<br/>g(z)·r + (1−g(z))·z, z = h_attn<br/>r = Linear(1→fusion_dim)(log1p(가중평균 V))"]
+        R3 -.->|"average_gate"| R6
         R1 --> R2 --> R3 --> R4 --> R5
     end
 
@@ -228,7 +230,8 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | | `retrieval_k`, `retrieval_chunk_size` | 20, 256 |
 | | `retrieval_future_mask_hours` | 72 (train 모드에서 `[t, t+72h]` 후보 제외, `≥ time_step`) |
 | | `retrieval_embedding_dim` | 16 (수요 bucket embedding 차원) |
-| | `retrieval_fusion`, `retrieval_use_fallback` | `embedding`, true (융합 방식 `average`/`embedding`/`vote`, embedding에서 O 혼합 사용) |
+| | `retrieval_fusion`, `retrieval_use_fallback` | `embedding`, true (융합 방식 `average`/`embedding`/`vote`/`average_gate`, embedding에서 O 혼합 사용) |
+| | `retrieval_spatial_sigma` | null (유사도의 3×3 칸 가중치 `exp(−d²/2σ²)`, null이면 균등) |
 | | `retrieval_query_measure` | `mean` (O 혼합의 m: `mean` 질의 평균 / `nonzero_count` 질의의 0 아닌 칸 수) |
 | | `retrieval_fallback_tau`, `retrieval_fallback_learn_tau` | 1.0, false (`w = e^{−m/τ}`, 학습 시 τ는 이 값에서 시작) |
 | 노드 적응 | `node_adaptive`, `node_adaptive_min_demand` | true, 0.1 |
@@ -300,10 +303,10 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
 
 - `forward`는 HF `Trainer`용으로 `logits`와(라벨이 있으면) `loss`만 반환한다.
 - `forward_debug`는 같은 계산의 전체 결과를 반환한다: `logits`, `prediction`,
-  `prediction_flat`, `attention_weights`, `h_neural`, `h_local`, `h_attn`, `retrieval_scores`,
-  `retrieval_values`, `retrieval_query_measure`, `daily_valid`, `weekly_valid`, `loss`, `loss_sum`.
-  검색 끔에서는 세 검색 출력이 None,
-  `h_local = h_neural`이다.
+  `prediction_flat`, `attention_weights`, `h_neural`, `h_local`, `h_attn`, `retrieval_gate`, `h_head`,
+  `retrieval_scores`, `retrieval_values`, `retrieval_query_measure`, `daily_valid`, `weekly_valid`,
+  `loss`, `loss_sum`. 검색 끔에서는 검색 출력이 None이고 `h_local = h_neural`, `h_head = h_attn`이다.
+  `retrieval_gate`는 `average_gate`에서만 값이 있다.
 - `configure_loss`는 손실을 교체하고 `config.loss_type`(및 `rmse_weight`)을 함께 갱신해
   체크포인트가 마지막 학습 손실을 기록하게 한다.
 - `node_delta_parameters`는 노드별 ΔW 파라미터를 반환한다(적응 꺼짐이면 빈 튜플).
@@ -423,9 +426,9 @@ attention mask로 표현한다.
 
 ### 6.5 출력 head
 
-`neural_pred = Softplus(neural_head(h_attn))` (`use_softplus=false`면 raw),
-`neural_head = Linear(fusion_dim → 1)`. `prediction = neural_pred`이고 이를 `[B,H,W]`로
-reshape한 것이 `logits`다. 검색 결과는 출력에서 섞지 않고 6.6처럼 `h_neural`에 융합한다.
+`neural_pred = Softplus(neural_head(h_head))` (`use_softplus=false`면 raw),
+`neural_head = Linear(fusion_dim → 1)`. `h_head`는 `h_attn`이고, `retrieval_fusion=average_gate`일 때만
+6.6의 gate 혼합 결과다. `prediction = neural_pred`이고 이를 `[B,H,W]`로 reshape한 것이 `logits`다.
 
 ### 6.6 검색 (`CausalRetrieval` + 융합, 선택 경로)
 
@@ -451,8 +454,11 @@ reshape한 것이 `logits`다. 검색 결과는 출력에서 섞지 않고 6.6�
   - `τ = t`는 V가 정답 `y_t`이고, `τ ∈ (t, t+k]`는 K 창에 `y_t`가 들어간다. 두 경우 모두
     `[t, t+72h]` 제외 범위에 들어가므로 `retrieval_future_mask_hours ≥ k`를 요구한다.
   - train 모드 후보는 V·K 창이 모두 train 구간 안이므로 val·test 수요가 학습에 쓰이지 않는다.
-- **매칭**: Q와 K를 `[k·P_r]` 벡터로 펴 L2 정규화한 cosine 유사도 `s`로 top-`retrieval_k`를 고른다
-  (`retrieval_chunk_size` 단위로 병합). 허용 후보가 k개보다 적으면 빈 칸은 `s = −inf`다.
+- **매칭**: Q와 K를 `[k·P_r]` 벡터로 펴서 가중 cosine 유사도 `s = Σ w x y / (√Σ w x² · √Σ w y²)`로
+  top-`retrieval_k`를 고른다(`retrieval_chunk_size` 단위로 병합). 칸 가중치는
+  `w_p = exp(−d_p² / 2σ²)`(`d_p`: 창 중심과의 거리, σ = `retrieval_spatial_sigma`)이며 모든 시점에 같다.
+  σ=1이면 중앙 1, 상하좌우 0.61, 대각 0.37이고, σ가 null이면 모두 1(보통 cosine)이다.
+  허용 후보가 k개보다 적으면 빈 칸은 `s = −inf`다.
 - **융합** (`retrieval_fusion`, 후보 i):
   - `average`: `r = Σ_i softmax(s)_i · V_i` (후보가 없으면 0),
     `h_local = Linear(2·history_hidden → history_hidden)([h_neural ⊕ Linear(1 → history_hidden)(log1p(r))])`.
@@ -473,7 +479,10 @@ reshape한 것이 `logits`다. 검색 결과는 출력에서 섞지 않고 6.6�
     raw `s`를 합한다(빈 칸 0). 수요 0 bucket을 버린 `vote[1:]`을 쓴다(Ulsan 6, Porto 10차원).
     `h_local = Linear(history_hidden + (bucket 수 − 1) → history_hidden)([h_neural ⊕ vote[1:]])`.
     질의가 전부 0이면 s가 모두 0이라 vote도 0이다.
-  - `h_local`이 `BranchAttention`의 neural 후보·query로 `h_neural`을 대신한다.
+  - `average_gate`: `h_neural`은 그대로 두고, BranchAttention 출력 `z = h_attn`에 섞는다.
+    `r = Linear(1 → fusion_dim)(log1p(Σ_i softmax(s)_i · V_i))`, `g = sigmoid(Linear(fusion_dim → 1)(z))`,
+    `h_head = g·r + (1 − g)·z`.
+  - `average_gate` 외 모드는 `h_local`이 `BranchAttention`의 neural 후보·query로 `h_neural`을 대신한다.
 
 <details>
 <summary>세부</summary>
@@ -633,7 +642,8 @@ python test.py <checkpoint_dir> --city {ulsan,porto} --weather_csv_path <csv> \
   거부, train 모드에서 `y_t`나 train 구간 밖 값을 바꿔도, eval 모드에서 `t` 이후 값을 바꿔도
   결과[t](유사도·V)가 그대로.
 - 검색 융합: bucket 경계·배정, 빈 후보 칸 무시, m=0이면 검색 결과와 무관하게 `O`만 사용, average 식,
-  vote의 가장 가까운 bucket 반올림·bucket별 s 합·0번 제외. 검색 켬(embedding O 켬·끔, average, vote)
+  vote의 가장 가까운 bucket 반올림·bucket별 s 합·0번 제외, average_gate의 `g·r + (1−g)·z`. 중앙 가중
+  cosine(σ=1) 표가 브루트포스 기준과 일치. 검색 켬(embedding O 켬·끔, average, vote, average_gate+σ)
   eval forward가 eval 모드 표를 쓰고, V가 τ의 노드 자신 수요이고,
   m(평균·0 아닌 칸 수)이 `demand_history` 창에서 계산한 값과 같고, 융합 파라미터에 gradient가
   흐르며, 체크포인트 복원 후 예측이 같다.

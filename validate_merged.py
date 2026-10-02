@@ -25,6 +25,7 @@ from models.merged.modules import (
     LocalHistoryEncoder,
     PeriodicLSTMEncoder,
     RetrievalFusion,
+    RetrievalGate,
     demand_bucket_bounds,
 )
 from train import build_dataset_kwargs, select_node_adaptive_indices, select_retrieval_value_cap
@@ -278,8 +279,13 @@ def _check_node_adaptive_identity() -> dict:
     }
 
 
-def _reference_retrieval(grid: np.ndarray, k: int, radius: int, top: int, allowed) -> dict:
-    """브루트포스 기준: (t, 노드)마다 허용 후보 τ를 직접 훑어 유사도 내림차순 top-k ``[(s, τ)]``."""
+def _reference_retrieval(
+    grid: np.ndarray, k: int, radius: int, top: int, allowed, spatial_sigma: float | None = None
+) -> dict:
+    """브루트포스 기준: (t, 노드)마다 허용 후보 τ를 직접 훑어 유사도 내림차순 top-k ``[(s, τ)]``.
+
+    유사도는 칸별 가중치 ``w_p = exp(−d_p²/2σ²)``(σ 없으면 1)를 쓴 가중 cosine이다.
+    """
 
     total, height, width = grid.shape
     padded = np.pad(grid, ((0, 0), (radius, radius), (radius, radius)))
@@ -288,16 +294,23 @@ def _reference_retrieval(grid: np.ndarray, k: int, radius: int, top: int, allowe
         [padded[:, y:y + size, x:x + size].reshape(total, -1) for y in range(height) for x in range(width)],
         axis=1,
     ).astype(np.float64)  # [T, N, P]
+    offsets = np.arange(-radius, radius + 1)
+    distance_sq = (offsets[:, None] ** 2 + offsets[None, :] ** 2).reshape(-1)
+    cell_weights = np.ones(size * size) if spatial_sigma is None else np.exp(-distance_sq / (2 * spatial_sigma ** 2))
+    weights = np.repeat(cell_weights, k)  # crops[..].T.reshape(-1)의 [P, k] 순서
+
+    def weighted_cos(a: np.ndarray, b: np.ndarray) -> float:
+        denom = max(np.sqrt((weights * a * a).sum()), 1e-12) * max(np.sqrt((weights * b * b).sum()), 1e-12)
+        return float((weights * a * b).sum() / denom)
+
     out = {}
     for t in range(k, total):
         for node in range(crops.shape[1]):
             query = crops[t - k:t, node].T.reshape(-1)
-            query = query / max(np.linalg.norm(query), 1e-12)
-            scored = []
-            for tau in range(k, total):
-                if allowed(t, tau):
-                    key = crops[tau - k:tau, node].T.reshape(-1)
-                    scored.append((float(query @ (key / max(np.linalg.norm(key), 1e-12))), tau))
+            scored = [
+                (weighted_cos(query, crops[tau - k:tau, node].T.reshape(-1)), tau)
+                for tau in range(k, total) if allowed(t, tau)
+            ]
             out[t, node] = sorted(scored, reverse=True)[:top]
     return out
 
@@ -326,13 +339,13 @@ def _check_retrieval_boundary() -> dict:
     rng = np.random.default_rng(0)
     grid = rng.random((40, 3, 3)).astype(np.float32)
 
-    def build(values: np.ndarray, temp_dir: str) -> CausalRetrieval:
+    def build(values: np.ndarray, temp_dir: str, spatial_sigma: float | None = None) -> CausalRetrieval:
         path = Path(temp_dir) / 'grid.npy'
         np.save(path, values, allow_pickle=False)
         return CausalRetrieval(
             height=3, width=3, time_step=k, local_radius=1, retrieval_grid_path=path,
             retrieval_k=top, retrieval_chunk_size=4, retrieval_train_end=train_end,
-            future_mask_hours=mask_hours,
+            future_mask_hours=mask_hours, spatial_sigma=spatial_sigma,
         )
 
     cpu = torch.device('cpu')
@@ -358,8 +371,15 @@ def _check_retrieval_boundary() -> dict:
             _table_gap(train_table, _reference_retrieval(grid, k, 1, top, train_allowed)),
             _table_gap(eval_table, _reference_retrieval(grid, k, 1, top, lambda t, tau: tau < t)),
         )
+        # 중앙 가중 cosine(σ=1)도 기준과 같아야 하고, 균등 cosine과는 달라야 한다.
+        gaussian_table = build(grid, temp_dir, spatial_sigma=1.0).table(False, cpu)
+        gap = max(gap, _table_gap(
+            gaussian_table, _reference_retrieval(grid, k, 1, top, lambda t, tau: tau < t, spatial_sigma=1.0)
+        ))
         if gap > 1e-5:
             raise AssertionError(f'retrieval differs from brute-force reference: {gap}')
+        if torch.equal(gaussian_table[0], eval_table[0]):
+            raise AssertionError('spatial_sigma did not change the similarity')
 
         def query(values: np.ndarray, training: bool, times: list[int]) -> tuple[torch.Tensor, ...]:
             module = build(values, temp_dir).train(training)
@@ -419,6 +439,7 @@ def _check_independent_retrieval_radius() -> dict:
             (1, 'mean', False, 'embedding', False),
             (1, 'mean', False, 'average', False),
             (1, 'mean', False, 'vote', False),
+            (1, 'mean', False, 'average_gate', False),
         )
         for case, (radius, measure, learn_tau, fusion_mode, use_fallback) in enumerate(variants):
             config = MergedDemandConfig(
@@ -428,6 +449,7 @@ def _check_independent_retrieval_radius() -> dict:
                 retrieval_fusion=fusion_mode, retrieval_use_fallback=use_fallback,
                 retrieval_query_measure=measure, retrieval_fallback_tau=0.5,
                 retrieval_fallback_learn_tau=learn_tau,
+                retrieval_spatial_sigma=1.0 if fusion_mode == 'average_gate' else None,
                 temperature_min=-5.0, temperature_max=30.0, precipitation_max=20.0,
             )
             model = MergedDemandModel(config).eval()
@@ -456,7 +478,12 @@ def _check_independent_retrieval_radius() -> dict:
             model.train()
             model._compute(**inputs)['logits'].sum().backward()
             fusion = model.retrieval_fusion
-            if fusion_mode == 'average':
+            if fusion_mode == 'average_gate':
+                if fusion is not None or not torch.equal(output['h_local'], output['h_neural']):
+                    raise AssertionError('average_gate must not change h_neural before branch attention')
+                gate = model.retrieval_gate
+                checked = (('value_projection', gate.value_projection.weight), ('gate', gate.gate.weight))
+            elif fusion_mode == 'average':
                 checked = (('value_projection', fusion.value_projection.weight),)
             elif fusion_mode == 'vote':
                 # vote 벡터가 들어가는 fuse 열(h_neural 뒤)에 gradient가 흘러야 한다.
@@ -590,9 +617,22 @@ def _check_retrieval_fusion() -> dict:
     expected = vote.fuse(torch.cat([h_neural, expected_votes], dim=-1))
     if not torch.allclose(vote(h_neural, vote_scores, vote_values, busy), expected, atol=1e-6):
         raise AssertionError('vote fusion does not match the expected per-bucket similarity sums')
+
+    # average_gate: g(z)·r + (1 − g(z))·z, r = Linear(log1p(softmax(s) 가중평균 label)).
+    gate = RetrievalGate(4)
+    z = torch.randn(1, 1, 4)
+    blended, g = gate(z, pair_scores, pair_values)
+    r = gate.value_projection(torch.log1p(mean_label))
+    g_expected = torch.sigmoid(gate.gate(z))
+    if not (
+        torch.allclose(blended, g_expected * r + (1 - g_expected) * z, atol=1e-6)
+        and torch.allclose(g, g_expected.squeeze(-1), atol=1e-6)
+    ):
+        raise AssertionError('average_gate does not match g·r + (1 − g)·z')
     return {
         'retrieval_buckets_cap7': demand_bucket_bounds(7), 'invalid_slot_ignored': True,
         'zero_query_uses_O': True, 'average_fusion_formula': True, 'vote_fusion_formula': True,
+        'average_gate_formula': True,
     }
 
 

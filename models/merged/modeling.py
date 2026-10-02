@@ -22,6 +22,7 @@ from .modules import (
     PeriodicLSTMEncoder,
     PredictionHead,
     RetrievalFusion,
+    RetrievalGate,
 )
 
 WEATHER_CHANNELS = 2  # 기온, 강수 + g·적설
@@ -151,6 +152,10 @@ class MergedDemandModel(PreTrainedModel):
                 retrieval_train_end=config.retrieval_train_end,
                 future_mask_hours=config.retrieval_future_mask_hours,
                 query_measure=config.retrieval_query_measure,
+                spatial_sigma=(
+                    None if config.retrieval_spatial_sigma is None
+                    else float(config.retrieval_spatial_sigma)
+                ),
             )
             if self.use_retrieval else None
         )
@@ -163,6 +168,9 @@ class MergedDemandModel(PreTrainedModel):
                 f'{config.retrieval_fusion} 검색 융합에는 retrieval_value_cap이 필요함 - train.py가 '
                 'train 구간 상위 0.5% 수요 경계를 계산해 넘겨야 한다'
             )
+        # average_gate는 BranchAttention 뒤에서 섞고, 나머지 모드는 h_neural에 concat한다.
+        gate_after_attention = self.use_retrieval and config.retrieval_fusion == 'average_gate'
+        self.retrieval_gate = RetrievalGate(config.fusion_dim) if gate_after_attention else None
         self.retrieval_fusion = (
             RetrievalFusion(
                 config.history_hidden,
@@ -175,7 +183,7 @@ class MergedDemandModel(PreTrainedModel):
                 fallback_tau=float(config.retrieval_fallback_tau),
                 learn_tau=bool(config.retrieval_fallback_learn_tau),
             )
-            if self.use_retrieval else None
+            if self.use_retrieval and not gate_after_attention else None
         )
         # 속성 이름은 기존 체크포인트 키(output_gate.neural_head.*)와 맞추려고 유지한다.
         self.output_gate = PredictionHead(config.fusion_dim, use_softplus=self.use_softplus)
@@ -275,14 +283,14 @@ class MergedDemandModel(PreTrainedModel):
 
         weather_cls = self._weather_features(weather) if self.weather_cls_dim else None
         h_neural = self.local_history(demand_history, recent_extra, weather_cls)
+        retrieval_scores = retrieval_values = retrieval_query_measure = None
+        h_local = h_neural
         if self.retrieval is not None:
             retrieval_scores, retrieval_values, retrieval_query_measure = self.retrieval(sample_idx)
-            h_local = self.retrieval_fusion(
-                h_neural, retrieval_scores, retrieval_values, retrieval_query_measure
-            )
-        else:
-            retrieval_scores = retrieval_values = retrieval_query_measure = None
-            h_local = h_neural
+            if self.retrieval_fusion is not None:
+                h_local = self.retrieval_fusion(
+                    h_neural, retrieval_scores, retrieval_values, retrieval_query_measure
+                )
         # Ablation은 브랜치 출력을 0으로 바꾸되 valid mask와 모듈 shape은 유지한다.
         h_daily, daily_valid = self.daily_branch(daily_demand, daily_mask, daily_extra)
         if not self.use_daily:
@@ -294,7 +302,12 @@ class MergedDemandModel(PreTrainedModel):
             h_local, h_daily, h_weekly, daily_valid, weekly_valid
         )
 
-        prediction = self.output_gate(h_attn)
+        # average_gate: h_head = g(z)·r + (1 − g(z))·z, z = h_attn.
+        retrieval_gate = None
+        h_head = h_attn
+        if self.retrieval_gate is not None:
+            h_head, retrieval_gate = self.retrieval_gate(h_attn, retrieval_scores, retrieval_values)
+        prediction = self.output_gate(h_head)
         prediction_grid = prediction.reshape(-1, self.height, self.width)
 
         output: dict[str, Tensor | None] = {
@@ -308,6 +321,8 @@ class MergedDemandModel(PreTrainedModel):
             'retrieval_values': retrieval_values,
             'retrieval_query_measure': retrieval_query_measure,
             'h_attn': h_attn,
+            'retrieval_gate': retrieval_gate,
+            'h_head': h_head,
             'daily_valid': daily_valid,
             'weekly_valid': weekly_valid,
         }
