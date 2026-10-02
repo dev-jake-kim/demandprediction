@@ -36,6 +36,7 @@ class LocalHistoryEncoder(nn.Module):
         node_adaptive_indices: Sequence[int] | None = None,
         node_adaptive_mode: str = "additive",
         functional_neighbors: Sequence[Sequence[int]] | None = None,
+        use_event_embedding: bool = False,
     ) -> None:
         super().__init__()
         if extra_dim < 0:
@@ -64,6 +65,10 @@ class LocalHistoryEncoder(nn.Module):
         self.sink_embedding = nn.Parameter(torch.randn(transformer_layers, d_model) * 0.02)
         self.node_embedding = nn.Parameter(torch.randn(self.num_nodes, d_model) * 0.02)
         self.direction_bias = nn.Parameter(torch.zeros(transformer_heads, self.num_neighbors))
+        # 모든 이벤트(공연·축제 등)가 공유하는 학습 임베딩. 0 초기화라 학습 전에는 없는 것과 같다.
+        self.use_event_embedding = use_event_embedding
+        if use_event_embedding:
+            self.event_embedding = nn.Parameter(torch.zeros(d_model))
         # 기능적 이웃: 노드마다 train 구간 상관이 큰 먼 노드 K개. 그 최근 수요 평균을 토큰에 더한다.
         self._functional_neighbor_list = (
             None if functional_neighbors is None else [[int(v) for v in row] for row in functional_neighbors]
@@ -246,8 +251,9 @@ class LocalHistoryEncoder(nn.Module):
         demands: Tensor,
         extra: Tensor | None = None,
         weather_cls: Tensor | None = None,
+        event_mask: Tensor | None = None,
     ) -> Tensor:
-        """``[B, k, H, W]`` 수요 -> ``[B, N, history_hidden]``."""
+        """``[B, k, H, W]`` 수요 -> ``[B, N, history_hidden]``. ``event_mask``는 ``[B, k, N]`` 0/1."""
 
         if demands.ndim != 4 or tuple(demands.shape[1:]) != (self.time_step, self.height, self.width):
             raise ValueError(
@@ -278,6 +284,12 @@ class LocalHistoryEncoder(nn.Module):
             if weather_cls is None:
                 raise ValueError("weather_cls_dim>0인데 weather_cls가 None임")
             tokens = tokens + self.weather_projection(weather_cls)[:, :, None, :]
+        if self.use_event_embedding:
+            if event_mask is None or tuple(event_mask.shape) != (batch, steps, nodes):
+                raise ValueError(f"use_event_embedding이면 event_mask [B,{steps},{nodes}]가 필요함")
+            tokens = tokens + event_mask.to(tokens.dtype).unsqueeze(-1) * self.event_embedding
+        elif event_mask is not None:
+            raise ValueError("use_event_embedding=false인데 event_mask가 주어짐")
         sequences = batch * steps
         hidden_tokens = tokens.reshape(sequences, nodes, -1)
         mask = self._attention_mask(sequences)

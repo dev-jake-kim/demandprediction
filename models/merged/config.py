@@ -56,6 +56,8 @@ class MergedDemandConfig(PretrainedConfig):
         node_adaptive: bool = False,
         node_adaptive_min_demand: float = 0.8,
         node_adaptive_indices: list[int] | None = None,
+        use_event_embedding: bool = False,
+        event_csv_path: str | None = None,
         node_adaptive_mode: str = 'additive',
         loss_type: str = 'combined',
         loss_gamma: float = 1.0,
@@ -111,6 +113,9 @@ class MergedDemandConfig(PretrainedConfig):
         self.node_adaptive_min_demand = node_adaptive_min_demand
         # train.py가 train 구간에서 계산해 주입하고, 체크포인트 복원에 쓰인다.
         self.node_adaptive_indices = node_adaptive_indices
+        # 공연·축제 등 이벤트 노드·시각에 공유 학습 임베딩을 더한다. 표 경로는 train.py가 절대경로로 주입.
+        self.use_event_embedding = use_event_embedding
+        self.event_csv_path = event_csv_path
         # additive: W + ΔW[n] | gated: W + s·(1−g[n])·(V[n] − W) (docs/SPEC.md §6.7)
         self.node_adaptive_mode = node_adaptive_mode
         # configure_loss가 stage마다 갱신한다(체크포인트가 마지막 학습 손실을 기록).

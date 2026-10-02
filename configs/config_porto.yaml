@@ -22,6 +22,8 @@ data:
   lag_radius: 0
   # 시점별 추가 context 채널: holiday(공휴일, dataset의 start_time·holidays 필요) | city_demand(도시 전체 수요).
   context_features: []
+  # 이벤트(공연·축제 등) 표 CSV(node,start,end). 주면 공유 이벤트 임베딩을 Transformer 입력 토큰에 더한다.
+  event_csv: null
 
 train:
 

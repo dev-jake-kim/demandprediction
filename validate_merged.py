@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
@@ -454,6 +455,50 @@ def _check_masked_grid_receptive_field() -> dict:
     return {'masked_grid_receptive_radius': 'local_radius * transformer_layers'}
 
 
+def _check_event_mask() -> dict:
+    """이벤트 표: [h,h+1)∩[start,end) 겹침 규칙, 샘플 창 [t−k+1, t+1), 0 임베딩 불변, 이벤트 노드에만 영향."""
+
+    cfg = _compose('ulsan')
+    path = resolve_dataset_path('ulsan', cfg.dataset.npy_path)
+    kwargs = build_dataset_kwargs(cfg)
+    origin = pd.Timestamp(kwargs['start_time'])
+    node = 40
+    with tempfile.TemporaryDirectory(prefix='merged_event_') as temp_dir:
+        csv = Path(temp_dir) / 'events.csv'
+        start, end = origin + pd.Timedelta(hours=100, minutes=30), origin + pd.Timedelta(hours=102)
+        pd.DataFrame({'node': [node], 'start': [f'{start:%Y-%m-%d %H:%M}'], 'end': [f'{end:%Y-%m-%d %H:%M}']}).to_csv(csv, index=False)
+        dataset = UnifiedDemandDataset(path, 'train', **{**kwargs, 'event_csv_path': csv})
+    active = np.flatnonzero(dataset.event_table[:, node])
+    if active.tolist() != [100, 101] or dataset.event_table.sum() != 2:
+        raise AssertionError(f'이벤트 시각 표가 [100, 101]이 아님: {active.tolist()}')
+    target = 101
+    sample = dataset[target - int(dataset.indices[0])]
+    window = sample['event_mask'].numpy()
+    if not (int(sample['sample_idx']) == target and window[-1, node] == 1 and window[-2, node] == 1 and window.sum() == 2):
+        raise AssertionError('event_mask 창이 [t−k+1, t+1)이 아님')
+
+    torch.manual_seed(0)
+    common = dict(height=4, width=3, time_step=6, local_radius=1, d_model=8, num_fourier_bands=2,
+                  transformer_layers=1, transformer_heads=2, transformer_ffn=16, history_hidden=5, dropout=0.0)
+    encoder = LocalHistoryEncoder(**common, use_event_embedding=True).eval()
+    demands = torch.rand(2, 6, 4, 3) * 5
+    mask = torch.zeros(2, 6, 12)
+    mask[:, -1, 7] = 1.0
+    with torch.no_grad():
+        reference = encoder(demands, event_mask=torch.zeros_like(mask))
+        zero_gap = float((encoder(demands, event_mask=mask) - reference).abs().max())
+        encoder.event_embedding.fill_(1.0)
+        changed = (encoder(demands, event_mask=mask) - reference).abs().amax(dim=(0, 2))
+    if zero_gap != 0.0:
+        raise AssertionError(f'0 이벤트 임베딩인데 출력이 바뀜: {zero_gap:.3e}')
+    # 1층 3×3 창: 노드 7(행 2, 열 1)의 창 밖 노드는 바뀌지 않아야 한다.
+    outside = [n for n in range(12) if abs(n // 3 - 2) > 1 or abs(n % 3 - 1) > 1]
+    if float(changed[7]) == 0.0 or float(changed[outside].max()) != 0.0:
+        raise AssertionError('이벤트 임베딩 영향이 이벤트 노드 창에 국한되지 않음')
+    return {'event_mask_window': '[t-k+1, t+1)', 'event_zero_embedding_identity': True}
+
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', default='cpu')
@@ -469,6 +514,7 @@ def main() -> None:
     results.append(_check_independent_retrieval_radius())
     results.append(_check_retrieval_pass())
     results.append(_check_masked_grid_receptive_field())
+    results.append(_check_event_mask())
     report = {'device': str(device), 'all_pass': True, 'checks': results}
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

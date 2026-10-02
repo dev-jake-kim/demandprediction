@@ -50,7 +50,7 @@ flowchart TD
     WC --> C1
 
     subgraph LH["LocalHistoryEncoder: 공간 + 최근 시간"]
-        L1["노드 토큰<br/>log1p + Fourier 스칼라 임베딩<br/>+ 노드 임베딩 [B·k, N, D]"]
+        L1["노드 토큰<br/>log1p + Fourier 스칼라 임베딩<br/>+ 노드 임베딩 [B·k, N, D]<br/>(선택) + 이벤트 노드·시각에 공유 이벤트 임베딩"]
         L2["층마다: [층별 sink, 노드 N개]<br/>[B·k, 1+N, D]"]
         L3["masked Transformer 층<br/>노드는 sink + 자기 창만 봄<br/>+ 방향별·head별 bias"]
         L4["sink 출력 버림<br/>노드 출력만 다음 층으로"]
@@ -227,6 +227,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | | `retrieval_k`, `retrieval_chunk_size`, `retrieval_scope` | 20, 256, `observed_past` |
 | 기능적 이웃 | `functional_neighbor_k`, `functional_neighbor_mode` | 0 (끔), `raw` — masked Transformer 수용 영역(`local_radius × transformer_layers`) 밖에서 train 구간 상관(`raw` 원 시계열 / `residual` 요일×시각 평균을 뺀 잔차)이 가장 큰 노드 k개를 train.py가 골라 `functional_neighbors`로 주입. 그 최근 수요 평균의 `Linear(1→D)(log1p)`를 노드 토큰에 더한다 |
 | 추가 context | `context_extra_dim`, `context_features` | 0, [] — train.py가 `data.context_features`에서 주입. 채널은 날씨·요일·시간 뒤에 붙는다 |
+| 이벤트 | `use_event_embedding`, `event_csv_path` | false, null — train.py가 `data.event_csv`가 있으면 켜고 절대경로를 저장. 공연·축제 등 모든 이벤트에 **같은** 학습 임베딩 `event_embedding [D]`(0 초기화)을 이벤트 시각·노드의 Transformer 입력 토큰에 더한다(§6.2) |
 | 노드 적응 | `node_adaptive`, `node_adaptive_min_demand`, `node_adaptive_mode` | true, 0.1, `additive` |
 | 손실 | `loss_type` | `mae` |
 | | `loss_gamma`, `loss_eps`, `rmse_weight`, `split_threshold`, `split_high_weight` | 1.0, 0.5, 10.0, 1.0, 1.0 |
@@ -261,6 +262,11 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
   `start_time`·`holidays` 필요, 울산은 2025-01-27 임시공휴일 포함 / `city_demand` 도시 전체 수요
   `log1p(합)/log1p(train 최댓값)`). 최근 창은 `[t−k, t)`, lag는 각 lag 시점 값이며 `context_extra`,
   `daily_context_extra`, `weekly_context_extra`로 모델에 들어간다.
+- `data.event_csv` (기본 null, 선택): 이벤트 표 CSV(`node`, `start`, `end` 필수; `name`, `category`,
+  `venue`, `precision`, `source`는 기록용). `start`·`end`는 `dataset.start_time`과 같은 현지 시각
+  `YYYY-MM-DD HH:MM`. 시각 `h`의 `[h, h+1)`이 `[start, end)`와 겹치면 그 노드·시각을 1로 하는
+  `[T, N]` 표를 만든다. 샘플은 `event_mask [k, N]`을 날씨와 같은 창 `[t−k+1, t+1)`로 받는다
+  (일정은 미리 공개되므로 예측 시각 `t`를 포함). 울산 표는 `data/raw/ulsan_events.csv`.
 - `train`: batch Ulsan 24 / Porto 8 (train·eval 동일), `num_train_epochs=120`,
   `optim=adamw_torch_fused`, `learning_rate=1e-3`, `weight_decay=0.05`, `max_grad_norm=5.0`,
   `lr_scheduler_type=constant`, `warmup_ratio=0`, epoch 단위 log/eval/save,
@@ -351,7 +357,7 @@ node_delta_parameters() -> tuple[nn.Parameter, ...]
 
 ### 6.2 `LocalHistoryEncoder`
 
-`forward(demands [B,k,H,W], extra [B,k,E], weather_cls [B,k,2]|None) → h_neural [B,N,history_hidden]`
+`forward(demands [B,k,H,W], extra [B,k,E], weather_cls [B,k,2]|None, event_mask [B,k,N]|None) → h_neural [B,N,history_hidden]`
 
 시점마다 격자 전체를 한 시퀀스로 인코딩한다. 노드 토큰은 시점당 한 번만 만들고, 이웃 창은
 attention mask로 표현한다.
@@ -361,6 +367,7 @@ attention mask로 표현한다.
 
 1. 노드 토큰: `log1p(max(x,0))` → `FourierScalarEmbedding` → `+ node_embedding[n]`
    → `[B·k, N, D]` (`cls_add`면 `Linear(2→D)(날씨 2채널)`을 모든 노드 토큰에 더함).
+   `use_event_embedding`이면 `event_mask[b,i,n]·event_embedding`을 더한다(모든 이벤트 공유 벡터).
    `FourierScalarEmbedding(v) = Linear([v, sin(2π·v·f), cos(2π·v·f)])`,
    `f = exp(log_frequencies)`, `log_frequencies`는 `linspace(-2,2,num_bands)`로 초기화되는
    학습 파라미터.

@@ -134,6 +134,7 @@ class MergedDemandModel(PreTrainedModel):
             node_adaptive_indices=node_adaptive_indices,
             node_adaptive_mode=config.node_adaptive_mode,
             functional_neighbors=config.functional_neighbors,
+            use_event_embedding=config.use_event_embedding,
         )
         self.periodic_hidden = config.periodic_hidden
         self.daily_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim)
@@ -277,6 +278,7 @@ class MergedDemandModel(PreTrainedModel):
         context_extra: Tensor | None = None,
         daily_context_extra: Tensor | None = None,
         weekly_context_extra: Tensor | None = None,
+        event_mask: Tensor | None = None,
     ) -> dict[str, Tensor | None]:
         """모델 계산을 수행하고 예측·중간 결과·선택적 손실을 반환한다."""
 
@@ -285,7 +287,7 @@ class MergedDemandModel(PreTrainedModel):
         weekly_extra = self._temporal_extra(weekly_weather, weekly_hour, weekly_day_of_week, weekly_context_extra)
 
         weather_cls = self._weather_features(weather) if self.weather_cls_dim else None
-        h_neural = self.local_history(demand_history, recent_extra, weather_cls)
+        h_neural = self.local_history(demand_history, recent_extra, weather_cls, event_mask)
         # Ablation은 브랜치 출력을 0으로 바꾸되 valid mask와 모듈 shape은 유지한다.
         h_daily, daily_valid = self.daily_branch(daily_demand, daily_mask, daily_extra)
         if not self.use_daily:
@@ -350,6 +352,7 @@ class MergedDemandModel(PreTrainedModel):
         context_extra: Tensor | None = None,
         daily_context_extra: Tensor | None = None,
         weekly_context_extra: Tensor | None = None,
+        event_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """``Trainer``용으로 ``{'loss', 'logits'}``만 반환한다.
 
@@ -376,6 +379,7 @@ class MergedDemandModel(PreTrainedModel):
             context_extra=context_extra,
             daily_context_extra=daily_context_extra,
             weekly_context_extra=weekly_context_extra,
+            event_mask=event_mask,
         )
         slim: dict[str, Tensor] = {'logits': output['logits']}
         if 'loss' in output:

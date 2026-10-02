@@ -115,6 +115,8 @@ def main() -> None:
         context_features=model.config.context_features,
         start_time=dataset_yaml.get('start_time'),
         holidays=list(dataset_yaml.get('holidays') or []),
+        # 이벤트 임베딩을 학습한 체크포인트면 같은 이벤트 표를 쓴다.
+        event_csv_path=model.config.event_csv_path if model.config.use_event_embedding else None,
     )
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers

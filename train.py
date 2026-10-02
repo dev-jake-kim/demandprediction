@@ -167,6 +167,10 @@ def build_dataset_kwargs(cfg: DictConfig) -> dict:
         'context_features': list(cfg.data.get('context_features') or []),
         'start_time': cfg.dataset.get('start_time'),
         'holidays': list(cfg.dataset.get('holidays') or []),
+        # 공연·축제 등 이벤트 표(선택). 상대경로는 실행 디렉터리 기준.
+        'event_csv_path': (
+            str((Path.cwd() / str(cfg.data.event_csv)).resolve()) if cfg.data.get('event_csv') else None
+        ),
     }
 
 
@@ -409,7 +413,14 @@ def main(cfg: DictConfig) -> None:
         context_extra_dim=len(dataset_kwargs['context_features']),
         context_features=dataset_kwargs['context_features'],
         functional_neighbors=functional_neighbors,
+        use_event_embedding=dataset_kwargs['event_csv_path'] is not None,
+        event_csv_path=dataset_kwargs['event_csv_path'],
     )
+    if dataset_kwargs['event_csv_path'] is not None:
+        logger.info(
+            f'[event] {dataset_kwargs["event_csv_path"]}: train 구간 이벤트 노드·시각 '
+            f'{int(train_ds.event_table[: train_ds.train_end].sum())}개, 전체 {int(train_ds.event_table.sum())}개'
+        )
     # Trainer 초기화보다 먼저 seed를 고정해 모델 초기화를 재현한다.
     set_seed(cfg.train.seed)
 

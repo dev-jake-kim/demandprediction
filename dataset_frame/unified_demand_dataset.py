@@ -133,6 +133,7 @@ class UnifiedDemandDataset(Dataset):
         context_features: Sequence[str] = (),
         start_time: str | None = None,
         holidays: Sequence[str] = (),
+        event_csv_path: str | Path | None = None,
     ) -> None:
         super().__init__()
         if not 0 < train_ratio < 1 or not 0 <= val_ratio < 1 or train_ratio + val_ratio >= 1:
@@ -181,6 +182,11 @@ class UnifiedDemandDataset(Dataset):
         self.hour_table, self.day_of_week_table = _calendar_features(all_times)
         self.context_features = tuple(context_features)
         self.context_table = self._make_context_table(self.context_features, start_time, holidays)
+        # 이벤트(공연·축제 등) 노드·시각 표 [T, N]. 없으면 None이고 샘플에 event_mask를 넣지 않는다.
+        self.event_csv_path = None if event_csv_path is None else Path(event_csv_path).expanduser().resolve()
+        self.event_table = (
+            None if self.event_csv_path is None else self._make_event_table(self.event_csv_path, start_time)
+        )
 
         self.daily_values, self.daily_mask = self._make_lag_table(self.daily_lag_values)
         self.weekly_values, self.weekly_mask = self._make_lag_table(self.weekly_lag_values)
@@ -213,6 +219,31 @@ class UnifiedDemandDataset(Dataset):
         if not columns:
             return np.zeros((self.total_steps, 0), dtype=np.float32)
         return np.ascontiguousarray(np.stack(columns, axis=1))
+
+    def _make_event_table(self, path: Path, start_time: str | None) -> np.ndarray:
+        """이벤트 CSV(``node``, ``start``, ``end``) -> ``[T, N]`` float32. 시각 ``[h, h+1)``이 ``[start, end)``와 겹치면 1."""
+
+        if start_time is None:
+            raise ValueError('event_csv_path에는 start_time이 필요함')
+        frame = pd.read_csv(path)
+        missing = [column for column in ('node', 'start', 'end') if column not in frame.columns]
+        if missing:
+            raise ValueError(f'{path}: 이벤트 CSV에 열 {missing}이 없음')
+        origin = pd.Timestamp(start_time)
+        table = np.zeros((self.total_steps, self.num_nodes), dtype=np.float32)
+        for row in frame.itertuples(index=False):
+            node = int(row.node)
+            if not 0 <= node < self.num_nodes:
+                raise ValueError(f'{path}: node {node}가 범위(0..{self.num_nodes - 1}) 밖')
+            start = (pd.Timestamp(row.start) - origin) / pd.Timedelta(hours=1)
+            end = (pd.Timestamp(row.end) - origin) / pd.Timedelta(hours=1)
+            if not end > start:
+                raise ValueError(f'{path}: end가 start보다 늦어야 함 ({row.start} ~ {row.end})')
+            first = max(int(np.floor(start)), 0)
+            last = min(int(np.ceil(end)), self.total_steps)
+            if first < last:
+                table[first:last, node] = 1.0
+        return table
 
     def _make_lag_context(self, lags: np.ndarray) -> dict[str, np.ndarray]:
         """Build lag-time weather/calendar context arrays; invalid sources are zeroed."""
@@ -255,7 +286,7 @@ class UnifiedDemandDataset(Dataset):
         recent_times = np.arange(target_time - self.time_step, target_time, dtype=np.int64)
         recent_hour, recent_day_of_week = _calendar_features(recent_times)
 
-        return {
+        sample = {
             'demand_history': torch.from_numpy(np.array(history, dtype=np.float32, copy=True)),
             'daily_demand': torch.from_numpy(self.daily_values[target_time]),
             'daily_mask': torch.from_numpy(self.daily_mask[target_time]),
@@ -277,6 +308,12 @@ class UnifiedDemandDataset(Dataset):
             'daily_context_extra': torch.from_numpy(self.daily_context['context'][target_time]),
             'weekly_context_extra': torch.from_numpy(self.weekly_context['context'][target_time]),
         }
+        if self.event_table is not None:
+            # 이벤트 일정은 미리 공개되므로 날씨와 같은 창 [t−k+1, t+1) (예측 시각 t 포함).
+            sample['event_mask'] = torch.from_numpy(
+                self.event_table[target_time - self.time_step + 1 : target_time + 1].copy()
+            )
+        return sample
 
     @property
     def train_end(self) -> int:
