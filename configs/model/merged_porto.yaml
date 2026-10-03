@@ -52,6 +52,13 @@ rmse_weight: 10.0
 # mape_weight는 loss_type='mse_mape'에서만 사용한다(error² + mape_weight·|error|/(y+1)).
 mape_weight: 1.0
 
+# node_mix_*는 loss_type(또는 stage2.loss)='node_mix'에서만 사용한다(docs/SPEC.md §7).
+node_mix_lambda_low: 0.9
+node_mix_lambda_high: 0.1
+node_mix_tau: 0.5
+node_mix_width: 0.5
+node_mix_scaler: true
+
 # split_*은 loss_type='demand_split'에서만 사용한다.
 split_threshold: 1.0
 split_high_weight: 1.0

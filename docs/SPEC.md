@@ -530,6 +530,22 @@ W_hh(n), b(n)도 같은 식 (공유 b = b_ih + b_hh)
 | `rmse_mape` | `rmse_weight·RMSE + MAPE(+1)` |
 | `demand_split` | `y ≤ split_threshold`: `|d|/(|y|+1)`, 그 외: `split_high_weight·d²` |
 | `mse_mape` | `d² + mape_weight·|d|/(|y|+1)` (제곱항은 평균 쪽, 상대항은 저수요 칸을 0 쪽으로; stage 2는 `stage2.mape_weight`) |
+| `node_mix` | 노드 `n`마다 `r_n·[λ_n·|d| + (1−λ_n)·d²/(2A_n)]` (아래) |
+
+**`node_mix`** — 노드 수요 수준에 따라 MAE·MSE 비중을 바꾸되, 노드 사이 업데이트 비중은 바꾸지 않는다.
+
+- `μ_n`: train 구간 노드 평균 수요. `λ_n = λ_hi + (λ_lo − λ_hi)·σ((ln τ − ln(μ_n + 0.01)) / w)`
+  (`node_mix_lambda_low`, `node_mix_lambda_high`, `node_mix_tau`, `node_mix_width`). 저수요 노드는 `λ_lo`(MAE 쪽),
+  고수요 노드는 `λ_hi`(MSE 쪽).
+- `A_n = max(mean_train |y − ŷ_ref|, 0.05)`, `ŷ_ref`는 train 구간 노드×요일×시각 평균(기준 예측).
+  MSE 항을 `2A_n`으로 나누면 기준 잔차에서 `E|∂(d²/2A_n)/∂p| ≈ 1`이 되어 MAE 항(`|∂|d|/∂p| = 1`)과
+  기울기 크기가 같아진다. 그래서 `λ_n`은 노드 안에서 손실의 **모양**만 정한다.
+- 노드 scaler `r_n = λ̄ + (1 − λ̄)·2A_n`, `λ̄`=`λ_n`의 노드 평균. 기준 잔차에서 노드 `n`의 기대 기울기 크기가
+  `r_n`으로 고정되며, 이는 모든 노드에 같은 `λ̄`를 쓴 `λ̄·|d| + (1−λ̄)·d²`의 노드별 기울기 크기와 같다.
+  즉 `λ_n`을 노드마다 바꿔도 노드 사이 업데이트 비중은 균일 `λ̄` 손실과 같다. `node_mix_scaler=false`면
+  `r_n=1`, MSE 정규화 없이 `λ_n·|d| + (1−λ_n)·d²`(대조군).
+- `λ_n`, `1/(2A_n)`, `r_n`은 train.py가 train 구간에서 계산해 config(`node_mix_lambda`,
+  `node_mix_mse_scale`, `node_mix_weight`, 길이 N)에 넣는다. 손실 텐서는 비영속 버퍼다.
 
 `compute_merged_metrics(preds, labels)`:
 

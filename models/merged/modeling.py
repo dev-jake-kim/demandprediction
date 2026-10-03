@@ -182,6 +182,10 @@ class MergedDemandModel(PreTrainedModel):
             split_threshold=self.config.split_threshold,
             split_high_weight=self.config.split_high_weight,
             mape_weight=self.config.mape_weight,
+            node_mix=(
+                (self.config.node_mix_lambda, self.config.node_mix_mse_scale, self.config.node_mix_weight)
+                if self.config.node_mix_lambda is not None else None
+            ),
         )
         self.loss_is_scalar = loss_type in SCALAR_LOSS_TYPES
         # property 금지: PreTrainedModel.__init__이 같은 이름에 대입한다.

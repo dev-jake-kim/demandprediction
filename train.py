@@ -251,6 +251,30 @@ def select_node_adaptive_indices(train_ds: UnifiedDemandDataset, min_demand: flo
     return indices
 
 
+def compute_node_mix(
+    train_ds: UnifiedDemandDataset, lam_low: float, lam_high: float, tau: float, width: float, scaler: bool
+) -> tuple[list[float], list[float], list[float]]:
+    """node_mix 손실의 노드별 (λ_n, 1/(2A_n), r_n) — train 구간 ``[time_step, train_end)``만 쓴다 (docs/SPEC.md §7)."""
+
+    lo, hi = train_ds.time_step, train_ds.train_end
+    y = train_ds.grid[lo:hi].reshape(hi - lo, -1).astype(np.float64)
+    mu = y.mean(axis=0)
+    lam = lam_high + (lam_low - lam_high) / (1.0 + np.exp(-(np.log(tau) - np.log(mu + 0.01)) / width))
+    if not scaler:
+        ones = np.ones_like(mu)
+        return lam.tolist(), ones.tolist(), ones.tolist()
+    # 기준 예측: train 구간 노드×요일×시각 평균. A_n = mean|y − 기준|, 0 근처 노드는 0.05로 하한.
+    how = (train_ds.day_of_week_table[lo:hi] * 24 + train_ds.hour_table[lo:hi]).astype(np.int64)
+    ref = np.zeros_like(y)
+    for k in np.unique(how):
+        rows = how == k
+        ref[rows] = y[rows].mean(axis=0)
+    a = np.maximum(np.abs(y - ref).mean(axis=0), 0.05)
+    lam_bar = float(lam.mean())
+    weight = lam_bar + (1.0 - lam_bar) * 2.0 * a
+    return lam.tolist(), (1.0 / (2.0 * a)).tolist(), weight.tolist()
+
+
 def _summarize_history(
     log_history: list[dict], best_metric_key: str = 'loss'
 ) -> tuple[list[dict], int, float]:
@@ -286,6 +310,9 @@ def load_stage1_with_new_nodes(init_from: str, config: MergedDemandConfig) -> Me
     # 체크포인트를 다시 지정하기 전에 저장된 목적함수와 구조를 검증한다.
     ignored = {
         'node_adaptive_indices', 'node_adaptive_min_demand', 'node_adaptive', 'node_adaptive_mode',
+        # stage 2 손실 전용 설정(node_mix 벡터·하이퍼파라미터)은 stage 1 가중치와 무관하다.
+        'node_mix_lambda', 'node_mix_mse_scale', 'node_mix_weight', 'node_mix_lambda_low',
+        'node_mix_lambda_high', 'node_mix_tau', 'node_mix_width', 'node_mix_scaler',
         'architectures', 'dtype',
     }
     saved = source_config.to_dict()
@@ -389,6 +416,22 @@ def main(cfg: DictConfig) -> None:
             f'({len(node_adaptive_indices) / total_nodes * 100:.1f}%)에만 ΔW를 준다'
         )
 
+    # node_mix 손실(stage 1 또는 stage 2)을 쓰면 노드별 λ·정규화·scaler를 train 구간에서 계산한다.
+    node_mix = None
+    if 'node_mix' in (str(model_kwargs.get('loss_type')), str(cfg.stage2.loss)):
+        node_mix = compute_node_mix(
+            train_ds,
+            float(model_kwargs['node_mix_lambda_low']),
+            float(model_kwargs['node_mix_lambda_high']),
+            float(model_kwargs['node_mix_tau']),
+            float(model_kwargs['node_mix_width']),
+            bool(model_kwargs['node_mix_scaler']),
+        )
+        lam_v, _, weight_v = (np.asarray(v) for v in node_mix)
+        logger.info(
+            f'[node_mix] λ_n {lam_v.min():.2f}~{lam_v.max():.2f} (평균 {lam_v.mean():.2f}), '
+            f'scaler r_n {weight_v.min():.2f}~{weight_v.max():.2f}, scaler={model_kwargs["node_mix_scaler"]}'
+        )
     # 기능적 이웃: masked Transformer 수용 영역(local_radius × transformer_layers) 밖에서 train 구간
     # 상관이 가장 큰 노드 k개. k=0이면 끔.
     functional_k = int(model_kwargs.get('functional_neighbor_k', 0))
@@ -417,6 +460,9 @@ def main(cfg: DictConfig) -> None:
         use_event_embedding=dataset_kwargs['event_csv_path'] is not None,
         event_csv_path=dataset_kwargs['event_csv_path'],
         weather_lead=dataset_kwargs['weather_lead'],
+        node_mix_lambda=node_mix[0] if node_mix else None,
+        node_mix_mse_scale=node_mix[1] if node_mix else None,
+        node_mix_weight=node_mix[2] if node_mix else None,
     )
     if dataset_kwargs['event_csv_path'] is not None:
         logger.info(

@@ -67,6 +67,14 @@ class MergedDemandConfig(PretrainedConfig):
         split_threshold: float = 1.0,
         split_high_weight: float = 1.0,
         mape_weight: float = 1.0,
+        node_mix_lambda_low: float = 0.9,
+        node_mix_lambda_high: float = 0.1,
+        node_mix_tau: float = 0.5,
+        node_mix_width: float = 0.5,
+        node_mix_scaler: bool = True,
+        node_mix_lambda: list[float] | None = None,
+        node_mix_mse_scale: list[float] | None = None,
+        node_mix_weight: list[float] | None = None,
         **kwargs,
     ) -> None:
         self.height = height
@@ -131,6 +139,15 @@ class MergedDemandConfig(PretrainedConfig):
         self.split_high_weight = split_high_weight
         # mse_mape 손실의 상대오차 항 가중치(error² + mape_weight·|error|/(y+1)).
         self.mape_weight = mape_weight
+        # node_mix 손실 하이퍼파라미터와 train.py가 계산해 넣는 노드별 벡터(docs/SPEC.md §7).
+        self.node_mix_lambda_low = node_mix_lambda_low
+        self.node_mix_lambda_high = node_mix_lambda_high
+        self.node_mix_tau = node_mix_tau
+        self.node_mix_width = node_mix_width
+        self.node_mix_scaler = node_mix_scaler
+        self.node_mix_lambda = node_mix_lambda
+        self.node_mix_mse_scale = node_mix_mse_scale
+        self.node_mix_weight = node_mix_weight
         super().__init__(**kwargs)
 
 
