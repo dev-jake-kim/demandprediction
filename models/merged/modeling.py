@@ -133,6 +133,7 @@ class MergedDemandModel(PreTrainedModel):
             use_neighbors=self.use_neighbors,
             use_sink=config.use_sink,
             local_encoder=config.local_encoder,
+            global_nodes=config.global_nodes,
             node_adaptive_indices=node_adaptive_indices,
             node_adaptive_mode=config.node_adaptive_mode,
             functional_neighbors=config.functional_neighbors,

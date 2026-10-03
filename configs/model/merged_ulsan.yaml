@@ -37,6 +37,8 @@ use_neighbors: true
 use_sink: true
 # masked_grid(채택) | crop(이전 방식, ablation 전용)
 local_encoder: masked_grid
+# 모든 노드가 attention으로 볼 수 있는 노드 id 목록(실험용, 기본 없음)
+global_nodes: []
 use_softplus: true
 
 # node_adaptive는 stage 1에서 ΔW를 고정하고 stage 2에서 학습한다.

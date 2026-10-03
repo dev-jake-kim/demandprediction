@@ -395,6 +395,10 @@ attention mask로 표현한다.
    - `use_neighbors=false`면 노드는 자기 자신과 sink만 본다.
    - `use_sink=false`면 sink를 붙이지 않고 노드 `N`개만 넣는다. mask는 노드 쌍 부분만 쓴다
      (모든 노드는 자기 자신을 보므로 전부 `-inf`인 행은 없다).
+   - `global_nodes`(기본 빈 목록)에 든 노드 `g`는 **모든 노드가 볼 수 있다**(열 `g`를 가리지 않음).
+     창 밖 쌍 `(i, g)`의 bias는 0으로 초기화되는 학습 파라미터 `global_bias [heads]`다(창 안이면
+     `direction_bias` 그대로). `g` 자신이 보는 범위(행)는 바뀌지 않는다. 수요가 큰 노드의 상태가 도시 전체에
+     영향을 주는지 보는 실험용이다.
 4. 각 층은 pre-norm `nn.TransformerEncoderLayer`(GELU)이며 attention 가중치 dropout은
    `attention_dropout`, 나머지는 `dropout`. eval·no_grad의 MHA fast path는 3D float mask를
    올바르게 적용하지 않으므로 호출 동안 끈다.

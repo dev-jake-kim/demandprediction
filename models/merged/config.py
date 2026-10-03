@@ -54,6 +54,7 @@ class MergedDemandConfig(PretrainedConfig):
         use_neighbors: bool = True,
         use_sink: bool = True,
         local_encoder: str = 'masked_grid',
+        global_nodes: list[int] | None = None,
         use_softplus: bool = True,
         node_adaptive: bool = False,
         node_adaptive_min_demand: float = 0.8,
@@ -124,6 +125,8 @@ class MergedDemandConfig(PretrainedConfig):
         self.use_sink = use_sink
         # masked_grid(채택) | crop(이전 방식, ablation 전용) — docs/SPEC.md §4.2
         self.local_encoder = local_encoder
+        # 모든 노드가 attention으로 볼 수 있는 노드 id(마스크 열 개방, docs/SPEC.md §6.2).
+        self.global_nodes = list(global_nodes or [])
         self.use_softplus = use_softplus
         self.node_adaptive = node_adaptive
         self.node_adaptive_min_demand = node_adaptive_min_demand

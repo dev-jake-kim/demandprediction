@@ -35,6 +35,7 @@ class LocalHistoryEncoder(nn.Module):
         use_neighbors: bool = True,
         use_sink: bool = True,
         local_encoder: str = "masked_grid",
+        global_nodes: Sequence[int] | None = None,
         node_adaptive_indices: Sequence[int] | None = None,
         node_adaptive_mode: str = "additive",
         functional_neighbors: Sequence[Sequence[int]] | None = None,
@@ -74,9 +75,15 @@ class LocalHistoryEncoder(nn.Module):
         self.node_embedding = nn.Parameter(torch.randn(self.num_nodes, d_model) * 0.02)
         if local_encoder == "masked_grid":
             self.direction_bias = nn.Parameter(torch.zeros(transformer_heads, self.num_neighbors))
+            # 모든 노드가 볼 수 있는 노드(마스크 열 개방). 창 밖 쌍은 head별 global_bias(0 초기화)를 쓴다.
+            self._global_node_list = sorted({int(v) for v in (global_nodes or [])})
+            if self._global_node_list:
+                if min(self._global_node_list) < 0 or max(self._global_node_list) >= self.num_nodes:
+                    raise ValueError(f"global_nodes가 노드 범위(0..{self.num_nodes - 1})를 벗어남")
+                self.global_bias = nn.Parameter(torch.zeros(transformer_heads))
         else:
-            if functional_neighbors is not None or use_event_embedding or weather_cls_dim > 0:
-                raise ValueError("local_encoder=crop은 기능적 이웃·이벤트 임베딩·cls_add 날씨를 지원하지 않음")
+            if functional_neighbors is not None or use_event_embedding or weather_cls_dim > 0 or global_nodes:
+                raise ValueError("local_encoder=crop은 기능적 이웃·이벤트 임베딩·cls_add 날씨·global_nodes를 지원하지 않음")
             self.register_buffer("neighbor_valid", self._make_neighbor_valid(), persistent=True)
             self.special_embedding = nn.Embedding(2, d_model)  # 0: CLS, 1: EDGE(격자 밖)
             self.position_embedding = nn.Parameter(torch.randn(1 + self.num_neighbors, d_model) * 0.02)
@@ -253,6 +260,12 @@ class LocalHistoryEncoder(nn.Module):
         direction = self.neighbor_direction
         allowed = direction >= 0
         bias = self.direction_bias[:, direction.clamp_min(0)]
+        if self._global_node_list:
+            column = torch.zeros_like(allowed)
+            column[:, self._global_node_list] = True
+            extra = column & ~allowed  # 창 밖에서 새로 열리는 (i, g) 쌍
+            bias = torch.where(extra, self.global_bias[:, None, None], bias)
+            allowed = allowed | column
         if self.use_sink:
             allowed = F.pad(allowed, (1, 0, 1, 0), value=True)
             bias = F.pad(bias, (1, 0, 1, 0))
