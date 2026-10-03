@@ -730,6 +730,7 @@ def main(cfg: DictConfig) -> None:
                 'use_branch_attention',
                 'use_neighbors',
                 'use_sink',
+                'local_encoder',
                 'use_softplus',
             )
         },

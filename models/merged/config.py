@@ -53,6 +53,7 @@ class MergedDemandConfig(PretrainedConfig):
         use_branch_attention: bool = True,
         use_neighbors: bool = True,
         use_sink: bool = True,
+        local_encoder: str = 'masked_grid',
         use_softplus: bool = True,
         node_adaptive: bool = False,
         node_adaptive_min_demand: float = 0.8,
@@ -121,6 +122,8 @@ class MergedDemandConfig(PretrainedConfig):
         self.use_branch_attention = use_branch_attention
         self.use_neighbors = use_neighbors
         self.use_sink = use_sink
+        # masked_grid(채택) | crop(이전 방식, ablation 전용) — docs/SPEC.md §4.2
+        self.local_encoder = local_encoder
         self.use_softplus = use_softplus
         self.node_adaptive = node_adaptive
         self.node_adaptive_min_demand = node_adaptive_min_demand

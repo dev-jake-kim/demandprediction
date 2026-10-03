@@ -36,6 +36,8 @@ use_calendar: true
 use_branch_attention: true
 use_neighbors: true
 use_sink: true
+# masked_grid(채택) | crop(이전 방식, ablation 전용)
+local_encoder: masked_grid
 use_softplus: true
 
 # node_adaptive는 stage 1에서 ΔW를 고정하고 stage 2에서 학습한다.
