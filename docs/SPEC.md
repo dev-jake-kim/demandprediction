@@ -251,7 +251,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | `use_weather` | true | 정규화 날씨를 0으로 (train 평균에 해당) |
 | `use_calendar` | true | 요일·시간 임베딩을 0으로 |
 | `use_neighbors` | true | masked attention에서 노드가 자기 자신과 sink만 보도록 이웃을 가림 |
-| `use_sink` | true | 층별 sink 토큰을 쓰지 않음: 입력 `[B·k, N, D]`, mask `[N, N]`(노드는 자기 창만 봄), `sink_embedding` 없음 |
+| `use_sink` | true | 층별 sink 토큰을 쓰지 않음: 입력 `[B·k, N, D]`, mask `[N, N]`(노드는 자기 창만 봄), `sink_embedding` 없음. 채택 설정 5시드에서 끄면 울산은 차이 없음(RMSE +0.01%, MAPE −0.24%), Porto는 RMSE +1.69%(4/5)·MAE +0.50%(5/5)·MAPE −0.70%(5/5) |
 | `use_branch_attention` | true | 학습된 attention 대신 유효 브랜치 균등 평균 |
 | `use_softplus` | true | neural head의 raw 선형 출력 사용 (음수 가능) |
 | `weather_injection` | `concat` | `cls_add`: 날씨를 LSTM 입력 대신 Transformer 노드 토큰에 더함 |
