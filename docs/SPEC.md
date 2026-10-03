@@ -235,7 +235,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | 추가 context | `context_extra_dim`, `context_features` | 0, [] — train.py가 `data.context_features`에서 주입. 채널은 날씨·요일·시간 뒤에 붙는다 |
 | 이벤트 | `use_event_embedding`, `event_csv_path` | false, null — train.py가 `data.event_csv`가 있으면 켜고 절대경로를 저장. 공연·축제 등 모든 이벤트에 **같은** 학습 임베딩 `event_embedding [D]`(0 초기화)을 이벤트 시각·노드의 Transformer 입력 토큰에 더한다(§6.2) |
 | 노드 적응 | `node_adaptive`, `node_adaptive_min_demand`, `node_adaptive_mode` | true, 0.1, `additive` |
-| 손실 | `loss_type`, `mape_weight` | 울산 `mse_mape`, 2.0 / Porto `mae` (stage 2도 같은 손실: `stage2.loss`, `stage2.mape_weight`) |
+| 손실 | `loss_type`, `mape_weight` | `mse_mape`, 울산 2.0 / Porto 6.0 (stage 2도 같은 손실: `stage2.loss`, `stage2.mape_weight`) |
 | | `loss_gamma`, `loss_eps`, `rmse_weight`, `split_threshold`, `split_high_weight` | 1.0, 0.5, 10.0, 1.0, 1.0 |
 
 ### 4.2 기능 스위치
@@ -691,8 +691,10 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
   - 울산: 손실 `mse_mape`(λ=2, stage 1·2), `msemape2_ulsan_seed{seed}_471594f`. ADFormer 8h 대비
     RMSE 0.7123(−2.29%), MAPE 15.219(−2.39%). MAE 손실은 중앙값을 예측해 평균 대비 23% 과소예측하고
     RMSE가 막혔다(이전 울산 채택 `timestep8_ulsan_*`는 `output/past/adopted_ulsan_mae_d02824a/`).
-  - Porto: 손실 `mae`, `timestep8_porto_seed{seed}_{39185a1|d02824a}`
-    (시드 245는 커밋 `39185a1`, 나머지는 `d02824a`; 두 커밋의 모델 코드는 같다).
+  - Porto: 손실 `mse_mape`(λ=6, stage 1·2), `msemape6_porto_seed{seed}_0769f0c`. ADFormer 8h 대비
+    RMSE 1.5846(−9.67%), MAPE 14.364(−8.89%). λ는 3시드 val로 골랐다(λ=2·4·6·8·12 중 val RMSE가 최저 근처
+    (+0.4%)이면서 val MAPE가 가장 낮은 6). 이전 Porto 채택(MAE, `timestep8_porto_*`, RMSE −5.85%·MAPE −3.94%)은
+    `output/past/adopted_porto_mae_d02824a/`.
 - 이전 채택 모델:
   - 커밋 `8d28250`, 입력 창 24시간, 시드 245 `weathermerge_{ulsan,porto}_seed245_8d28250`:
     `output/past/adopted_8d28250/`. 현재 코드로 불러올 수 있다(`test.py`는 체크포인트의
