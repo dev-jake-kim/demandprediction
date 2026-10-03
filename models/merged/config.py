@@ -73,6 +73,7 @@ class MergedDemandConfig(PretrainedConfig):
         node_mix_width: float = 0.5,
         node_mix_scaler: bool = True,
         node_mix_lambda: list[float] | None = None,
+        node_mix_mape_scale: list[float] | None = None,
         node_mix_mse_scale: list[float] | None = None,
         node_mix_weight: list[float] | None = None,
         **kwargs,
@@ -146,6 +147,7 @@ class MergedDemandConfig(PretrainedConfig):
         self.node_mix_width = node_mix_width
         self.node_mix_scaler = node_mix_scaler
         self.node_mix_lambda = node_mix_lambda
+        self.node_mix_mape_scale = node_mix_mape_scale
         self.node_mix_mse_scale = node_mix_mse_scale
         self.node_mix_weight = node_mix_weight
         super().__init__(**kwargs)

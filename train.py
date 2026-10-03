@@ -253,8 +253,8 @@ def select_node_adaptive_indices(train_ds: UnifiedDemandDataset, min_demand: flo
 
 def compute_node_mix(
     train_ds: UnifiedDemandDataset, lam_low: float, lam_high: float, tau: float, width: float, scaler: bool
-) -> tuple[list[float], list[float], list[float]]:
-    """node_mix 손실의 노드별 (λ_n, 1/(2A_n), r_n) — train 구간 ``[time_step, train_end)``만 쓴다 (docs/SPEC.md §7)."""
+) -> tuple[list[float], list[float], list[float], list[float]]:
+    """node_mix 손실의 노드별 (λ_n, 1/B_n, 1/(2A_n), r_n) — train 구간 ``[time_step, train_end)``만 쓴다 (docs/SPEC.md §7)."""
 
     lo, hi = train_ds.time_step, train_ds.train_end
     y = train_ds.grid[lo:hi].reshape(hi - lo, -1).astype(np.float64)
@@ -262,17 +262,18 @@ def compute_node_mix(
     lam = lam_high + (lam_low - lam_high) / (1.0 + np.exp(-(np.log(tau) - np.log(mu + 0.01)) / width))
     if not scaler:
         ones = np.ones_like(mu)
-        return lam.tolist(), ones.tolist(), ones.tolist()
-    # 기준 예측: train 구간 노드×요일×시각 평균. A_n = mean|y − 기준|, 0 근처 노드는 0.05로 하한.
+        return lam.tolist(), ones.tolist(), ones.tolist(), ones.tolist()
+    # MAPE 항 기울기 크기 E[1/(y+1)] = B_n, MSE 항 기울기 크기 2·E|y − 기준| = 2A_n (기준: 노드×요일×시각 평균).
     how = (train_ds.day_of_week_table[lo:hi] * 24 + train_ds.hour_table[lo:hi]).astype(np.int64)
     ref = np.zeros_like(y)
     for k in np.unique(how):
         rows = how == k
         ref[rows] = y[rows].mean(axis=0)
     a = np.maximum(np.abs(y - ref).mean(axis=0), 0.05)
+    b = (1.0 / (y + 1.0)).mean(axis=0)
     lam_bar = float(lam.mean())
-    weight = lam_bar + (1.0 - lam_bar) * 2.0 * a
-    return lam.tolist(), (1.0 / (2.0 * a)).tolist(), weight.tolist()
+    weight = lam_bar * b + (1.0 - lam_bar) * 2.0 * a
+    return lam.tolist(), (1.0 / b).tolist(), (1.0 / (2.0 * a)).tolist(), weight.tolist()
 
 
 def _summarize_history(
@@ -311,7 +312,7 @@ def load_stage1_with_new_nodes(init_from: str, config: MergedDemandConfig) -> Me
     ignored = {
         'node_adaptive_indices', 'node_adaptive_min_demand', 'node_adaptive', 'node_adaptive_mode',
         # stage 2 손실 전용 설정(node_mix 벡터·하이퍼파라미터)은 stage 1 가중치와 무관하다.
-        'node_mix_lambda', 'node_mix_mse_scale', 'node_mix_weight', 'node_mix_lambda_low',
+        'node_mix_lambda', 'node_mix_mape_scale', 'node_mix_mse_scale', 'node_mix_weight', 'node_mix_lambda_low',
         'node_mix_lambda_high', 'node_mix_tau', 'node_mix_width', 'node_mix_scaler',
         'architectures', 'dtype',
     }
@@ -427,7 +428,7 @@ def main(cfg: DictConfig) -> None:
             float(model_kwargs['node_mix_width']),
             bool(model_kwargs['node_mix_scaler']),
         )
-        lam_v, _, weight_v = (np.asarray(v) for v in node_mix)
+        lam_v, _, _, weight_v = (np.asarray(v) for v in node_mix)
         logger.info(
             f'[node_mix] λ_n {lam_v.min():.2f}~{lam_v.max():.2f} (평균 {lam_v.mean():.2f}), '
             f'scaler r_n {weight_v.min():.2f}~{weight_v.max():.2f}, scaler={model_kwargs["node_mix_scaler"]}'
@@ -461,8 +462,9 @@ def main(cfg: DictConfig) -> None:
         event_csv_path=dataset_kwargs['event_csv_path'],
         weather_lead=dataset_kwargs['weather_lead'],
         node_mix_lambda=node_mix[0] if node_mix else None,
-        node_mix_mse_scale=node_mix[1] if node_mix else None,
-        node_mix_weight=node_mix[2] if node_mix else None,
+        node_mix_mape_scale=node_mix[1] if node_mix else None,
+        node_mix_mse_scale=node_mix[2] if node_mix else None,
+        node_mix_weight=node_mix[3] if node_mix else None,
     )
     if dataset_kwargs['event_csv_path'] is not None:
         logger.info(

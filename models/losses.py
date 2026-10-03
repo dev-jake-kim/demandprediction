@@ -97,26 +97,30 @@ class MseMapeLoss(nn.Module):
 
 
 class NodeMixLoss(nn.Module):
-    """Node-wise ``weight_n * (lam_n * |d| + (1 - lam_n) * d**2 * mse_scale_n)``.
+    """Node-wise ``weight_n * (lam_n * |d| / (|y| + 1) * mape_scale_n + (1 - lam_n) * d**2 * mse_scale_n)``.
 
-    ``mse_scale_n = 1 / (2 A_n)`` matches the squared-error gradient to the absolute-error gradient
+    ``mape_scale_n = 1 / B_n`` and ``mse_scale_n = 1 / (2 A_n)`` match both terms' gradient magnitudes
     at reference residuals, so ``lam_n`` only changes the loss shape within a node; ``weight_n``
     fixes the node's expected gradient magnitude (docs/SPEC.md §7). Per-node vectors have length
     ``H*W`` and are reshaped to the prediction grid.
     """
 
-    def __init__(self, lam: list[float], mse_scale: list[float], weight: list[float]) -> None:
+    def __init__(
+        self, lam: list[float], mape_scale: list[float], mse_scale: list[float], weight: list[float]
+    ) -> None:
         super().__init__()
-        if not (len(lam) == len(mse_scale) == len(weight)):
+        if not (len(lam) == len(mape_scale) == len(mse_scale) == len(weight)):
             raise ValueError('node_mix 벡터 길이가 다름')
-        self.register_buffer('lam', torch.tensor(lam, dtype=torch.float32), persistent=False)
-        self.register_buffer('mse_scale', torch.tensor(mse_scale, dtype=torch.float32), persistent=False)
-        self.register_buffer('weight', torch.tensor(weight, dtype=torch.float32), persistent=False)
+        for name, values in (('lam', lam), ('mape_scale', mape_scale), ('mse_scale', mse_scale), ('weight', weight)):
+            self.register_buffer(name, torch.tensor(values, dtype=torch.float32), persistent=False)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         grid = y_pred.shape[-2:]
         if self.lam.device != y_pred.device:
             self.to(y_pred.device)
-        lam, mse_scale, weight = (v.view(grid) for v in (self.lam, self.mse_scale, self.weight))
+        lam, mape_scale, mse_scale, weight = (
+            v.view(grid) for v in (self.lam, self.mape_scale, self.mse_scale, self.weight)
+        )
         diff = y_true - y_pred
-        return weight * (lam * diff.abs() + (1.0 - lam) * diff ** 2 * mse_scale)
+        relative = diff.abs() / (y_true.abs() + 1.0)
+        return weight * (lam * relative * mape_scale + (1.0 - lam) * diff ** 2 * mse_scale)

@@ -183,7 +183,8 @@ class MergedDemandModel(PreTrainedModel):
             split_high_weight=self.config.split_high_weight,
             mape_weight=self.config.mape_weight,
             node_mix=(
-                (self.config.node_mix_lambda, self.config.node_mix_mse_scale, self.config.node_mix_weight)
+                (self.config.node_mix_lambda, self.config.node_mix_mape_scale,
+                 self.config.node_mix_mse_scale, self.config.node_mix_weight)
                 if self.config.node_mix_lambda is not None else None
             ),
         )

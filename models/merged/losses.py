@@ -23,7 +23,7 @@ def build_loss(
     split_threshold: float = 1.0,
     split_high_weight: float = 1.0,
     mape_weight: float = 1.0,
-    node_mix: tuple[list[float], list[float], list[float]] | None = None,
+    node_mix: tuple[list[float], list[float], list[float], list[float]] | None = None,
 ) -> nn.Module:
     """Build a configured training objective by name.
 
@@ -43,7 +43,7 @@ def build_loss(
         return MseMapeLoss(mape_weight=mape_weight)
     if loss_type == 'node_mix':
         if node_mix is None:
-            raise ValueError('node_mix 손실에는 노드별 (lambda, mse_scale, weight)가 필요함 — train.py가 계산해 config에 넣는다')
+            raise ValueError('node_mix 손실에는 노드별 (lambda, mape_scale, mse_scale, weight)가 필요함 — train.py가 계산해 config에 넣는다')
         return NodeMixLoss(*node_mix)
     raise ValueError(
         f"알 수 없는 loss_type: {loss_type!r} "
