@@ -547,6 +547,9 @@ W_hh(n), b(n)도 같은 식 (공유 b = b_ih + b_hh)
   `r_n=1`, 정규화 없이 `λ_n·|d|/(|y|+1) + (1−λ_n)·d²`(대조군).
 - `λ_n`, `1/B_n`, `1/(2A_n)`, `r_n`은 train.py가 train 구간에서 계산해 config(`node_mix_lambda`,
   `node_mix_mape_scale`, `node_mix_mse_scale`, `node_mix_weight`, 길이 N)에 넣는다. 손실 텐서는 비영속 버퍼다.
+- 울산 3시드(stage 1·2, ADF 8h 대비 RMSE / MAPE): (λ_lo, λ_hi) = (0.9, 0.1) −3.70% / +4.62%, (0.95, 0.2)
+  −3.03% / +0.65%, (0.97, 0.35) −2.02% / −3.62%, (0.98, 0.5) −0.21% / −7.59%. 같은 MAPE에서 `mse_mape` 경계보다
+  RMSE가 약 0.1%p 낫거나 같아(시드 편차 수준) 채택하지 않았다. scaler를 끄면((0.9, 0.1)) −3.94% / +8.72%.
 
 `compute_merged_metrics(preds, labels)`:
 
