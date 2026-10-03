@@ -33,6 +33,7 @@ class LocalHistoryEncoder(nn.Module):
         extra_dim: int = 0,
         weather_cls_dim: int = 0,
         use_neighbors: bool = True,
+        use_sink: bool = True,
         node_adaptive_indices: Sequence[int] | None = None,
         node_adaptive_mode: str = "additive",
         functional_neighbors: Sequence[Sequence[int]] | None = None,
@@ -61,8 +62,10 @@ class LocalHistoryEncoder(nn.Module):
         # from_pretrained가 체크포인트에서 복원하도록 persistent 버퍼로 둔다.
         self.register_buffer("neighbor_direction", self._make_neighbor_direction(), persistent=True)
         self.scalar_embedding = FourierScalarEmbedding(d_model, num_fourier_bands)
-        # 층마다 독립 sink 토큰. 한 층의 sink 출력은 다음 층으로 전달하지 않는다.
-        self.sink_embedding = nn.Parameter(torch.randn(transformer_layers, d_model) * 0.02)
+        # 층마다 독립 sink 토큰. 한 층의 sink 출력은 다음 층으로 전달하지 않는다. use_sink=false면 없다.
+        self.use_sink = use_sink
+        if use_sink:
+            self.sink_embedding = nn.Parameter(torch.randn(transformer_layers, d_model) * 0.02)
         self.node_embedding = nn.Parameter(torch.randn(self.num_nodes, d_model) * 0.02)
         self.direction_bias = nn.Parameter(torch.zeros(transformer_heads, self.num_neighbors))
         # 모든 이벤트(공연·축제 등)가 공유하는 학습 임베딩. 0 초기화라 학습 전에는 없는 것과 같다.
@@ -230,14 +233,17 @@ class LocalHistoryEncoder(nn.Module):
         return torch.where(inside, direction, torch.full_like(direction, -1))
 
     def _attention_mask(self, sequences: int) -> Tensor:
-        """``[sequences * heads, 1+N, 1+N]`` 더하는 attention mask (index 0 = sink).
+        """더하는 attention mask. use_sink면 ``[sequences*heads, 1+N, 1+N]`` (index 0 = sink), 아니면 ``[.., N, N]``.
 
         sink 행·열은 막지 않는다. 노드 쌍은 창 안이면 방향별·head별 bias, 밖이면 -inf.
         """
 
         direction = self.neighbor_direction
-        allowed = F.pad(direction >= 0, (1, 0, 1, 0), value=True)
-        bias = F.pad(self.direction_bias[:, direction.clamp_min(0)], (1, 0, 1, 0))
+        allowed = direction >= 0
+        bias = self.direction_bias[:, direction.clamp_min(0)]
+        if self.use_sink:
+            allowed = F.pad(allowed, (1, 0, 1, 0), value=True)
+            bias = F.pad(bias, (1, 0, 1, 0))
         mask = bias.masked_fill(~allowed, float("-inf"))
         length = mask.shape[-1]
         return (
@@ -297,9 +303,12 @@ class LocalHistoryEncoder(nn.Module):
         fastpath = torch.backends.mha.get_fastpath_enabled()
         torch.backends.mha.set_fastpath_enabled(False)
         try:
-            for layer, sink in zip(self.transformer, self.sink_embedding):
-                layer_input = torch.cat([sink.expand(sequences, 1, -1), hidden_tokens], dim=1)
-                hidden_tokens = layer(layer_input, src_mask=mask)[:, 1:]
+            for index, layer in enumerate(self.transformer):
+                if self.use_sink:
+                    sink = self.sink_embedding[index].expand(sequences, 1, -1)
+                    hidden_tokens = layer(torch.cat([sink, hidden_tokens], dim=1), src_mask=mask)[:, 1:]
+                else:
+                    hidden_tokens = layer(hidden_tokens, src_mask=mask)
         finally:
             torch.backends.mha.set_fastpath_enabled(fastpath)
         summary = hidden_tokens.reshape(batch, steps, nodes, -1)

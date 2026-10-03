@@ -131,6 +131,7 @@ class MergedDemandModel(PreTrainedModel):
             extra_dim=self.extra_dim,
             weather_cls_dim=self.weather_cls_dim,
             use_neighbors=self.use_neighbors,
+            use_sink=config.use_sink,
             node_adaptive_indices=node_adaptive_indices,
             node_adaptive_mode=config.node_adaptive_mode,
             functional_neighbors=config.functional_neighbors,

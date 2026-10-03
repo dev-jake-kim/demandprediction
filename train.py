@@ -729,6 +729,7 @@ def main(cfg: DictConfig) -> None:
                 'use_calendar',
                 'use_branch_attention',
                 'use_neighbors',
+                'use_sink',
                 'use_softplus',
             )
         },

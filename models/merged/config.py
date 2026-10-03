@@ -52,6 +52,7 @@ class MergedDemandConfig(PretrainedConfig):
         use_calendar: bool = True,
         use_branch_attention: bool = True,
         use_neighbors: bool = True,
+        use_sink: bool = True,
         use_softplus: bool = True,
         node_adaptive: bool = False,
         node_adaptive_min_demand: float = 0.8,
@@ -119,6 +120,7 @@ class MergedDemandConfig(PretrainedConfig):
         self.use_calendar = use_calendar
         self.use_branch_attention = use_branch_attention
         self.use_neighbors = use_neighbors
+        self.use_sink = use_sink
         self.use_softplus = use_softplus
         self.node_adaptive = node_adaptive
         self.node_adaptive_min_demand = node_adaptive_min_demand

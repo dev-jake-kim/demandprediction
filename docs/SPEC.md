@@ -251,6 +251,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | `use_weather` | true | 정규화 날씨를 0으로 (train 평균에 해당) |
 | `use_calendar` | true | 요일·시간 임베딩을 0으로 |
 | `use_neighbors` | true | masked attention에서 노드가 자기 자신과 sink만 보도록 이웃을 가림 |
+| `use_sink` | true | 층별 sink 토큰을 쓰지 않음: 입력 `[B·k, N, D]`, mask `[N, N]`(노드는 자기 창만 봄), `sink_embedding` 없음 |
 | `use_branch_attention` | true | 학습된 attention 대신 유효 브랜치 균등 평균 |
 | `use_softplus` | true | neural head의 raw 선형 출력 사용 (음수 가능) |
 | `weather_injection` | `concat` | `cls_add`: 날씨를 LSTM 입력 대신 Transformer 노드 토큰에 더함 |
@@ -391,6 +392,8 @@ attention mask로 표현한다.
      0으로 초기화되는 학습 파라미터다.
    - 격자 밖 이웃은 토큰이 없으므로 가장자리 노드는 창 안 실재 노드만 본다.
    - `use_neighbors=false`면 노드는 자기 자신과 sink만 본다.
+   - `use_sink=false`면 sink를 붙이지 않고 노드 `N`개만 넣는다. mask는 노드 쌍 부분만 쓴다
+     (모든 노드는 자기 자신을 보므로 전부 `-inf`인 행은 없다).
 4. 각 층은 pre-norm `nn.TransformerEncoderLayer`(GELU)이며 attention 가중치 dropout은
    `attention_dropout`, 나머지는 `dropout`. eval·no_grad의 MHA fast path는 3D float mask를
    올바르게 적용하지 않으므로 호출 동안 끈다.

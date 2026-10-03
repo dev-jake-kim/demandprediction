@@ -35,6 +35,7 @@ weather_injection: concat
 use_calendar: true
 use_branch_attention: true
 use_neighbors: true
+use_sink: true
 use_softplus: true
 
 # node_adaptive는 stage 1에서 ΔW를 고정하고 stage 2에서 학습한다.
