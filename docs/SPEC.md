@@ -398,7 +398,10 @@ attention mask로 표현한다.
    - `global_nodes`(기본 빈 목록)에 든 노드 `g`는 **모든 노드가 볼 수 있다**(열 `g`를 가리지 않음).
      창 밖 쌍 `(i, g)`의 bias는 0으로 초기화되는 학습 파라미터 `global_bias [heads]`다(창 안이면
      `direction_bias` 그대로). `g` 자신이 보는 범위(행)는 바뀌지 않는다. 수요가 큰 노드의 상태가 도시 전체에
-     영향을 주는지 보는 실험용이다.
+     영향을 주는지 보는 실험용이다. 채택 설정에서 수요 상위 20% 노드 하나씩(1시드, val로 선별 → 3시드):
+     울산은 효과 없음(노드 55·62, 3시드 RMSE +0.04~0.08%·MAPE +0.11~0.30%), Porto는 선별한 4개 모두 RMSE −0.4~−0.8%·
+     MAPE −0.4~−1.2%(노드 114는 3/3 시드 모두 개선). Porto는 40개 중 36개가 1시드 test MAPE를 낮춰 노드 고유 효과보다
+     "전역 열 하나를 여는 것" 자체의 효과로 보인다.
 4. 각 층은 pre-norm `nn.TransformerEncoderLayer`(GELU)이며 attention 가중치 dropout은
    `attention_dropout`, 나머지는 `dropout`. eval·no_grad의 MHA fast path는 3D float mask를
    올바르게 적용하지 않으므로 호출 동안 끈다.
