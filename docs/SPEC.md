@@ -285,6 +285,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
   만든다: `raw_calls`(전체 호출), `failed`(배차 실패, call_state=3), `wait_min`(성공 호출의 평균 대기 분),
   `high_send`(send_level≥3 호출). 수요 격자와 같은 좌표(700m, EPSG:5174)·시각(호출 시각 floor)이다.
   샘플은 `aux_history [k, N, C]`를 수요 이력과 같은 창 `[t−k, t)`로 받는다(예측 시각 이전에 관측된 값만).
+  울산 채택 설정 3시드: test RMSE +0.06%, MAPE +0.02%(채택 대비) — 효과 없음. 채택 잔차와의 상관도 0.03~0.06.
 - `train`: batch Ulsan 24 / Porto 8 (train·eval 동일), `num_train_epochs=120`,
   `optim=adamw_torch_fused`, `learning_rate=1e-3`, `weight_decay=0.05`, `max_grad_norm=5.0`,
   `lr_scheduler_type=constant`, `warmup_ratio=0`, epoch 단위 log/eval/save,
@@ -564,6 +565,26 @@ x·W(b,n)ᵀ = x·Wᵀ + Σ_m c[b,n,m]·(x·B_ihᵀ[m] + B_b[m])     (활성값 
   offset `Δv[n, branch]` (`[A, 3, fusion_dim]`)를 더한다.
 - 모든 위치의 ΔW는 0으로 생성되고 stage 1에서 고정, stage 2에서 학습한다(위 규칙과 같음).
 
+**울산 ΔW 실험 결과** (채택 stage 1 체크포인트에서 stage 2만, 같은 시드 ADFormer 8h 대비 test RMSE / MAPE):
+
+| ΔW 설정 | 3시드 (245/6835/851) | 5시드 |
+|---|---|---|
+| additive, history (채택, 대조군) | −2.45% / −2.42% | −2.29% / −2.39% |
+| basis M=8 / +기술자 / +기술자·전체 노드 | −2.28% / −2.53%, −2.26% / −2.58%, −2.27% / −2.56% | |
+| basis + dynamic (history, history+periodic) | −2.28% / −2.52%, −2.28% / −2.53% | |
+| history+head | −2.44% / −2.43% | |
+| history+fusion | −2.45% / −2.43% | |
+| **history+periodic** | −2.39% / −2.78% | **−2.28% / −2.66%** (대조군 대비 MAPE 5/5·MAE 5/5·RMSE 4/5 개선) |
+| history+periodic+head / +fusion | −2.48% / −2.44%, −2.39% / −2.78% | |
+| history+periodic, ΔW만 학습(공유 고정) lr 1e-3 | −2.48% / −2.55% (best epoch 2) | |
+| joint(처음부터) basis history+periodic | −1.95% / +0.03% | |
+
+- ΔW의 예측 기여는 작다: 채택 체크포인트에서 ΔW만 0으로 바꾸면 test 예측이 평균 0.01(수요 평균 0.47) 바뀌고
+  RMSE 0.1% 차이. lr을 10배로 올려 ΔW만 학습해도 val 최적이 2 epoch이고 그 뒤 val이 나빠진다 → 용량·학습량이 아니라
+  노드 고유 신호가 작은 것이 한계. Poisson NLL로 학습한 비편향 μ의 잔차에서 val로 추정한 노드×시각 편향을
+  test에 더해도 RMSE −0.2% 이하.
+- 같은 stage 1에서 ΔW 변형 4개를 평균해도 −2.47% / −2.60%(단일 −2.45% / −2.39%)로 앙상블 이득이 거의 없다.
+
 <details>
 <summary>세부</summary>
 
@@ -590,14 +611,16 @@ x·W(b,n)ᵀ = x·Wᵀ + Σ_m c[b,n,m]·(x·B_ihᵀ[m] + B_b[m])     (활성값 
 | `demand_split` | `y ≤ split_threshold`: `|d|/(|y|+1)`, 그 외: `split_high_weight·d²` |
 | `mse_mape` | `d² + mape_weight·|d|/(|y|+1)` (제곱항은 평균 쪽, 상대항은 저수요 칸을 0 쪽으로; stage 2는 `stage2.mape_weight`) |
 | `node_mix` | 노드 `n`마다 `r_n·[λ_n·|d|/((|y|+1)·B_n) + (1−λ_n)·d²/(2A_n)]` (아래) |
-| `poisson` | `ŷ − y·ln(ŷ + 1e−6)` (Poisson NLL). 출력 `ŷ`는 평균 수요 μ다. `decision_lambda > 0`이면 평가(eval) 때 점 예측을 μ에서 아래 결정 규칙으로 바꾼다 |
+| `poisson` | `ŷ − y·ln(ŷ + 1e−6)` (Poisson NLL). 출력 `ŷ`는 평균 수요 μ다(점 예측 = μ) |
 
-**분포 예측 + 결정 (`poisson` + `decision_lambda`)** — 표현은 likelihood로 배우고, 점 예측은 평가 목적에 맞게 따로 정한다.
+**`poisson` 실험 (울산, stage 1·2, 3시드)** — 표현은 likelihood로 배우고 점 예측은 평가 목적으로 따로 정할 수 있는지 확인했다.
 
-- 학습: 출력 μ를 Poisson NLL로 학습한다(stage 1·2 모두). 학습 중 `logits`는 μ다.
-- 평가: `Y ~ Poisson(μ)`라 보고 `c* = argmin_c E[(Y − c)²] + λ_dec·E[|Y − c|/(Y + 1)]`를 낸다(`λ_dec = decision_lambda`).
-  `J'(c) = 2(c − μ) + λ_dec·(2·Σ_{y<c} p(y)/(y+1) − Σ_y p(y)/(y+1))`가 c에 대해 증가하므로 이분법으로 푼다.
-  μ 격자(0~μ_max, 간격 0.005)에서 미리 표를 만들고 선형 보간한다. `λ_dec`는 학습과 무관해 val에서 고른다.
+- μ 그대로: test RMSE −5.39% / MAPE +32.9% (ADFormer 8h 대비). μ의 test MSE(0.477)가 평균 μ(0.481)와 같아
+  잔차가 Poisson 잡음 수준이다.
+- 오프라인 결정 `c* = argmin_c E[(Y − c)²] + λ·E[|Y − c|/(Y + 1)]` (`Y ~ Poisson(μ)`, 또는 val에서 μ 구간별로 실측 분포로
+  최적화): λ=2.25에서 −2.44% / −2.43%로 mse_mape λ=2 학습(−2.45% / −2.42%)과 같은 RMSE↔MAPE 교환선. NB(분산 1.2μ·1.5μ)도 같은 선.
+- μ를 진짜라 놓고 Poisson으로 표본을 뽑아 같은 결정을 하면 −2.26% / −2.26% → 이 데이터의 잡음만으로 교환선이 정해진다.
+  결정 규칙은 코드에 넣지 않았다(`/tmp` 분석).
 
 **`node_mix`** — 노드 수요 수준에 따라 MAPE·MSE 비중을 바꾸되, 노드 사이 업데이트 비중은 바꾸지 않는다.
 
