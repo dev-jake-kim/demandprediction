@@ -540,6 +540,18 @@ W_ih(n)  = W_ih + ΔW_ih[n]        (W_hh, b도 additive와 같은 식)
   `node_descriptors [A, F_φ]`로 config에 저장): 시각별(24)·요일별(7, 시작일 기준 상대 요일) 평균 수요 / 노드 평균,
   `log1p` 평균, 0 비율, 변동계수 = 34차원. 차원마다 적응 노드 사이에서 표준화한다.
   수요 패턴이 비슷한 노드가 비슷한 ΔW 방향에서 시작하고 같이 움직이게 한다.
+- 울산 채택 stage 1 체크포인트에서 stage 2만 3시드(245/6835/851) 비교, 대조군 additive(채택과 동일 재현):
+  test RMSE / MAPE (ADFormer 8h 같은 시드 대비) additive −2.45% / −2.42%, basis M=8 −2.28% / −2.53%,
+  +기술자 −2.26% / −2.58%, +기술자·전체 168노드 −2.27% / −2.56%. ΔW 파라미터는 2.21M → 0.20M으로 줄었지만
+  RMSE↔MAPE 교환선 위에서만 움직였다(두 지표 동시 개선 없음).
+
+**`node_adaptive_scope`** (기본 `[history]`): ΔW를 넣을 위치. 같은 선택 노드·`node_adaptive_mode`(additive|basis)를 쓴다.
+
+- `history`: 위의 최근 이력 `history_lstm`.
+- `periodic`: 일·주 주기 `PeriodicLSTMEncoder.lstm`마다 `NodeLSTMDelta`(같은 식, basis는 기술자 없이 `C ~ N(0, 1/M)`).
+  주기 branch는 노드 정체성 입력이 없어(노드 공용 LSTM) 노드별 주기 반응을 따로 배울 수 없었다.
+- `head`: 출력 `neural_head`에 `raw[n] += h_attn[n]·Δw[n] + Δb[n]` (`Δw: [A, fusion_dim]`, `Δb: [A]`).
+- 모든 위치의 ΔW는 0으로 생성되고 stage 1에서 고정, stage 2에서 학습한다(위 규칙과 같음).
 
 <details>
 <summary>세부</summary>

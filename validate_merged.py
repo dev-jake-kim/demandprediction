@@ -354,6 +354,55 @@ def _check_node_adaptive_identity() -> dict:
     if basis_params != basis_expected:
         raise AssertionError(f'basis 파라미터 수가 예상과 다름: {basis_params} != {basis_expected}')
 
+    # periodic: ΔW=0이면 공유 LSTM과 같고, ΔW≠0이면 노드마다 W+ΔW[n]인 nn.LSTM을 따로 돌린 결과와 같아야 한다.
+    from models.merged.modules.fusion import NeuralRetrievalGate
+    from models.merged.modules.periodic import PeriodicLSTMEncoder
+
+    torch.manual_seed(1)
+    periodic = PeriodicLSTMEncoder(5, extra_dim=2, node_adaptive_indices=adaptive)
+    values = torch.rand(2, 4, num_nodes, 1) * 3
+    invalid = torch.tensor([[False, True, False, False], [True, True, True, True]])
+    extra = torch.rand(2, 4, 2)
+    with torch.no_grad():
+        periodic_zero, _ = periodic(values, invalid, extra)
+        shared = PeriodicLSTMEncoder(5, extra_dim=2)
+        shared.load_state_dict({k: v for k, v in periodic.state_dict().items() if 'node_delta' not in k})
+        periodic_shared, _ = shared(values, invalid, extra)
+        periodic_zero_gap = float((periodic_zero - periodic_shared).abs().max())
+        for param in periodic.node_delta_parameters():
+            param.normal_(0.0, 0.3)
+        periodic_out, _ = periodic(values, invalid, extra)
+        weight_ih, weight_hh, bias = periodic.node_delta.weights(periodic.lstm)
+        manual_gap = 0.0
+        for slot, node in enumerate(adaptive):
+            single = PeriodicLSTMEncoder(5, extra_dim=2)
+            single.lstm.weight_ih_l0.copy_(weight_ih[slot])
+            single.lstm.weight_hh_l0.copy_(weight_hh[slot])
+            single.lstm.bias_ih_l0.copy_(bias[slot])
+            single.lstm.bias_hh_l0.zero_()
+            reference, _ = single(values[:, :, node : node + 1], invalid, extra)
+            manual_gap = max(manual_gap, float((periodic_out[:, node] - reference[:, 0]).abs().max()))
+        others_gap = float((periodic_out[:, others] - periodic_shared[:, others]).abs().max())
+    if periodic_zero_gap > 1e-6 or manual_gap > 1e-5 or others_gap != 0.0:
+        raise AssertionError(
+            f'periodic ΔW: zero {periodic_zero_gap:.2e}, 노드별 LSTM {manual_gap:.2e}, 비대상 {others_gap:.2e}'
+        )
+
+    # head: ΔW=0이면 공유 head와 같고, 대상 노드만 h·Δw[n] + Δb[n]만큼 raw가 바뀐다.
+    gate = NeuralRetrievalGate(6, use_softplus=False, node_adaptive_indices=adaptive)
+    h_attn = torch.randn(2, num_nodes, 6)
+    with torch.no_grad():
+        head_zero, _, _ = gate(h_attn, None, bypass_gate=True)
+        reference = gate.neural_head(h_attn).squeeze(-1)
+        for param in gate.node_delta_parameters():
+            param.normal_()
+        head_delta, _, _ = gate(h_attn, None, bypass_gate=True)
+        expected_head = reference.clone()
+        expected_head[:, adaptive] += (h_attn[:, adaptive] * gate.node_delta_head_weight).sum(-1) + gate.node_delta_head_bias
+    head_gap = max(float((head_zero - reference).abs().max()), float((head_delta - expected_head).abs().max()))
+    if head_gap > 1e-5:
+        raise AssertionError(f'head ΔW 결과가 예상과 다름: {head_gap:.2e}')
+
     return {
         'node_adaptive_zero_delta_matches_nn_lstm': True,
         'max_abs_diff': gap,
@@ -363,6 +412,8 @@ def _check_node_adaptive_identity() -> dict:
         'gated_identity_max_abs_diff': gated_gap,
         'basis_identity_max_abs_diff': basis_gap,
         'basis_vs_additive_max_abs_diff': basis_gap_full,
+        'periodic_delta_vs_per_node_lstm_max_abs_diff': manual_gap,
+        'head_delta_max_abs_diff': head_gap,
     }
 
 

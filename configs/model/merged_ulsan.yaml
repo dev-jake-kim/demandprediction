@@ -48,8 +48,10 @@ node_adaptive_min_demand: 0.1
 # | basis: ΔW[n] = Σ_m c[n,m]·B[m] (공유 기저 node_delta_rank개, docs/SPEC.md §6.7)
 node_adaptive_mode: additive
 node_delta_rank: 8
-# basis에서 c[n]에 train 구간 노드 기술자(일중 모양·수준·0 비율·주말 비·변동계수) 투영을 더한다.
+# basis에서 c[n]에 train 구간 노드 기술자(일중·요일 모양, 수준, 0 비율, 변동계수) 투영을 더한다.
 node_delta_descriptor: false
+# ΔW 위치: history(최근 이력 LSTM) | periodic(일·주 주기 LSTM) | head(출력 head)
+node_adaptive_scope: [history]
 
 
 # 울산: RMSE(평균)와 MAPE(0 쪽)를 함께 맞추는 mse_mape(λ=2). Porto는 mae.

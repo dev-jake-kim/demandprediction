@@ -10,6 +10,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .embeddings import FourierScalarEmbedding
+from .node_delta import run_node_lstm
 
 
 class LocalHistoryEncoder(nn.Module):
@@ -272,7 +273,6 @@ class LocalHistoryEncoder(nn.Module):
         returned tensor has shape ``[B, A, history_hidden]``.
         """
 
-        batch, num_adaptive, steps, _ = sequence.shape
         lstm = self.history_lstm
         shared_bias = lstm.bias_ih_l0 + lstm.bias_hh_l0
         if self.node_adaptive_mode == "gated":
@@ -291,17 +291,7 @@ class LocalHistoryEncoder(nn.Module):
             weight_hh = lstm.weight_hh_l0 + self.node_delta_weight_hh  # (A,4h,h)
             bias = shared_bias + self.node_delta_bias  # (A,4h)
 
-        gates_x = torch.einsum("bakf,agf->bakg", sequence, weight_ih) + bias.unsqueeze(1)
-
-        hidden = sequence.new_zeros(batch, num_adaptive, self.history_hidden)
-        cell = sequence.new_zeros(batch, num_adaptive, self.history_hidden)
-        for step in range(steps):
-            gates = gates_x[:, :, step] + torch.einsum("bah,agh->bag", hidden, weight_hh)
-            in_gate, forget_gate, cell_gate, out_gate = gates.chunk(4, dim=-1)
-            # PyTorch LSTM 게이트 순서: i, f, g, o
-            cell = forget_gate.sigmoid() * cell + in_gate.sigmoid() * cell_gate.tanh()
-            hidden = out_gate.sigmoid() * cell.tanh()
-        return hidden
+        return run_node_lstm(sequence, weight_ih, weight_hh, bias)[:, :, -1]
 
     def _make_neighbor_direction(self) -> Tensor:
         """``[N, N]`` long. query 노드 기준 key 노드의 창 내 방향 index, 창 밖이면 -1.

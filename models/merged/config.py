@@ -68,6 +68,7 @@ class MergedDemandConfig(PretrainedConfig):
         node_delta_rank: int = 8,
         node_delta_descriptor: bool = False,
         node_descriptors: list[list[float]] | None = None,
+        node_adaptive_scope: list[str] | None = None,
         loss_type: str = 'combined',
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
@@ -152,6 +153,8 @@ class MergedDemandConfig(PretrainedConfig):
         self.node_delta_rank = node_delta_rank
         self.node_delta_descriptor = node_delta_descriptor
         self.node_descriptors = node_descriptors
+        # ΔW 위치: history | periodic | head (기본 history만, docs/SPEC.md §6.7).
+        self.node_adaptive_scope = list(node_adaptive_scope or ['history'])
         # configure_loss가 stage마다 갱신한다(체크포인트가 마지막 학습 손실을 기록).
         self.loss_type = loss_type
         self.loss_gamma = loss_gamma

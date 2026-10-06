@@ -100,6 +100,11 @@ class MergedDemandModel(PreTrainedModel):
                     '시간 리크를 막으려면 train.py가 train 구간 평균 수요로 계산해 넘겨야 한다'
                 )
             node_adaptive_indices = [int(value) for value in config.node_adaptive_indices]
+        # ΔW를 넣을 위치: history(최근 이력 LSTM) | periodic(일·주 주기 LSTM) | head(출력 head). docs/SPEC.md §6.7.
+        scope = set(getattr(config, 'node_adaptive_scope', None) or ['history'])
+        if not scope <= {'history', 'periodic', 'head'}:
+            raise ValueError(f"node_adaptive_scope는 history|periodic|head 중에서 (받음: {sorted(scope)})")
+        scoped = lambda name: node_adaptive_indices if name in scope else None  # noqa: E731
 
         self.snow_scale = nn.Parameter(torch.tensor(1.0))
         self.weekday_embedding = nn.Embedding(7, config.weekday_dim)
@@ -134,7 +139,7 @@ class MergedDemandModel(PreTrainedModel):
             use_sink=config.use_sink,
             local_encoder=config.local_encoder,
             global_nodes=config.global_nodes,
-            node_adaptive_indices=node_adaptive_indices,
+            node_adaptive_indices=scoped('history'),
             node_adaptive_mode=config.node_adaptive_mode,
             functional_neighbors=config.functional_neighbors,
             use_event_embedding=config.use_event_embedding,
@@ -143,8 +148,13 @@ class MergedDemandModel(PreTrainedModel):
             node_descriptors=getattr(config, 'node_descriptors', None),
         )
         self.periodic_hidden = config.periodic_hidden
-        self.daily_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim)
-        self.weekly_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim)
+        periodic_delta = dict(
+            node_adaptive_indices=scoped('periodic'),
+            node_adaptive_mode=config.node_adaptive_mode,
+            node_delta_rank=getattr(config, 'node_delta_rank', 8),
+        )
+        self.daily_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim, **periodic_delta)
+        self.weekly_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim, **periodic_delta)
         self.branch_attention = BranchAttention(
             config.history_hidden,
             config.periodic_hidden,
@@ -165,7 +175,9 @@ class MergedDemandModel(PreTrainedModel):
             )
             if self.use_retrieval else None
         )
-        self.output_gate = NeuralRetrievalGate(config.fusion_dim, use_softplus=self.use_softplus)
+        self.output_gate = NeuralRetrievalGate(
+            config.fusion_dim, use_softplus=self.use_softplus, node_adaptive_indices=scoped('head')
+        )
         self.loss_fn: nn.Module
         self.configure_loss(config.loss_type)
 
@@ -200,14 +212,23 @@ class MergedDemandModel(PreTrainedModel):
         self.config.loss_type = loss_type
 
     def node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
-        """노드별 ΔW 파라미터 전부(node_adaptive가 꺼져 있으면 빈 튜플, gated면 게이트 logit 포함)."""
+        """노드별 ΔW 파라미터 전부(node_adaptive가 꺼져 있으면 빈 튜플, gated면 게이트 logit 포함).
+        node_adaptive_scope의 history·periodic(일·주)·head 순서."""
 
-        return self.local_history.node_delta_parameters()
+        return (
+            self.local_history.node_delta_parameters()
+            + self.daily_branch.node_delta_parameters()
+            + self.weekly_branch.node_delta_parameters()
+            + self.output_gate.node_delta_parameters()
+        )
 
     def begin_node_adaptation(self) -> None:
-        """ΔW 학습 시작 직전 호출(gated: V ← 공유 W, s ← 1; additive: 아무것도 안 함)."""
+        """ΔW 학습 시작 직전 호출(출력 불변). gated: V ← 공유 W, s ← 1; basis: 계수 난수; additive: 없음."""
 
         self.local_history.begin_node_adaptation()
+        for branch in (self.daily_branch, self.weekly_branch):
+            if branch.node_delta is not None:
+                branch.node_delta.begin()
 
     def pre_lstm_parameters(self) -> list[nn.Parameter]:
         """LSTM 입력을 만드는 파라미터(stage2.freeze=pre_lstm에서 고정).
@@ -232,7 +253,7 @@ class MergedDemandModel(PreTrainedModel):
         복원된 delta에는 다시 0을 쓰지 않는다.
         """
 
-        if module is not self.local_history:
+        if module is self or not hasattr(module, 'node_delta_parameters'):
             return
         for param in module.node_delta_parameters():
             if not getattr(param, '_is_hf_initialized', False):
