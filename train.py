@@ -255,6 +255,27 @@ def select_node_adaptive_indices(train_ds: UnifiedDemandDataset, min_demand: flo
     return indices
 
 
+def compute_node_descriptors(train_ds: UnifiedDemandDataset, indices: list[int]) -> list[list[float]]:
+    """basis ΔW용 노드 기술자 φ[n] (34차원, 적응 노드 사이 표준화). ``[time_step, train_end)``만 사용.
+
+    시각별(24)·요일별(7, 시작일 기준 상대 요일) 평균 / 노드 평균, log1p 평균, 0 비율, 변동계수.
+    """
+
+    start, end = train_ds.time_step, train_ds.train_end
+    values = train_ds.grid[start:end].reshape(end - start, -1)[:, indices].astype(np.float64)
+    hours = np.asarray(train_ds.hour_table[start:end]).astype(int)
+    days = np.asarray(train_ds.day_of_week_table[start:end]).astype(int)
+    mean = values.mean(axis=0)
+    safe_mean = np.maximum(mean, 1e-6)
+    hour_profile = np.stack([values[hours == h].mean(axis=0) for h in range(24)], axis=1) / safe_mean[:, None]
+    day_profile = np.stack([values[days == d].mean(axis=0) for d in range(7)], axis=1) / safe_mean[:, None]
+    features = np.column_stack([
+        hour_profile, day_profile, np.log1p(mean), (values == 0).mean(axis=0), values.std(axis=0) / safe_mean,
+    ])
+    features = (features - features.mean(axis=0)) / np.maximum(features.std(axis=0), 1e-6)
+    return features.tolist()
+
+
 def compute_node_mix(
     train_ds: UnifiedDemandDataset, lam_low: float, lam_high: float, tau: float, width: float, scaler: bool
 ) -> tuple[list[float], list[float], list[float], list[float]]:
@@ -315,6 +336,7 @@ def load_stage1_with_new_nodes(init_from: str, config: MergedDemandConfig) -> Me
     # 체크포인트를 다시 지정하기 전에 저장된 목적함수와 구조를 검증한다.
     ignored = {
         'node_adaptive_indices', 'node_adaptive_min_demand', 'node_adaptive', 'node_adaptive_mode',
+        'node_delta_rank', 'node_delta_descriptor', 'node_descriptors',
         # stage 2 손실 전용 설정(node_mix 벡터·하이퍼파라미터)은 stage 1 가중치와 무관하다.
         'node_mix_lambda', 'node_mix_mape_scale', 'node_mix_mse_scale', 'node_mix_weight', 'node_mix_lambda_low',
         'node_mix_lambda_high', 'node_mix_tau', 'node_mix_width', 'node_mix_scaler',
@@ -420,6 +442,10 @@ def main(cfg: DictConfig) -> None:
             f'노드 {len(node_adaptive_indices)}/{total_nodes} '
             f'({len(node_adaptive_indices) / total_nodes * 100:.1f}%)에만 ΔW를 준다'
         )
+        if model_kwargs.get('node_delta_descriptor'):
+            if model_kwargs.get('node_adaptive_mode') != 'basis':
+                raise ValueError('node_delta_descriptor는 node_adaptive_mode=basis에서만 쓴다')
+            model_kwargs['node_descriptors'] = compute_node_descriptors(train_ds, node_adaptive_indices)
 
     # node_mix 손실(stage 1 또는 stage 2)을 쓰면 노드별 λ·정규화·scaler를 train 구간에서 계산한다.
     node_mix = None

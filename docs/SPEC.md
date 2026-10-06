@@ -522,6 +522,25 @@ W_hh(n), b(n)도 같은 식 (공유 b = b_ih + b_hh)
   Porto RMSE +0.64%(0/5). `g`는 학습 후에도 0.48~0.50에 머물렀다(초기 `V=W`라 logit 기울기가 0에서
   시작하고, 공용 lr 1e-4로는 logit이 거의 움직이지 않음). 채택하지 않았다.
 
+**`node_adaptive_mode=basis`** (선택): 노드마다 독립인 full-rank ΔW 대신 노드가 공유하는 `M`개 기저의
+선형 결합으로 ΔW를 만든다(노드 사이 통계 공유, 자유도 `A·4h·(F+h+1)` → `M·4h·(F+h+1) + A·M`).
+
+```text
+c[n]     = C[n] (+ φ[n]·W_φ, node_delta_descriptor=true)    C: [A, M], W_φ: [F_φ, M]
+ΔW_ih[n] = Σ_m c[n,m]·B_ih[m]     B_ih: [M, 4h, D+E]
+ΔW_hh[n], Δb[n]도 같은 식          B_hh: [M, 4h, h], B_b: [M, 4h]
+W_ih(n)  = W_ih + ΔW_ih[n]        (W_hh, b도 additive와 같은 식)
+```
+
+- `M = node_delta_rank`(기본 8). 모든 `node_delta_*`는 생성 시 0이라 stage 1은 공유 LSTM과 같은 함수다
+  (`stage2.init_from`의 "저장 ΔW = 0" 검사도 그대로).
+- `begin_node_adaptation()`이 `C ~ N(0, 1/(2M))`, `W_φ ~ N(0, 1/(2M·F_φ))`(descriptor 없으면 `C ~ N(0, 1/M)`)로
+  채우고 `B`는 0으로 둔다(LoRA식: 시작 출력 불변, 첫 기울기는 `B`로). 난수는 학습 seed를 따른다.
+- 노드 기술자 `φ[n]` (`node_delta_descriptor=true`, train.py가 `train` 구간 `demand[k:train_end]`에서 계산해
+  `node_descriptors [A, F_φ]`로 config에 저장): 시각별(24)·요일별(7, 시작일 기준 상대 요일) 평균 수요 / 노드 평균,
+  `log1p` 평균, 0 비율, 변동계수 = 34차원. 차원마다 적응 노드 사이에서 표준화한다.
+  수요 패턴이 비슷한 노드가 비슷한 ΔW 방향에서 시작하고 같이 움직이게 한다.
+
 <details>
 <summary>세부</summary>
 

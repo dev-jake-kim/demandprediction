@@ -65,6 +65,9 @@ class MergedDemandConfig(PretrainedConfig):
         event_csv_path: str | None = None,
         weather_lead: int = 0,
         node_adaptive_mode: str = 'additive',
+        node_delta_rank: int = 8,
+        node_delta_descriptor: bool = False,
+        node_descriptors: list[list[float]] | None = None,
         loss_type: str = 'combined',
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
@@ -144,6 +147,11 @@ class MergedDemandConfig(PretrainedConfig):
         self.weather_lead = weather_lead
         # additive: W + ΔW[n] | gated: W + s·(1−g[n])·(V[n] − W) (docs/SPEC.md §6.7)
         self.node_adaptive_mode = node_adaptive_mode
+        # basis: ΔW[n] = Σ_m c[n,m]·B[m] (rank M), descriptor면 c[n]에 노드 기술자 φ[n]·W_φ를 더한다.
+        # node_descriptors [A, F_φ]는 train.py가 train 구간에서 계산해 넣는다(docs/SPEC.md §6.7).
+        self.node_delta_rank = node_delta_rank
+        self.node_delta_descriptor = node_delta_descriptor
+        self.node_descriptors = node_descriptors
         # configure_loss가 stage마다 갱신한다(체크포인트가 마지막 학습 손실을 기록).
         self.loss_type = loss_type
         self.loss_gamma = loss_gamma

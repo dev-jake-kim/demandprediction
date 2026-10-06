@@ -139,6 +139,8 @@ class MergedDemandModel(PreTrainedModel):
             functional_neighbors=config.functional_neighbors,
             use_event_embedding=config.use_event_embedding,
             aux_channels=getattr(config, 'aux_channels', 0),
+            node_delta_rank=getattr(config, 'node_delta_rank', 8),
+            node_descriptors=getattr(config, 'node_descriptors', None),
         )
         self.periodic_hidden = config.periodic_hidden
         self.daily_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim)

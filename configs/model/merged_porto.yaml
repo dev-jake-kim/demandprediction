@@ -46,7 +46,11 @@ use_softplus: true
 node_adaptive: true
 node_adaptive_min_demand: 0.1
 # additive: W + ΔW[n] | gated: g[n]·W + (1−g[n])·V[n] (V는 stage 2 시작 때 W로 복사)
+# | basis: ΔW[n] = Σ_m c[n,m]·B[m] (공유 기저 node_delta_rank개, docs/SPEC.md §6.7)
 node_adaptive_mode: additive
+node_delta_rank: 8
+# basis에서 c[n]에 train 구간 노드 기술자(일중 모양·수준·0 비율·주말 비·변동계수) 투영을 더한다.
+node_delta_descriptor: false
 
 
 # Porto: mse_mape(λ=6, val 기준 선택). 수요 규모가 커서 울산(λ=2)보다 MAPE 항 가중이 크다.

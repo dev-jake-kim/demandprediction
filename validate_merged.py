@@ -304,6 +304,56 @@ def _check_node_adaptive_identity() -> dict:
     if gated_params != expected + len(adaptive):
         raise AssertionError(f'gated 파라미터 수가 예상과 다름: {gated_params} != {expected + len(adaptive)}')
 
+    # basis: 생성 시 0, begin_node_adaptation(C 난수, B=0) 직후 출력 불변. B를 채우면 같은 ΔW의 additive와 일치.
+    torch.manual_seed(0)
+    descriptors = torch.randn(len(adaptive), 3).tolist()
+    basis = LocalHistoryEncoder(
+        height=height,
+        width=width,
+        time_step=time_step,
+        local_radius=1,
+        d_model=8,
+        num_fourier_bands=2,
+        transformer_layers=1,
+        transformer_heads=2,
+        transformer_ffn=16,
+        history_hidden=5,
+        dropout=0.0,
+        node_adaptive_indices=adaptive,
+        node_adaptive_mode='basis',
+        node_delta_rank=2,
+        node_descriptors=descriptors,
+    )
+    basis.eval()
+    if any(float(param.detach().abs().sum()) != 0.0 for param in basis.node_delta_parameters()):
+        raise AssertionError('basis: node_delta 파라미터가 0으로 생성되지 않음')
+    with torch.no_grad():
+        basis.begin_node_adaptation()
+        basis_after = basis(demands)
+        basis.node_adaptive = False
+        basis_reference = basis(demands)
+        basis.node_adaptive = True
+        basis_gap = float((basis_after - basis_reference).abs().max())
+        if basis_gap > 1e-5:
+            raise AssertionError(f'basis: begin_node_adaptation 직후 출력이 공유 경로와 다름: {basis_gap:.3e}')
+        for param in (basis.node_delta_basis_ih, basis.node_delta_basis_hh, basis.node_delta_basis_bias):
+            param.normal_(0.0, 0.3)
+        coef = basis.node_delta_coefficients()
+        encoder.node_delta_weight_ih.copy_(torch.einsum('am,mgf->agf', coef, basis.node_delta_basis_ih))
+        encoder.node_delta_weight_hh.copy_(torch.einsum('am,mgh->agh', coef, basis.node_delta_basis_hh))
+        encoder.node_delta_bias.copy_(coef @ basis.node_delta_basis_bias)
+        encoder.load_state_dict({k: v for k, v in basis.state_dict().items() if 'node_delta' not in k}, strict=False)
+        basis_gap_full = float((basis(demands) - encoder(demands)).abs().max())
+        encoder.node_delta_weight_ih.zero_()
+        encoder.node_delta_weight_hh.zero_()
+        encoder.node_delta_bias.zero_()
+    if basis_gap_full > 1e-5:
+        raise AssertionError(f'basis: 같은 ΔW의 additive와 출력이 다름: {basis_gap_full:.3e}')
+    basis_params = sum(param.numel() for param in basis.node_delta_parameters())
+    basis_expected = 2 * (n_gates * (8 + 5) + n_gates) + len(adaptive) * 2 + 3 * 2
+    if basis_params != basis_expected:
+        raise AssertionError(f'basis 파라미터 수가 예상과 다름: {basis_params} != {basis_expected}')
+
     return {
         'node_adaptive_zero_delta_matches_nn_lstm': True,
         'max_abs_diff': gap,
@@ -311,6 +361,8 @@ def _check_node_adaptive_identity() -> dict:
         'adaptive_nodes': len(adaptive),
         'node_delta_params': actual,
         'gated_identity_max_abs_diff': gated_gap,
+        'basis_identity_max_abs_diff': basis_gap,
+        'basis_vs_additive_max_abs_diff': basis_gap_full,
     }
 
 
