@@ -124,3 +124,10 @@ class NodeMixLoss(nn.Module):
         diff = y_true - y_pred
         relative = diff.abs() / (y_true.abs() + 1.0)
         return weight * (lam * relative * mape_scale + (1.0 - lam) * diff ** 2 * mse_scale)
+
+
+class PoissonNllLoss(nn.Module):
+    """Elementwise Poisson negative log-likelihood ``mu - y * log(mu + eps)`` (constant terms dropped)."""
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        return y_pred - y_true * torch.log(y_pred + 1e-6)

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from torch import nn
 
-from ..losses import CombinedLoss, DemandSplitLoss, MseMapeLoss, NodeMixLoss, RmseMapeLoss
+from ..losses import CombinedLoss, DemandSplitLoss, MseMapeLoss, NodeMixLoss, PoissonNllLoss, RmseMapeLoss
 
 # Scalar objectives bypass elementwise aggregation in the model.
 SCALAR_LOSS_TYPES = frozenset({'rmse_mape'})
@@ -45,10 +45,12 @@ def build_loss(
         if node_mix is None:
             raise ValueError('node_mix 손실에는 노드별 (lambda, mape_scale, mse_scale, weight)가 필요함 — train.py가 계산해 config에 넣는다')
         return NodeMixLoss(*node_mix)
+    if loss_type == 'poisson':
+        return PoissonNllLoss()
     raise ValueError(
         f"알 수 없는 loss_type: {loss_type!r} "
-        f"(가능: 'combined', 'mae', 'rmse_mape', 'demand_split', 'mse_mape', 'node_mix')"
+        f"(가능: 'combined', 'mae', 'rmse_mape', 'demand_split', 'mse_mape', 'node_mix', 'poisson')"
     )
 
 
-__all__ = ['CombinedLoss', 'DemandSplitLoss', 'MseMapeLoss', 'NodeMixLoss', 'RmseMapeLoss', 'SCALAR_LOSS_TYPES', 'build_loss']
+__all__ = ['CombinedLoss', 'DemandSplitLoss', 'MseMapeLoss', 'NodeMixLoss', 'PoissonNllLoss', 'RmseMapeLoss', 'SCALAR_LOSS_TYPES', 'build_loss']

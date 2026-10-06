@@ -542,6 +542,14 @@ W_hh(n), b(n)도 같은 식 (공유 b = b_ih + b_hh)
 | `demand_split` | `y ≤ split_threshold`: `|d|/(|y|+1)`, 그 외: `split_high_weight·d²` |
 | `mse_mape` | `d² + mape_weight·|d|/(|y|+1)` (제곱항은 평균 쪽, 상대항은 저수요 칸을 0 쪽으로; stage 2는 `stage2.mape_weight`) |
 | `node_mix` | 노드 `n`마다 `r_n·[λ_n·|d|/((|y|+1)·B_n) + (1−λ_n)·d²/(2A_n)]` (아래) |
+| `poisson` | `ŷ − y·ln(ŷ + 1e−6)` (Poisson NLL). 출력 `ŷ`는 평균 수요 μ다. `decision_lambda > 0`이면 평가(eval) 때 점 예측을 μ에서 아래 결정 규칙으로 바꾼다 |
+
+**분포 예측 + 결정 (`poisson` + `decision_lambda`)** — 표현은 likelihood로 배우고, 점 예측은 평가 목적에 맞게 따로 정한다.
+
+- 학습: 출력 μ를 Poisson NLL로 학습한다(stage 1·2 모두). 학습 중 `logits`는 μ다.
+- 평가: `Y ~ Poisson(μ)`라 보고 `c* = argmin_c E[(Y − c)²] + λ_dec·E[|Y − c|/(Y + 1)]`를 낸다(`λ_dec = decision_lambda`).
+  `J'(c) = 2(c − μ) + λ_dec·(2·Σ_{y<c} p(y)/(y+1) − Σ_y p(y)/(y+1))`가 c에 대해 증가하므로 이분법으로 푼다.
+  μ 격자(0~μ_max, 간격 0.005)에서 미리 표를 만들고 선형 보간한다. `λ_dec`는 학습과 무관해 val에서 고른다.
 
 **`node_mix`** — 노드 수요 수준에 따라 MAPE·MSE 비중을 바꾸되, 노드 사이 업데이트 비중은 바꾸지 않는다.
 
