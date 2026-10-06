@@ -26,6 +26,8 @@ data:
   event_csv: null
   # 최근 창 날씨 행을 당기는 칸 수. ASOS 강수는 직전 1시간 누적이라 1이면 예측 시각 [t, t+1) 강수까지 본다(예보 가정).
   weather_lead: 0
+  # 노드·시각별 배차 상태 격자 [T,H,W,C] .npy(선택). 예: data/raw/ulsan_dispatch_grid.npy (preprocessing/ulsan/build_dispatch_grid.py)
+  aux_grid: null
 
 train:
 

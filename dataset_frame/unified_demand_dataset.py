@@ -135,6 +135,7 @@ class UnifiedDemandDataset(Dataset):
         holidays: Sequence[str] = (),
         event_csv_path: str | Path | None = None,
         weather_lead: int = 0,
+        aux_grid_path: str | Path | None = None,
     ) -> None:
         super().__init__()
         if not 0 < train_ratio < 1 or not 0 <= val_ratio < 1 or train_ratio + val_ratio >= 1:
@@ -188,6 +189,16 @@ class UnifiedDemandDataset(Dataset):
                 [self.weather[self.weather_lead:], np.repeat(self.weather[-1:], self.weather_lead, axis=0)]
             )
         )
+        # 노드·시각별 배차 상태 [T, N, C] (선택). 샘플은 수요 이력과 같은 창 [t−k, t)를 받는다.
+        self.aux_grid_path = None if aux_grid_path is None else Path(aux_grid_path).expanduser().resolve()
+        self.aux_table = None
+        if self.aux_grid_path is not None:
+            aux = np.load(self.aux_grid_path).astype(np.float32)
+            if aux.ndim != 4 or aux.shape[:3] != (self.total_steps, self.height, self.width):
+                raise ValueError(f'{self.aux_grid_path}: [T,H,W,C]=({self.total_steps},{self.height},{self.width},C)여야 함, got {aux.shape}')
+            if not np.isfinite(aux).all() or aux.min() < 0:
+                raise ValueError(f'{self.aux_grid_path}: 유한한 비음수여야 함')
+            self.aux_table = np.ascontiguousarray(aux.reshape(self.total_steps, self.num_nodes, -1))
         all_times = np.arange(self.total_steps, dtype=np.int64)
         self.hour_table, self.day_of_week_table = _calendar_features(all_times)
         self.context_features = tuple(context_features)
@@ -323,6 +334,9 @@ class UnifiedDemandDataset(Dataset):
             sample['event_mask'] = torch.from_numpy(
                 self.event_table[target_time - self.time_step + 1 : target_time + 1].copy()
             )
+        if self.aux_table is not None:
+            # 배차 상태는 관측된 과거만: 수요 이력과 같은 창 [t−k, t).
+            sample['aux_history'] = torch.from_numpy(self.aux_table[target_time - self.time_step : target_time].copy())
         return sample
 
     @property

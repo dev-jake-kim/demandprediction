@@ -40,6 +40,7 @@ class LocalHistoryEncoder(nn.Module):
         node_adaptive_mode: str = "additive",
         functional_neighbors: Sequence[Sequence[int]] | None = None,
         use_event_embedding: bool = False,
+        aux_channels: int = 0,
     ) -> None:
         super().__init__()
         if extra_dim < 0:
@@ -100,6 +101,12 @@ class LocalHistoryEncoder(nn.Module):
             if len(self._functional_neighbor_list) != self.num_nodes:
                 raise ValueError('functional_neighbors는 노드마다 한 행이어야 함')
             self.functional_projection = nn.Linear(1, d_model)
+        # 노드별 배차 상태(실패·대기 등) C채널을 log1p 후 Linear(C→D)로 토큰에 더한다(선택).
+        self.aux_channels = int(aux_channels)
+        if self.aux_channels > 0:
+            if local_encoder != "masked_grid":
+                raise ValueError("aux_channels는 masked_grid 인코더에서만 지원")
+            self.aux_projection = nn.Linear(self.aux_channels, d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -283,8 +290,9 @@ class LocalHistoryEncoder(nn.Module):
         extra: Tensor | None = None,
         weather_cls: Tensor | None = None,
         event_mask: Tensor | None = None,
+        aux_history: Tensor | None = None,
     ) -> Tensor:
-        """``[B, k, H, W]`` 수요 -> ``[B, N, history_hidden]``. ``event_mask``는 ``[B, k, N]`` 0/1."""
+        """``[B, k, H, W]`` 수요 -> ``[B, N, history_hidden]``. ``event_mask``는 ``[B, k, N]`` 0/1, ``aux_history``는 ``[B, k, N, C]``."""
 
         if demands.ndim != 4 or tuple(demands.shape[1:]) != (self.time_step, self.height, self.width):
             raise ValueError(
@@ -302,11 +310,11 @@ class LocalHistoryEncoder(nn.Module):
             raise ValueError("extra_dim=0인데 extra가 주어짐")
 
         if self.local_encoder == "crop":
-            if weather_cls is not None or event_mask is not None:
-                raise ValueError("local_encoder=crop은 weather_cls·event_mask를 받지 않음")
+            if weather_cls is not None or event_mask is not None or aux_history is not None:
+                raise ValueError("local_encoder=crop은 weather_cls·event_mask·aux_history를 받지 않음")
             summary = self._crop_summary(demands)
         else:
-            summary = self._masked_grid_summary(demands, weather_cls, event_mask)
+            summary = self._masked_grid_summary(demands, weather_cls, event_mask, aux_history)
         sequence = summary.permute(0, 2, 1, 3).reshape(batch * nodes, steps, -1)
 
         if self.extra_dim > 0:
@@ -330,7 +338,8 @@ class LocalHistoryEncoder(nn.Module):
         return node_hidden
 
     def _masked_grid_summary(
-        self, demands: Tensor, weather_cls: Tensor | None, event_mask: Tensor | None
+        self, demands: Tensor, weather_cls: Tensor | None, event_mask: Tensor | None,
+        aux_history: Tensor | None = None,
     ) -> Tensor:
         """전체 노드 토큰 + 층별 sink -> 이웃 창 masked Transformer. ``[B, k, N, D]``."""
 
@@ -356,6 +365,12 @@ class LocalHistoryEncoder(nn.Module):
             tokens = tokens + event_mask.to(tokens.dtype).unsqueeze(-1) * self.event_embedding
         elif event_mask is not None:
             raise ValueError("use_event_embedding=false인데 event_mask가 주어짐")
+        if self.aux_channels > 0:
+            if aux_history is None or tuple(aux_history.shape) != (batch, steps, nodes, self.aux_channels):
+                raise ValueError(f"aux_channels={self.aux_channels}이면 aux_history [B,{steps},{nodes},{self.aux_channels}]가 필요함")
+            tokens = tokens + self.aux_projection(torch.log1p(aux_history.to(tokens.dtype)))
+        elif aux_history is not None:
+            raise ValueError("aux_channels=0인데 aux_history가 주어짐")
         sequences = batch * steps
         hidden_tokens = tokens.reshape(sequences, nodes, -1)
         mask = self._attention_mask(sequences)

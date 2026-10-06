@@ -59,8 +59,8 @@ def evaluate(model: MergedDemandModel, loader: DataLoader, device: str) -> dict[
 
     with torch.no_grad():
         for batch in tqdm(loader, desc='evaluate'):
-            # 선택 입력(event_mask)은 데이터셋이 줄 때만 넘긴다.
-            inputs = {key: batch[key].to(device) for key in (*INPUT_KEYS, 'event_mask') if key in batch}
+            # 선택 입력(event_mask·aux_history)은 데이터셋이 줄 때만 넘긴다.
+            inputs = {key: batch[key].to(device) for key in (*INPUT_KEYS, 'event_mask', 'aux_history') if key in batch}
             out = model(**inputs)
             all_preds.append(out['logits'].float().cpu().numpy())
             all_labels.append(batch['labels'].numpy())
@@ -119,6 +119,7 @@ def main() -> None:
         # 이벤트 임베딩을 학습한 체크포인트면 같은 이벤트 표를 쓴다.
         event_csv_path=model.config.event_csv_path if model.config.use_event_embedding else None,
         weather_lead=model.config.weather_lead,
+        aux_grid_path=getattr(model.config, 'aux_grid_path', None) if getattr(model.config, 'aux_channels', 0) else None,
     )
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers

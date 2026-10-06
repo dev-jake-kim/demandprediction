@@ -234,6 +234,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | 기능적 이웃 | `functional_neighbor_k`, `functional_neighbor_mode` | 0 (끔), `raw` — masked Transformer 수용 영역(`local_radius × transformer_layers`) 밖에서 train 구간 상관(`raw` 원 시계열 / `residual` 요일×시각 평균을 뺀 잔차)이 가장 큰 노드 k개를 train.py가 골라 `functional_neighbors`로 주입. 그 최근 수요 평균의 `Linear(1→D)(log1p)`를 노드 토큰에 더한다 |
 | 추가 context | `context_extra_dim`, `context_features` | 0, [] — train.py가 `data.context_features`에서 주입. 채널은 날씨·요일·시간 뒤에 붙는다 |
 | 이벤트 | `use_event_embedding`, `event_csv_path` | false, null — train.py가 `data.event_csv`가 있으면 켜고 절대경로를 저장. 공연·축제 등 모든 이벤트에 **같은** 학습 임베딩 `event_embedding [D]`(0 초기화)을 이벤트 시각·노드의 Transformer 입력 토큰에 더한다(§6.2) |
+| 배차 상태 | `aux_channels`, `aux_grid_path` | 0, null — train.py가 `data.aux_grid`가 있으면 채널 수와 절대경로를 넣는다. 최근 창 `[t−k, t)`의 노드별 배차 상태 `log1p` 값을 `Linear(C→D)`로 Transformer 입력 토큰에 더한다(§6.2) |
 | 노드 적응 | `node_adaptive`, `node_adaptive_min_demand`, `node_adaptive_mode` | true, 0.1, `additive` |
 | 손실 | `loss_type`, `mape_weight` | `mse_mape`, 울산 2.0 / Porto 6.0 (stage 2도 같은 손실: `stage2.loss`, `stage2.mape_weight`) |
 | | `loss_gamma`, `loss_eps`, `rmse_weight`, `split_threshold`, `split_high_weight` | 1.0, 0.5, 10.0, 1.0, 1.0 |
@@ -279,6 +280,11 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
   카테고리(대형 축제·불꽃/낙화·지역 축제/마켓·빛축제/크리스마스·대중 콘서트)만, 격자 안 장소, 노드별 겹침 합침
   164구간(train 153 / val 5 / test 6). 채택 설정 3시드 결과: 전체 test 지표는 변화 없음(RMSE +0.05%,
   MAPE +0.44%), test 이벤트 셀 RMSE −7.6%(구간 중)·−5.4%(종료 직후).
+- `data.aux_grid` (기본 null, 선택): 노드·시각별 배차 상태 `[T, H, W, C]` float `.npy`. 울산은
+  `preprocessing/ulsan/build_dispatch_grid.py`가 원본 호출 기록(`raw/origin_data.csv`, 지역 필터만 적용, 중복 제거 전)에서
+  만든다: `raw_calls`(전체 호출), `failed`(배차 실패, call_state=3), `wait_min`(성공 호출의 평균 대기 분),
+  `high_send`(send_level≥3 호출). 수요 격자와 같은 좌표(700m, EPSG:5174)·시각(호출 시각 floor)이다.
+  샘플은 `aux_history [k, N, C]`를 수요 이력과 같은 창 `[t−k, t)`로 받는다(예측 시각 이전에 관측된 값만).
 - `train`: batch Ulsan 24 / Porto 8 (train·eval 동일), `num_train_epochs=120`,
   `optim=adamw_torch_fused`, `learning_rate=1e-3`, `weight_decay=0.05`, `max_grad_norm=5.0`,
   `lr_scheduler_type=constant`, `warmup_ratio=0`, epoch 단위 log/eval/save,

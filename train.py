@@ -172,6 +172,10 @@ def build_dataset_kwargs(cfg: DictConfig) -> dict:
             str((Path.cwd() / str(cfg.data.event_csv)).resolve()) if cfg.data.get('event_csv') else None
         ),
         'weather_lead': int(cfg.data.get('weather_lead', 0) or 0),
+        # 노드·시각별 배차 상태 격자(선택, [T,H,W,C]).
+        'aux_grid_path': (
+            str((Path.cwd() / str(cfg.data.aux_grid)).resolve()) if cfg.data.get('aux_grid') else None
+        ),
     }
 
 
@@ -461,6 +465,8 @@ def main(cfg: DictConfig) -> None:
         use_event_embedding=dataset_kwargs['event_csv_path'] is not None,
         event_csv_path=dataset_kwargs['event_csv_path'],
         weather_lead=dataset_kwargs['weather_lead'],
+        aux_channels=0 if train_ds.aux_table is None else int(train_ds.aux_table.shape[-1]),
+        aux_grid_path=dataset_kwargs['aux_grid_path'],
         node_mix_lambda=node_mix[0] if node_mix else None,
         node_mix_mape_scale=node_mix[1] if node_mix else None,
         node_mix_mse_scale=node_mix[2] if node_mix else None,

@@ -55,6 +55,8 @@ class MergedDemandConfig(PretrainedConfig):
         use_sink: bool = True,
         local_encoder: str = 'masked_grid',
         global_nodes: list[int] | None = None,
+        aux_channels: int = 0,
+        aux_grid_path: str | None = None,
         use_softplus: bool = True,
         node_adaptive: bool = False,
         node_adaptive_min_demand: float = 0.8,
@@ -127,6 +129,9 @@ class MergedDemandConfig(PretrainedConfig):
         self.local_encoder = local_encoder
         # 모든 노드가 attention으로 볼 수 있는 노드 id(마스크 열 개방, docs/SPEC.md §6.2).
         self.global_nodes = list(global_nodes or [])
+        # 노드별 배차 상태 채널 수와 격자 경로(train.py가 data.aux_grid에서 주입, docs/SPEC.md §4).
+        self.aux_channels = aux_channels
+        self.aux_grid_path = aux_grid_path
         self.use_softplus = use_softplus
         self.node_adaptive = node_adaptive
         self.node_adaptive_min_demand = node_adaptive_min_demand
