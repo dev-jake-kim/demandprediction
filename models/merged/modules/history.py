@@ -10,7 +10,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .embeddings import FourierScalarEmbedding
-from .node_delta import run_node_lstm
+from .node_delta import run_dynamic_basis_lstm, run_node_lstm
 
 
 class LocalHistoryEncoder(nn.Module):
@@ -44,6 +44,7 @@ class LocalHistoryEncoder(nn.Module):
         aux_channels: int = 0,
         node_delta_rank: int = 8,
         node_descriptors: Sequence[Sequence[float]] | None = None,
+        node_delta_dynamic: bool = False,
     ) -> None:
         super().__init__()
         if extra_dim < 0:
@@ -169,6 +170,12 @@ class LocalHistoryEncoder(nn.Module):
                         raise ValueError(f"node_descriptors는 [A={num_adaptive}, F] 이어야 함")
                     self._cached_descriptor_table: Tensor | None = None
                     self.node_delta_descriptor_weight = nn.Parameter(torch.zeros(widths.pop(), rank))
+                # dynamic: 샘플·노드별 계수 c[b,n] = c[n] ⊙ (1 + tanh(x_last[b,n]·W_dyn)), W_dyn 0 시작(정적 basis와 같음).
+                self.node_delta_dynamic_weight = (
+                    nn.Parameter(torch.zeros(d_model + extra_dim, rank)) if node_delta_dynamic else None
+                )
+            elif node_delta_dynamic:
+                raise ValueError("node_delta_dynamic은 node_adaptive_mode=basis에서만 쓴다")
             else:
                 if node_descriptors is not None:
                     raise ValueError("node_descriptors는 node_adaptive_mode=basis에서만 쓴다")
@@ -211,6 +218,8 @@ class LocalHistoryEncoder(nn.Module):
             )
             if self.node_delta_descriptor_weight is not None:
                 deltas += (self.node_delta_descriptor_weight,)
+            if self.node_delta_dynamic_weight is not None:
+                deltas += (self.node_delta_dynamic_weight,)
             return deltas
         deltas = (
             self.node_delta_weight_ih,
@@ -283,6 +292,13 @@ class LocalHistoryEncoder(nn.Module):
             bias = shared_bias + mix[:, None] * (self.node_delta_bias - shared_bias)
         elif self.node_adaptive_mode == "basis":
             coef = self.node_delta_coefficients()  # (A,M)
+            if self.node_delta_dynamic_weight is not None:
+                # 마지막 시점 입력(Transformer 토큰 + 시각·날씨 context)으로 노드 계수를 샘플마다 조절한다.
+                scale = 1.0 + torch.tanh(sequence[:, :, -1] @ self.node_delta_dynamic_weight)  # (B,A,M)
+                return run_dynamic_basis_lstm(
+                    sequence, lstm, coef[None] * scale,
+                    self.node_delta_basis_ih, self.node_delta_basis_hh, self.node_delta_basis_bias,
+                )
             weight_ih = lstm.weight_ih_l0 + torch.einsum("am,mgf->agf", coef, self.node_delta_basis_ih)
             weight_hh = lstm.weight_hh_l0 + torch.einsum("am,mgh->agh", coef, self.node_delta_basis_hh)
             bias = shared_bias + coef @ self.node_delta_basis_bias

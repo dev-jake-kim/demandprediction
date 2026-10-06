@@ -30,6 +30,38 @@ def run_node_lstm(sequence: Tensor, weight_ih: Tensor, weight_hh: Tensor, bias: 
     return torch.stack(outputs, dim=2)
 
 
+def run_dynamic_basis_lstm(
+    sequence: Tensor,
+    lstm: nn.LSTM,
+    coef: Tensor,
+    basis_ih: Tensor,
+    basis_hh: Tensor,
+    basis_bias: Tensor,
+) -> Tensor:
+    """샘플·노드별 계수 ``coef [B,A,M]``의 basis ΔW LSTM 마지막 hidden ``[B,A,h]``.
+
+    ``W(b,a) = W + Σ_m coef[b,a,m]·B[m]``를 가중치로 만들지 않고 활성값 공간에서 계산한다:
+    ``x·W(b,a)ᵀ = x·Wᵀ + Σ_m coef[b,a,m]·(x·B[m]ᵀ)``.
+    """
+
+    batch, num_nodes, steps, _ = sequence.shape
+    hidden_size = lstm.hidden_size
+    shared_x = torch.einsum("bakf,gf->bakg", sequence, lstm.weight_ih_l0) + (lstm.bias_ih_l0 + lstm.bias_hh_l0)
+    basis_x = torch.einsum("bakf,mgf->bakmg", sequence, basis_ih) + basis_bias[None, None, None]
+    gates_x = shared_x + torch.einsum("bam,bakmg->bakg", coef, basis_x)
+    hidden = sequence.new_zeros(batch, num_nodes, hidden_size)
+    cell = sequence.new_zeros(batch, num_nodes, hidden_size)
+    for step in range(steps):
+        recurrent = hidden @ lstm.weight_hh_l0.T + torch.einsum(
+            "bam,bamg->bag", coef, torch.einsum("bah,mgh->bamg", hidden, basis_hh)
+        )
+        gates = gates_x[:, :, step] + recurrent
+        in_gate, forget_gate, cell_gate, out_gate = gates.chunk(4, dim=-1)
+        cell = forget_gate.sigmoid() * cell + in_gate.sigmoid() * cell_gate.tanh()
+        hidden = out_gate.sigmoid() * cell.tanh()
+    return hidden
+
+
 class NodeLSTMDelta(nn.Module):
     """선택 노드의 LSTM ΔW (``additive`` | ``basis``). 생성 시 전부 0이라 공유 LSTM과 같은 함수다."""
 
@@ -82,4 +114,4 @@ class NodeLSTMDelta(nn.Module):
         )
 
 
-__all__ = ["NodeLSTMDelta", "run_node_lstm"]
+__all__ = ["NodeLSTMDelta", "run_dynamic_basis_lstm", "run_node_lstm"]

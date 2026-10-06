@@ -422,6 +422,45 @@ def _check_node_adaptive_identity() -> dict:
     if fusion_zero_gap > 1e-6 or fusion_others_gap > 1e-6 or fusion_changed < 1e-3:
         raise AssertionError(f'fusion ΔW: zero {fusion_zero_gap:.2e}, 비대상 {fusion_others_gap:.2e}, 대상 변화 {fusion_changed:.2e}')
 
+    # dynamic basis: W_dyn=0이면 정적 basis와 같고, W_dyn≠0이면 샘플별 계수로 만든 가중치의 노드별 LSTM과 같다.
+    from models.merged.modules.node_delta import run_node_lstm
+
+    torch.manual_seed(3)
+    dynamic = LocalHistoryEncoder(
+        height=height, width=width, time_step=time_step, local_radius=1, d_model=8, num_fourier_bands=2,
+        transformer_layers=1, transformer_heads=2, transformer_ffn=16, history_hidden=5, dropout=0.0,
+        node_adaptive_indices=adaptive, node_adaptive_mode='basis', node_delta_rank=2, node_delta_dynamic=True,
+    )
+    dynamic.eval()
+    sequence = torch.randn(2, len(adaptive), time_step, 8)
+    with torch.no_grad():
+        dynamic.begin_node_adaptation()
+        for param in (dynamic.node_delta_basis_ih, dynamic.node_delta_basis_hh, dynamic.node_delta_basis_bias):
+            param.normal_(0.0, 0.3)
+        coef = dynamic.node_delta_coefficients()
+        lstm = dynamic.history_lstm
+        static = run_node_lstm(
+            sequence,
+            lstm.weight_ih_l0 + torch.einsum('am,mgf->agf', coef, dynamic.node_delta_basis_ih),
+            lstm.weight_hh_l0 + torch.einsum('am,mgh->agh', coef, dynamic.node_delta_basis_hh),
+            lstm.bias_ih_l0 + lstm.bias_hh_l0 + coef @ dynamic.node_delta_basis_bias,
+        )[:, :, -1]
+        dynamic_static_gap = float((dynamic._node_adaptive_hidden(sequence) - static).abs().max())
+        dynamic.node_delta_dynamic_weight.normal_(0.0, 0.5)
+        dyn_out = dynamic._node_adaptive_hidden(sequence)
+        scaled = coef[None] * (1.0 + torch.tanh(sequence[:, :, -1] @ dynamic.node_delta_dynamic_weight))
+        dynamic_gap = 0.0
+        for b in range(sequence.shape[0]):
+            reference = run_node_lstm(
+                sequence[b : b + 1],
+                lstm.weight_ih_l0 + torch.einsum('am,mgf->agf', scaled[b], dynamic.node_delta_basis_ih),
+                lstm.weight_hh_l0 + torch.einsum('am,mgh->agh', scaled[b], dynamic.node_delta_basis_hh),
+                lstm.bias_ih_l0 + lstm.bias_hh_l0 + scaled[b] @ dynamic.node_delta_basis_bias,
+            )[:, :, -1]
+            dynamic_gap = max(dynamic_gap, float((dyn_out[b : b + 1] - reference).abs().max()))
+    if dynamic_static_gap > 1e-5 or dynamic_gap > 1e-5:
+        raise AssertionError(f'dynamic basis: W_dyn=0 {dynamic_static_gap:.2e}, 샘플별 {dynamic_gap:.2e}')
+
     return {
         'node_adaptive_zero_delta_matches_nn_lstm': True,
         'max_abs_diff': gap,

@@ -52,6 +52,8 @@ node_delta_rank: 8
 node_delta_descriptor: false
 # ΔW 위치: history(최근 이력 LSTM) | periodic(일·주 주기 LSTM) | fusion(branch attention) | head(출력 head)
 node_adaptive_scope: [history]
+# basis에서 history ΔW 계수를 샘플·노드별 마지막 시점 입력으로 조절(c[b,n] = c[n]·(1 + tanh(x·W_dyn))).
+node_delta_dynamic: false
 
 
 # 울산: RMSE(평균)와 MAPE(0 쪽)를 함께 맞추는 mse_mape(λ=2). Porto는 mae.

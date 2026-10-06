@@ -545,6 +545,15 @@ W_ih(n)  = W_ih + ΔW_ih[n]        (W_hh, b도 additive와 같은 식)
   +기술자 −2.26% / −2.58%, +기술자·전체 168노드 −2.27% / −2.56%. ΔW 파라미터는 2.21M → 0.20M으로 줄었지만
   RMSE↔MAPE 교환선 위에서만 움직였다(두 지표 동시 개선 없음).
 
+**`node_delta_dynamic`** (basis 전용, 기본 false): history ΔW 계수를 샘플·노드마다 조절한다(정적 노드 ΔW → 상황별 ΔW).
+
+```text
+c[b,n,m] = c[n,m] · (1 + tanh(x_last[b,n]·W_dyn)[m])      W_dyn: [D+E, M], 0으로 생성·begin 후에도 0
+x·W(b,n)ᵀ = x·Wᵀ + Σ_m c[b,n,m]·(x·B_ihᵀ[m] + B_b[m])     (활성값 공간에서 계산, 가중치 [B,A,4h,F]를 만들지 않음)
+```
+
+- `x_last[b,n]`은 노드 `n`의 LSTM 마지막 입력(Transformer 토큰 + 시각·날씨 context). `W_dyn=0`이면 정적 basis와 같다.
+
 **`node_adaptive_scope`** (기본 `[history]`): ΔW를 넣을 위치. 같은 선택 노드·`node_adaptive_mode`(additive|basis)를 쓴다.
 
 - `history`: 위의 최근 이력 `history_lstm`.

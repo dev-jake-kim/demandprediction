@@ -147,6 +147,7 @@ class MergedDemandModel(PreTrainedModel):
             aux_channels=getattr(config, 'aux_channels', 0),
             node_delta_rank=getattr(config, 'node_delta_rank', 8),
             node_descriptors=getattr(config, 'node_descriptors', None),
+            node_delta_dynamic=getattr(config, 'node_delta_dynamic', False),
         )
         self.periodic_hidden = config.periodic_hidden
         periodic_delta = dict(
