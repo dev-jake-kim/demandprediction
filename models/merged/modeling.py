@@ -100,10 +100,11 @@ class MergedDemandModel(PreTrainedModel):
                     '시간 리크를 막으려면 train.py가 train 구간 평균 수요로 계산해 넘겨야 한다'
                 )
             node_adaptive_indices = [int(value) for value in config.node_adaptive_indices]
-        # ΔW를 넣을 위치: history(최근 이력 LSTM) | periodic(일·주 주기 LSTM) | head(출력 head). docs/SPEC.md §6.7.
+        # ΔW를 넣을 위치: history(최근 이력 LSTM) | periodic(일·주 주기 LSTM) | fusion(branch attention) | head(출력 head).
+        # docs/SPEC.md §6.7.
         scope = set(getattr(config, 'node_adaptive_scope', None) or ['history'])
-        if not scope <= {'history', 'periodic', 'head'}:
-            raise ValueError(f"node_adaptive_scope는 history|periodic|head 중에서 (받음: {sorted(scope)})")
+        if not scope <= {'history', 'periodic', 'fusion', 'head'}:
+            raise ValueError(f"node_adaptive_scope는 history|periodic|fusion|head 중에서 (받음: {sorted(scope)})")
         scoped = lambda name: node_adaptive_indices if name in scope else None  # noqa: E731
 
         self.snow_scale = nn.Parameter(torch.tensor(1.0))
@@ -160,6 +161,7 @@ class MergedDemandModel(PreTrainedModel):
             config.periodic_hidden,
             config.fusion_dim,
             use_attention=self.use_branch_attention,
+            node_adaptive_indices=scoped('fusion'),
         )
         self.retrieval = (
             CausalRetrieval(
@@ -213,12 +215,13 @@ class MergedDemandModel(PreTrainedModel):
 
     def node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
         """노드별 ΔW 파라미터 전부(node_adaptive가 꺼져 있으면 빈 튜플, gated면 게이트 logit 포함).
-        node_adaptive_scope의 history·periodic(일·주)·head 순서."""
+        node_adaptive_scope의 history·periodic(일·주)·fusion·head 순서."""
 
         return (
             self.local_history.node_delta_parameters()
             + self.daily_branch.node_delta_parameters()
             + self.weekly_branch.node_delta_parameters()
+            + self.branch_attention.node_delta_parameters()
             + self.output_gate.node_delta_parameters()
         )
 

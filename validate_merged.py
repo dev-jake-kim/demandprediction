@@ -403,6 +403,25 @@ def _check_node_adaptive_identity() -> dict:
     if head_gap > 1e-5:
         raise AssertionError(f'head ΔW 결과가 예상과 다름: {head_gap:.2e}')
 
+    # fusion: ΔW=0이면 공유 BranchAttention과 같고, 비대상 노드는 ΔW와 무관하다.
+    from models.merged.modules.attention import BranchAttention
+
+    torch.manual_seed(2)
+    fusion = BranchAttention(5, 4, 6, node_adaptive_indices=adaptive)
+    plain = BranchAttention(5, 4, 6)
+    plain.load_state_dict({k: v for k, v in fusion.state_dict().items() if 'node_delta' not in k})
+    inputs = (torch.randn(2, num_nodes, 5), torch.randn(2, num_nodes, 4), torch.randn(2, num_nodes, 4),
+              torch.tensor([True, False]), torch.tensor([True, True]))
+    with torch.no_grad():
+        fusion_zero_gap = float((fusion(*inputs)[0] - plain(*inputs)[0]).abs().max())
+        for param in fusion.node_delta_parameters():
+            param.normal_()
+        fused_delta = fusion(*inputs)[0]
+        fusion_others_gap = float((fused_delta[:, others] - plain(*inputs)[0][:, others]).abs().max())
+        fusion_changed = float((fused_delta[:, adaptive] - plain(*inputs)[0][:, adaptive]).abs().max())
+    if fusion_zero_gap > 1e-6 or fusion_others_gap > 1e-6 or fusion_changed < 1e-3:
+        raise AssertionError(f'fusion ΔW: zero {fusion_zero_gap:.2e}, 비대상 {fusion_others_gap:.2e}, 대상 변화 {fusion_changed:.2e}')
+
     return {
         'node_adaptive_zero_delta_matches_nn_lstm': True,
         'max_abs_diff': gap,

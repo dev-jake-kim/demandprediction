@@ -51,7 +51,7 @@ node_adaptive_mode: additive
 node_delta_rank: 8
 # basis에서 c[n]에 train 구간 노드 기술자(일중·요일 모양, 수준, 0 비율, 변동계수) 투영을 더한다.
 node_delta_descriptor: false
-# ΔW 위치: history(최근 이력 LSTM) | periodic(일·주 주기 LSTM) | head(출력 head)
+# ΔW 위치: history(최근 이력 LSTM) | periodic(일·주 주기 LSTM) | fusion(branch attention) | head(출력 head)
 node_adaptive_scope: [history]
 
 

@@ -551,6 +551,8 @@ W_ih(n)  = W_ih + ΔW_ih[n]        (W_hh, b도 additive와 같은 식)
 - `periodic`: 일·주 주기 `PeriodicLSTMEncoder.lstm`마다 `NodeLSTMDelta`(같은 식, basis는 기술자 없이 `C ~ N(0, 1/M)`).
   주기 branch는 노드 정체성 입력이 없어(노드 공용 LSTM) 노드별 주기 반응을 따로 배울 수 없었다.
 - `head`: 출력 `neural_head`에 `raw[n] += h_attn[n]·Δw[n] + Δb[n]` (`Δw: [A, fusion_dim]`, `Δb: [A]`).
+- `fusion`: `BranchAttention`에 노드별 query offset `Δq[n]` (`[A, fusion_dim]`, branch 선호)과 branch token별 value
+  offset `Δv[n, branch]` (`[A, 3, fusion_dim]`)를 더한다.
 - 모든 위치의 ΔW는 0으로 생성되고 stage 1에서 고정, stage 2에서 학습한다(위 규칙과 같음).
 
 <details>
