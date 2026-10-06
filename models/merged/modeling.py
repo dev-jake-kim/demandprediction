@@ -154,6 +154,8 @@ class MergedDemandModel(PreTrainedModel):
             node_adaptive_indices=scoped('periodic'),
             node_adaptive_mode=config.node_adaptive_mode,
             node_delta_rank=getattr(config, 'node_delta_rank', 8),
+            num_nodes=height * width,
+            node_embedding_dim=getattr(config, 'periodic_node_embedding_dim', 0),
         )
         self.daily_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim, **periodic_delta)
         self.weekly_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim, **periodic_delta)

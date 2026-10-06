@@ -54,6 +54,8 @@ node_delta_descriptor: false
 node_adaptive_scope: [history]
 # basis에서 history ΔW 계수를 샘플·노드별 마지막 시점 입력으로 조절(c[b,n] = c[n]·(1 + tanh(x·W_dyn))).
 node_delta_dynamic: false
+# 일·주 주기 LSTM 입력에 붙이는 학습 노드 임베딩 차원(0이면 끔). 주기 branch에 노드 정체성을 준다.
+periodic_node_embedding_dim: 0
 
 
 # 울산: RMSE(평균)와 MAPE(0 쪽)를 함께 맞추는 mse_mape(λ=2). Porto는 mae.

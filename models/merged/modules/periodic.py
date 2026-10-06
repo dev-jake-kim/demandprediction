@@ -20,18 +20,25 @@ class PeriodicLSTMEncoder(nn.Module):
         node_adaptive_indices: Sequence[int] | None = None,
         node_adaptive_mode: str = "additive",
         node_delta_rank: int = 8,
+        num_nodes: int = 0,
+        node_embedding_dim: int = 0,
     ) -> None:
         super().__init__()
         if extra_dim < 0:
             raise ValueError("extra_dim must be non-negative")
         self.extra_dim = extra_dim
-        self.lstm = nn.LSTM(1 + extra_dim, hidden_size, batch_first=True)
+        # 노드 임베딩 입력(선택): 공용 주기 LSTM에 노드 정체성을 준다(stage 1부터 학습, 노드별 게이트 bias와 같은 효과).
+        self.node_embedding = (
+            nn.Parameter(torch.randn(num_nodes, node_embedding_dim) * 0.1) if node_embedding_dim > 0 else None
+        )
+        input_size = 1 + extra_dim + node_embedding_dim
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
         # 선택 노드만 LSTM ΔW(docs/SPEC.md §6.7 node_adaptive_scope=periodic). 노드 id는 리스트로 보관.
         self._node_index_list = None if node_adaptive_indices is None else [int(v) for v in node_adaptive_indices]
         self._cached_node_index: Tensor | None = None
         self.node_delta = (
             None if self._node_index_list is None
-            else NodeLSTMDelta(len(self._node_index_list), 1 + extra_dim, hidden_size, node_adaptive_mode, node_delta_rank)
+            else NodeLSTMDelta(len(self._node_index_list), input_size, hidden_size, node_adaptive_mode, node_delta_rank)
         )
 
     def node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
@@ -63,6 +70,12 @@ class PeriodicLSTMEncoder(nn.Module):
             )
         elif extra is not None:
             raise ValueError("extra_dim=0인데 extra가 주어짐")
+        if self.node_embedding is not None:
+            if self.node_embedding.shape[0] != nodes:
+                raise ValueError(f"node_embedding 노드 수 {self.node_embedding.shape[0]} != 입력 {nodes}")
+            sequence = torch.cat(
+                [sequence, self.node_embedding[None, None].expand(batch, length, -1, -1).to(sequence.dtype)], dim=-1
+            )
 
         # 유효 lag를 원래 순서대로 앞에 모은다. lag 유효성은 샘플 단위라 노드 축에 공유된다.
         order = valid_mask.to(torch.long).argsort(dim=1, descending=True, stable=True)

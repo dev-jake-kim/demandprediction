@@ -425,6 +425,8 @@ attention mask로 표현한다.
 `forward(values [B,L,N,1], invalid_mask [B,L], extra [B,L,E]) → (h [B,N,periodic_hidden], valid [B])`
 
 - `valid[b]` = 유효 lag가 하나 이상인지.
+- `periodic_node_embedding_dim = d > 0` (선택, 기본 0): 학습 노드 임베딩 `[N, d]`(N(0, 0.1²) 초기화)를 모든 lag 입력에
+  붙인다(`1+E → 1+E+d`). 공용 주기 LSTM이 stage 1부터 노드 정체성을 본다(노드별 게이트 bias `W_e·e_n`와 같은 효과).
 
 <details>
 <summary>세부</summary>
