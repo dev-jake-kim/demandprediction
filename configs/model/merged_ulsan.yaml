@@ -51,7 +51,8 @@ node_delta_rank: 8
 # basis에서 c[n]에 train 구간 노드 기술자(일중·요일 모양, 수준, 0 비율, 변동계수) 투영을 더한다.
 node_delta_descriptor: false
 # ΔW 위치: history(최근 이력 LSTM) | periodic(일·주 주기 LSTM) | fusion(branch attention) | head(출력 head)
-node_adaptive_scope: [history]
+# 울산 채택: 일·주 주기 LSTM에도 ΔW (5시드 MAPE −0.27%p, RMSE 동일, docs/SPEC.md §6.7)
+node_adaptive_scope: [history, periodic]
 # basis에서 history ΔW 계수를 샘플·노드별 마지막 시점 입력으로 조절(c[b,n] = c[n]·(1 + tanh(x·W_dyn))).
 node_delta_dynamic: false
 # 일·주 주기 LSTM 입력에 붙이는 학습 노드 임베딩 차원(0이면 끔). 주기 branch에 노드 정체성을 준다.

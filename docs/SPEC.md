@@ -56,7 +56,7 @@ flowchart TD
         L4["sink 출력 버림<br/>노드 출력만 다음 층으로"]
         L5["최종 노드 출력 [B,N,k,D]<br/>+ 최근 context 14"]
         L6["공유 history LSTM"]
-        L7["적응 노드만 W + ΔW LSTM<br/>(gated: g·W + (1−g)·V)<br/>stage 2에서 ΔW 학습"]
+        L7["적응 노드만 W + ΔW LSTM<br/>(gated: g·W + (1−g)·V)<br/>stage 2에서 ΔW 학습<br/>(울산: 일·주 주기 LSTM에도 ΔW)"]
         HN["h_neural [B,N,history_hidden]"]
         L1 --> L2 --> L3 --> L4
         L4 -->|"transformer_layers번 반복"| L2
@@ -235,7 +235,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | 추가 context | `context_extra_dim`, `context_features` | 0, [] — train.py가 `data.context_features`에서 주입. 채널은 날씨·요일·시간 뒤에 붙는다 |
 | 이벤트 | `use_event_embedding`, `event_csv_path` | false, null — train.py가 `data.event_csv`가 있으면 켜고 절대경로를 저장. 공연·축제 등 모든 이벤트에 **같은** 학습 임베딩 `event_embedding [D]`(0 초기화)을 이벤트 시각·노드의 Transformer 입력 토큰에 더한다(§6.2) |
 | 배차 상태 | `aux_channels`, `aux_grid_path` | 0, null — train.py가 `data.aux_grid`가 있으면 채널 수와 절대경로를 넣는다. 최근 창 `[t−k, t)`의 노드별 배차 상태 `log1p` 값을 `Linear(C→D)`로 Transformer 입력 토큰에 더한다(§6.2) |
-| 노드 적응 | `node_adaptive`, `node_adaptive_min_demand`, `node_adaptive_mode` | true, 0.1, `additive` |
+| 노드 적응 | `node_adaptive`, `node_adaptive_min_demand`, `node_adaptive_mode`, `node_adaptive_scope` | true, 0.1, `additive`, 울산 `[history, periodic]` / Porto `[history]` |
 | 손실 | `loss_type`, `mape_weight` | `mse_mape`, 울산 2.0 / Porto 6.0 (stage 2도 같은 손실: `stage2.loss`, `stage2.mape_weight`) |
 | | `loss_gamma`, `loss_eps`, `rmse_weight`, `split_threshold`, `split_high_weight` | 1.0, 0.5, 10.0, 1.0, 1.0 |
 
@@ -585,6 +585,10 @@ x·W(b,n)ᵀ = x·Wᵀ + Σ_m c[b,n,m]·(x·B_ihᵀ[m] + B_b[m])     (활성값 
   RMSE 0.1% 차이. lr을 10배로 올려 ΔW만 학습해도 val 최적이 2 epoch이고 그 뒤 val이 나빠진다 → 용량·학습량이 아니라
   노드 고유 신호가 작은 것이 한계. Poisson NLL로 학습한 비편향 μ의 잔차에서 val로 추정한 노드×시각 편향을
   test에 더해도 RMSE −0.2% 이하.
+- Porto(채택 stage 1, 3시드) history+periodic: 대조군 대비 RMSE −0.06%·MAPE −0.07%로 방향은 같지만 잡음 수준이라
+  Porto 기본값은 `[history]` 유지.
+- 주기 LSTM에 노드 임베딩을 stage 1부터 넣어도(`periodic_node_embedding_dim=8`, §6.3, + history+periodic ΔW, 3시드)
+  −2.46% / −2.63%로 stage 2 periodic ΔW(−2.39% / −2.78%)와 같은 수준.
 - 같은 stage 1에서 ΔW 변형 4개를 평균해도 −2.47% / −2.60%(단일 −2.45% / −2.39%)로 앙상블 이득이 거의 없다.
 
 <details>
@@ -780,9 +784,12 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
 - **채택 모델**은 `output/adopted/`에 둔다: 결과 JSON은 `runs/`, 체크포인트·학습 로그·GPU 사용률
   기록은 `checkpoints/`의 같은 이름 폴더. 현재 채택 모델은 날씨 2채널(기온, 강수 + g·적설,
   min-max), `local_radius=1`(3×3), 검색 pass, **입력 시간 창 8시간**, 5시드(245/6835/851/5123/535)다.
-  - 울산: 손실 `mse_mape`(λ=2, stage 1·2), `msemape2_ulsan_seed{seed}_471594f`. ADFormer 8h 대비
-    RMSE 0.7123(−2.29%), MAPE 15.219(−2.39%). MAE 손실은 중앙값을 예측해 평균 대비 23% 과소예측하고
-    RMSE가 막혔다(이전 울산 채택 `timestep8_ulsan_*`는 `output/past/adopted_ulsan_mae_d02824a/`).
+  - 울산: 손실 `mse_mape`(λ=2, stage 1·2) + ΔW 위치 `[history, periodic]`, `dwper_ulsan_seed{seed}_0f4a9b2`
+    (stage 1은 `msemape2_ulsan_seed{seed}_471594f/stage1`을 `stage2.init_from`으로 이어받음 — 이 폴더는 stage 1
+    원본이라 그대로 둔다). ADFormer 8h 대비 RMSE 0.7124(−2.28%), MAE 0.3186(−1.99%), MAPE 15.177(−2.66%);
+    직전 채택(ΔW history만, `msemape2_*`, RMSE −2.29%·MAPE −2.39%) 대비 MAPE 5/5·MAE 5/5·RMSE 4/5 시드 개선.
+    MAE 손실은 중앙값을 예측해 평균 대비 23% 과소예측하고 RMSE가 막혔다(이전 울산 채택 `timestep8_ulsan_*`는
+    `output/past/adopted_ulsan_mae_d02824a/`).
   - Porto: 손실 `mse_mape`(λ=6, stage 1·2), `msemape6_porto_seed{seed}_0769f0c`. ADFormer 8h 대비
     RMSE 1.5846(−9.67%), MAPE 14.364(−8.89%). λ는 3시드 val로 골랐다(λ=2·4·6·8·12 중 val RMSE가 최저 근처
     (+0.4%)이면서 val MAPE가 가장 낮은 6). 이전 Porto 채택(MAE, `timestep8_porto_*`, RMSE −5.85%·MAPE −3.94%)은
