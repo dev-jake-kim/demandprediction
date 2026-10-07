@@ -106,6 +106,11 @@ class MergedDemandModel(PreTrainedModel):
         if not scope <= {'history', 'periodic', 'fusion', 'head'}:
             raise ValueError(f"node_adaptive_scope는 history|periodic|fusion|head 중에서 (받음: {sorted(scope)})")
         scoped = lambda name: node_adaptive_indices if name in scope else None  # noqa: E731
+        moe_kwargs = dict(
+            node_moe_experts=getattr(config, 'node_moe_experts', 4),
+            node_moe_router=getattr(config, 'node_moe_router', 'static'),
+            node_moe_top_k=getattr(config, 'node_moe_top_k', 0),
+        )
 
         self.snow_scale = nn.Parameter(torch.tensor(1.0))
         self.weekday_embedding = nn.Embedding(7, config.weekday_dim)
@@ -148,6 +153,7 @@ class MergedDemandModel(PreTrainedModel):
             node_delta_rank=getattr(config, 'node_delta_rank', 8),
             node_descriptors=getattr(config, 'node_descriptors', None),
             node_delta_dynamic=getattr(config, 'node_delta_dynamic', False),
+            **moe_kwargs,
         )
         self.periodic_hidden = config.periodic_hidden
         periodic_delta = dict(
@@ -156,6 +162,7 @@ class MergedDemandModel(PreTrainedModel):
             node_delta_rank=getattr(config, 'node_delta_rank', 8),
             num_nodes=height * width,
             node_embedding_dim=getattr(config, 'periodic_node_embedding_dim', 0),
+            **moe_kwargs,
         )
         self.daily_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim, **periodic_delta)
         self.weekly_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim, **periodic_delta)

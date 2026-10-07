@@ -461,6 +461,46 @@ def _check_node_adaptive_identity() -> dict:
     if dynamic_static_gap > 1e-5 or dynamic_gap > 1e-5:
         raise AssertionError(f'dynamic basis: W_dyn=0 {dynamic_static_gap:.2e}, 샘플별 {dynamic_gap:.2e}')
 
+    # moe: 생성·begin 직후 공유 경로와 같고, 전문가 ΔW·router를 채우면 Σ_k g_k·LSTM(W+ΔW_k)와 같다.
+    torch.manual_seed(4)
+    moe = LocalHistoryEncoder(
+        height=height, width=width, time_step=time_step, local_radius=1, d_model=8, num_fourier_bands=2,
+        transformer_layers=1, transformer_heads=2, transformer_ffn=16, history_hidden=5, dropout=0.0,
+        node_adaptive_indices=adaptive, node_adaptive_mode='moe', node_moe_experts=3, node_moe_router='dynamic',
+        node_moe_top_k=2,
+    )
+    moe.eval()
+    if any(float(param.detach().abs().sum()) != 0.0 for param in moe.node_delta_parameters()):
+        raise AssertionError('moe: node_delta 파라미터가 0으로 생성되지 않음')
+    with torch.no_grad():
+        moe.begin_node_adaptation()
+        moe_after = moe(demands)
+        moe.node_adaptive = False
+        moe_reference = moe(demands)
+        moe.node_adaptive = True
+        moe_identity_gap = float((moe_after - moe_reference).abs().max())
+        experts = moe.node_moe
+        for param in (experts.node_delta_expert_ih, experts.node_delta_expert_hh, experts.node_delta_expert_bias,
+                      experts.node_delta_router_input):
+            param.normal_(0.0, 0.3)
+        moe_out = moe._node_adaptive_hidden(sequence)
+        gate = experts.gates(sequence)
+        if int((gate > 0).sum(-1).max()) > 2 or float((gate.sum(-1) - 1).abs().max()) > 1e-5:
+            raise AssertionError('moe: top-k 게이트가 2개를 넘거나 합이 1이 아님')
+        lstm = moe.history_lstm
+        expected_moe = torch.zeros_like(moe_out)
+        for k in range(3):
+            single = torch.nn.LSTM(8, 5, batch_first=True)
+            single.weight_ih_l0.copy_(lstm.weight_ih_l0 + experts.node_delta_expert_ih[k])
+            single.weight_hh_l0.copy_(lstm.weight_hh_l0 + experts.node_delta_expert_hh[k])
+            single.bias_ih_l0.copy_(lstm.bias_ih_l0 + experts.node_delta_expert_bias[k])
+            single.bias_hh_l0.copy_(lstm.bias_hh_l0)
+            _, (h_k, _) = single(sequence.reshape(-1, time_step, 8))
+            expected_moe += gate[..., k, None] * h_k[-1].reshape(moe_out.shape)
+        moe_gap = float((moe_out - expected_moe).abs().max())
+    if moe_identity_gap > 1e-5 or moe_gap > 1e-5:
+        raise AssertionError(f'moe: begin 직후 {moe_identity_gap:.2e}, 전문가 혼합 {moe_gap:.2e}')
+
     return {
         'node_adaptive_zero_delta_matches_nn_lstm': True,
         'max_abs_diff': gap,

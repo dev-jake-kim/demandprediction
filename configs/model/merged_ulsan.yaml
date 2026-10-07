@@ -46,6 +46,7 @@ node_adaptive: true
 node_adaptive_min_demand: 0.1
 # additive: W + ΔW[n] | gated: g[n]·W + (1−g[n])·V[n] (V는 stage 2 시작 때 W로 복사)
 # | basis: ΔW[n] = Σ_m c[n,m]·B[m] (공유 기저 node_delta_rank개, docs/SPEC.md §6.7)
+# | moe: 공유 전문가 LSTM(W + ΔW_k) K개를 노드별 router로 섞음
 node_adaptive_mode: additive
 node_delta_rank: 8
 # basis에서 c[n]에 train 구간 노드 기술자(일중·요일 모양, 수준, 0 비율, 변동계수) 투영을 더한다.
@@ -55,6 +56,10 @@ node_delta_descriptor: false
 node_adaptive_scope: [history, periodic]
 # basis에서 history ΔW 계수를 샘플·노드별 마지막 시점 입력으로 조절(c[b,n] = c[n]·(1 + tanh(x·W_dyn))).
 node_delta_dynamic: false
+# moe 전문가 수, router(static: 노드별 표 | dynamic: + 입력 시간 평균), top-k(0이면 전체 softmax)
+node_moe_experts: 4
+node_moe_router: static
+node_moe_top_k: 0
 # 일·주 주기 LSTM 입력에 붙이는 학습 노드 임베딩 차원(0이면 끔). 주기 branch에 노드 정체성을 준다.
 periodic_node_embedding_dim: 0
 

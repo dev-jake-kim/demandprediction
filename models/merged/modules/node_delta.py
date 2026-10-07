@@ -114,4 +114,81 @@ class NodeLSTMDelta(nn.Module):
         )
 
 
-__all__ = ["NodeLSTMDelta", "run_dynamic_basis_lstm", "run_node_lstm"]
+class NodeLSTMMoE(nn.Module):
+    """선택 노드의 LSTM을 공유 전문가 K개(W + ΔW_k)의 router 혼합으로 바꾼다. docs/SPEC.md §6.7 ``moe``.
+
+    파라미터는 전부 0으로 생성(stage 1에서 공유 LSTM과 같음). ``begin``이 router 표 R을 N(0,1)로 채운다.
+    """
+
+    def __init__(
+        self,
+        num_nodes: int,
+        input_size: int,
+        hidden_size: int,
+        num_experts: int = 4,
+        router: str = "static",
+        top_k: int = 0,
+    ) -> None:
+        super().__init__()
+        if num_experts < 2:
+            raise ValueError("node_moe_experts는 2 이상이어야 함")
+        if router not in ("static", "dynamic"):
+            raise ValueError(f"node_moe_router는 'static'|'dynamic' (받음: {router!r})")
+        if not 0 <= top_k <= num_experts:
+            raise ValueError("node_moe_top_k는 0(전체)~전문가 수")
+        gates = 4 * hidden_size
+        self.num_experts = int(num_experts)
+        self.top_k = int(top_k)
+        self.node_delta_expert_ih = nn.Parameter(torch.zeros(num_experts, gates, input_size))
+        self.node_delta_expert_hh = nn.Parameter(torch.zeros(num_experts, gates, hidden_size))
+        self.node_delta_expert_bias = nn.Parameter(torch.zeros(num_experts, gates))
+        self.node_delta_router = nn.Parameter(torch.zeros(num_nodes, num_experts))
+        self.node_delta_router_input = (
+            nn.Parameter(torch.zeros(input_size, num_experts)) if router == "dynamic" else None
+        )
+
+    def node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
+        params = (self.node_delta_expert_ih, self.node_delta_expert_hh, self.node_delta_expert_bias, self.node_delta_router)
+        if self.node_delta_router_input is not None:
+            params += (self.node_delta_router_input,)
+        return params
+
+    @torch.no_grad()
+    def begin(self) -> None:
+        """router 표 R ~ N(0,1). 전문가 ΔW=0이라 출력 불변, 노드별 게이트 차이로 전문가가 갈라진다."""
+
+        self.node_delta_router.normal_(0.0, 1.0)
+
+    def gates(self, sequence: Tensor) -> Tensor:
+        """``sequence [B,A,L,F]`` -> 게이트 ``[B,A,K]`` (softmax, top_k>0이면 상위 k개만)."""
+
+        logits = self.node_delta_router.unsqueeze(0).expand(sequence.shape[0], -1, -1)
+        if self.node_delta_router_input is not None:
+            logits = logits + sequence.mean(dim=2) @ self.node_delta_router_input
+        if 0 < self.top_k < self.num_experts:
+            threshold = logits.topk(self.top_k, dim=-1).values[..., -1:]
+            logits = logits.masked_fill(logits < threshold, float("-inf"))
+        return torch.softmax(logits, dim=-1)
+
+    def forward(self, lstm: nn.LSTM, sequence: Tensor) -> Tensor:
+        """``sequence [B,A,L,F]`` -> 시점별 혼합 hidden ``[B,A,L,h]``."""
+
+        batch, num_nodes, steps, features = sequence.shape
+        flat = sequence.reshape(batch * num_nodes, steps, features)
+        zeros = flat.new_zeros(1, flat.shape[0], lstm.hidden_size)
+        gate = self.gates(sequence)
+        mixed = None
+        for expert in range(self.num_experts):
+            weights = [
+                lstm.weight_ih_l0 + self.node_delta_expert_ih[expert],
+                lstm.weight_hh_l0 + self.node_delta_expert_hh[expert],
+                lstm.bias_ih_l0 + self.node_delta_expert_bias[expert],
+                lstm.bias_hh_l0,
+            ]
+            output = torch._VF.lstm(flat, (zeros, zeros), weights, True, 1, 0.0, self.training, False, True)[0]
+            term = gate[..., expert, None, None] * output.reshape(batch, num_nodes, steps, -1)
+            mixed = term if mixed is None else mixed + term
+        return mixed
+
+
+__all__ = ["NodeLSTMDelta", "NodeLSTMMoE", "run_dynamic_basis_lstm", "run_node_lstm"]

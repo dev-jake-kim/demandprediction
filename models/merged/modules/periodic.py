@@ -7,7 +7,7 @@ from collections.abc import Sequence
 import torch
 from torch import Tensor, nn
 
-from .node_delta import NodeLSTMDelta, run_node_lstm
+from .node_delta import NodeLSTMDelta, NodeLSTMMoE, run_node_lstm
 
 
 class PeriodicLSTMEncoder(nn.Module):
@@ -22,6 +22,9 @@ class PeriodicLSTMEncoder(nn.Module):
         node_delta_rank: int = 8,
         num_nodes: int = 0,
         node_embedding_dim: int = 0,
+        node_moe_experts: int = 4,
+        node_moe_router: str = "static",
+        node_moe_top_k: int = 0,
     ) -> None:
         super().__init__()
         if extra_dim < 0:
@@ -36,10 +39,16 @@ class PeriodicLSTMEncoder(nn.Module):
         # 선택 노드만 LSTM ΔW(docs/SPEC.md §6.7 node_adaptive_scope=periodic). 노드 id는 리스트로 보관.
         self._node_index_list = None if node_adaptive_indices is None else [int(v) for v in node_adaptive_indices]
         self._cached_node_index: Tensor | None = None
-        self.node_delta = (
-            None if self._node_index_list is None
-            else NodeLSTMDelta(len(self._node_index_list), input_size, hidden_size, node_adaptive_mode, node_delta_rank)
-        )
+        if self._node_index_list is None:
+            self.node_delta = None
+        elif node_adaptive_mode == "moe":
+            self.node_delta = NodeLSTMMoE(
+                len(self._node_index_list), input_size, hidden_size, node_moe_experts, node_moe_router, node_moe_top_k
+            )
+        else:
+            self.node_delta = NodeLSTMDelta(
+                len(self._node_index_list), input_size, hidden_size, node_adaptive_mode, node_delta_rank
+            )
 
     def node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
         return () if self.node_delta is None else self.node_delta.node_delta_parameters()
@@ -91,7 +100,10 @@ class PeriodicLSTMEncoder(nn.Module):
                 index = torch.as_tensor(self._node_index_list, dtype=torch.long, device=compact.device)
                 self._cached_node_index = index
             node_sequence = compact.reshape(batch, nodes, length, feature_dim)[:, index]
-            node_steps = run_node_lstm(node_sequence, *self.node_delta.weights(self.lstm))
+            if isinstance(self.node_delta, NodeLSTMMoE):
+                node_steps = self.node_delta(self.lstm, node_sequence)
+            else:
+                node_steps = run_node_lstm(node_sequence, *self.node_delta.weights(self.lstm))
             steps = steps.reshape(batch, nodes, length, -1).index_copy(1, index, node_steps.to(steps.dtype))
             steps = steps.reshape(batch * nodes, length, -1)
         last = (lengths.clamp_min(1) - 1).repeat_interleave(nodes)

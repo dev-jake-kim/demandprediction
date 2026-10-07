@@ -10,7 +10,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .embeddings import FourierScalarEmbedding
-from .node_delta import run_dynamic_basis_lstm, run_node_lstm
+from .node_delta import NodeLSTMMoE, run_dynamic_basis_lstm, run_node_lstm
 
 
 class LocalHistoryEncoder(nn.Module):
@@ -45,6 +45,9 @@ class LocalHistoryEncoder(nn.Module):
         node_delta_rank: int = 8,
         node_descriptors: Sequence[Sequence[float]] | None = None,
         node_delta_dynamic: bool = False,
+        node_moe_experts: int = 4,
+        node_moe_router: str = "static",
+        node_moe_top_k: int = 0,
     ) -> None:
         super().__init__()
         if extra_dim < 0:
@@ -131,8 +134,8 @@ class LocalHistoryEncoder(nn.Module):
         self.history_hidden = history_hidden
 
         self.node_adaptive = node_adaptive_indices is not None
-        if node_adaptive_mode not in ("additive", "gated", "basis"):
-            raise ValueError(f"node_adaptive_mode는 'additive'|'gated'|'basis' (받음: {node_adaptive_mode!r})")
+        if node_adaptive_mode not in ("additive", "gated", "basis", "moe"):
+            raise ValueError(f"node_adaptive_mode는 'additive'|'gated'|'basis'|'moe' (받음: {node_adaptive_mode!r})")
         self.node_adaptive_mode = node_adaptive_mode
         if self.node_adaptive:
             # meta device 초기화에서도 검사할 수 있도록 파이썬 리스트로 다룬다.
@@ -176,6 +179,14 @@ class LocalHistoryEncoder(nn.Module):
                 )
             elif node_delta_dynamic:
                 raise ValueError("node_delta_dynamic은 node_adaptive_mode=basis에서만 쓴다")
+            elif node_adaptive_mode == "moe":
+                if node_descriptors is not None:
+                    raise ValueError("node_descriptors는 node_adaptive_mode=basis에서만 쓴다")
+                # moe: 공유 전문가 K개(W + ΔW_k)를 노드별 router로 섞는다(docs/SPEC.md §6.7).
+                self.node_moe = NodeLSTMMoE(
+                    num_adaptive, d_model + extra_dim, history_hidden,
+                    node_moe_experts, node_moe_router, node_moe_top_k,
+                )
             else:
                 if node_descriptors is not None:
                     raise ValueError("node_descriptors는 node_adaptive_mode=basis에서만 쓴다")
@@ -209,6 +220,8 @@ class LocalHistoryEncoder(nn.Module):
 
         if not self.node_adaptive:
             return ()
+        if self.node_adaptive_mode == "moe":
+            return self.node_moe.node_delta_parameters()
         if self.node_adaptive_mode == "basis":
             deltas = (
                 self.node_delta_basis_ih,
@@ -245,9 +258,12 @@ class LocalHistoryEncoder(nn.Module):
     @torch.no_grad()
     def begin_node_adaptation(self) -> None:
         """ΔW 학습 시작 직전 호출(출력 불변). gated: V[n] ← 현재 공유 가중치, s ← 1.
-        basis: 기저 B=0을 유지하고 계수 C(·W_φ)만 난수로 채운다."""
+        basis: 기저 B=0을 유지하고 계수 C(·W_φ)만 난수로 채운다. moe: router 표만 난수로 채운다."""
 
         if not self.node_adaptive:
+            return
+        if self.node_adaptive_mode == "moe":
+            self.node_moe.begin()
             return
         if self.node_adaptive_mode == "basis":
             rank = self.node_delta_rank
@@ -283,6 +299,8 @@ class LocalHistoryEncoder(nn.Module):
         """
 
         lstm = self.history_lstm
+        if self.node_adaptive_mode == "moe":
+            return self.node_moe(lstm, sequence)[:, :, -1]
         shared_bias = lstm.bias_ih_l0 + lstm.bias_hh_l0
         if self.node_adaptive_mode == "gated":
             # W + s·(1−g)·(V − W); s=1이면 g·W + (1−g)·V.

@@ -557,7 +557,24 @@ x·W(b,n)ᵀ = x·Wᵀ + Σ_m c[b,n,m]·(x·B_ihᵀ[m] + B_b[m])     (활성값 
 
 - `x_last[b,n]`은 노드 `n`의 LSTM 마지막 입력(Transformer 토큰 + 시각·날씨 context). `W_dyn=0`이면 정적 basis와 같다.
 
-**`node_adaptive_scope`** (기본 `[history]`): ΔW를 넣을 위치. 같은 선택 노드·`node_adaptive_mode`(additive|basis)를 쓴다.
+**`node_adaptive_mode=moe`** (선택): 노드마다 따로 두던 ΔW를 공유 전문가(expert) `K`개로 바꾸고, 노드별 router가 전문가를
+섞는다. 특화 연산은 전문가로 공유하고, 노드마다 어떤 특화를 얼마나 쓸지만 따로 둔다.
+
+```text
+expert k:  LSTM_k = LSTM(W + ΔW_k)          ΔW_k = (ΔW_ih[k], ΔW_hh[k], Δb[k]),  K = node_moe_experts
+router:    z[b,n,k] = R[n,k] (+ x̄[b,n]·W_r[:,k], node_moe_router=dynamic)       R: [A,K], W_r: [F,K]
+           g[b,n] = softmax(z[b,n]) (node_moe_top_k = t > 0이면 상위 t개 밖은 −∞)
+출력:      h[b,n] = Σ_k g[b,n,k]·LSTM_k(x[b,n])     (전문가 출력의 혼합, 모든 시점)
+```
+
+- `x̄[b,n]`은 노드 `n`의 LSTM 입력 시퀀스 시간 평균이다(시점별 router 없음, 한 샘플·노드에 게이트 하나).
+- 모든 `node_delta_*`(ΔW_k, R, W_r)는 0으로 생성되어 stage 1은 공유 LSTM과 같다. `begin_node_adaptation()`이
+  `R ~ N(0, 1)`로 채운다(`W_r`는 0 유지). 이때 전문가가 모두 같아(ΔW_k=0) 출력은 바뀌지 않고, 노드마다 다른
+  게이트로 기울기가 전문가에 다르게 나뉘어 전문가가 갈라진다(대칭 깨기).
+- 전문가는 공유 `nn.LSTM`의 가중치에 ΔW_k를 더해 cuDNN LSTM(`torch._VF.lstm`)으로 선택 노드 전체를 한 번에 돈다.
+- `node_adaptive_scope`의 `history`·`periodic`에 같은 식으로 쓴다(위치마다 전문가·router가 따로 있다).
+- 부하 균형 손실은 두지 않는다(dense softmax 기본).
+**`node_adaptive_scope`** (기본 `[history]`): ΔW를 넣을 위치. 같은 선택 노드·`node_adaptive_mode`(additive|basis|moe)를 쓴다.
 
 - `history`: 위의 최근 이력 `history_lstm`.
 - `periodic`: 일·주 주기 `PeriodicLSTMEncoder.lstm`마다 `NodeLSTMDelta`(같은 식, basis는 기술자 없이 `C ~ N(0, 1/M)`).

@@ -337,6 +337,7 @@ def load_stage1_with_new_nodes(init_from: str, config: MergedDemandConfig) -> Me
     ignored = {
         'node_adaptive_indices', 'node_adaptive_min_demand', 'node_adaptive', 'node_adaptive_mode',
         'node_delta_rank', 'node_delta_descriptor', 'node_descriptors', 'node_adaptive_scope', 'node_delta_dynamic',
+        'node_moe_experts', 'node_moe_router', 'node_moe_top_k',
         # stage 2 손실 전용 설정(node_mix 벡터·하이퍼파라미터)은 stage 1 가중치와 무관하다.
         'node_mix_lambda', 'node_mix_mape_scale', 'node_mix_mse_scale', 'node_mix_weight', 'node_mix_lambda_low',
         'node_mix_lambda_high', 'node_mix_tau', 'node_mix_width', 'node_mix_scaler',

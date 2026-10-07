@@ -71,6 +71,9 @@ class MergedDemandConfig(PretrainedConfig):
         node_adaptive_scope: list[str] | None = None,
         node_delta_dynamic: bool = False,
         periodic_node_embedding_dim: int = 0,
+        node_moe_experts: int = 4,
+        node_moe_router: str = 'static',
+        node_moe_top_k: int = 0,
         loss_type: str = 'combined',
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
@@ -161,6 +164,10 @@ class MergedDemandConfig(PretrainedConfig):
         self.node_delta_dynamic = node_delta_dynamic
         # 일·주 주기 LSTM 입력에 붙이는 학습 노드 임베딩 차원(0이면 끔, docs/SPEC.md §6.4).
         self.periodic_node_embedding_dim = periodic_node_embedding_dim
+        # moe: 공유 전문가 수, router(static: 노드 표만 | dynamic: + 입력 시간 평균), top-k(0=전체) (docs/SPEC.md §6.7).
+        self.node_moe_experts = node_moe_experts
+        self.node_moe_router = node_moe_router
+        self.node_moe_top_k = node_moe_top_k
         # configure_loss가 stage마다 갱신한다(체크포인트가 마지막 학습 손실을 기록).
         self.loss_type = loss_type
         self.loss_gamma = loss_gamma
