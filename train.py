@@ -712,7 +712,8 @@ def main(cfg: DictConfig) -> None:
             model.begin_node_adaptation()
         for param in deltas:
             param.requires_grad_(True)
-        # stage2.freeze: none | shared(ΔW만 학습) | pre_lstm(LSTM 입력부 고정, LSTM 이후만 학습).
+        # stage2.freeze: none | shared(ΔW만 학습) | pre_lstm(LSTM 입력부 고정, LSTM 이후만 학습)
+        # | delta(ΔW를 0으로 고정, 공유 가중치만 미세조정 — ΔW 효과 분리용 대조군).
         stage2_freeze = str(cfg.stage2.get('freeze', 'none'))
         if stage2_freeze == 'shared':
             for name, param in model.named_parameters():
@@ -721,8 +722,13 @@ def main(cfg: DictConfig) -> None:
         elif stage2_freeze == 'pre_lstm':
             for param in model.pre_lstm_parameters():
                 param.requires_grad_(False)
+        elif stage2_freeze == 'delta':
+            if model.config.node_adaptive_mode not in ('additive', 'basis'):
+                raise ValueError('stage2.freeze=delta는 ΔW=0이 공유 모델과 같은 additive|basis에서만 쓴다')
+            for param in deltas:
+                param.requires_grad_(False)
         elif stage2_freeze != 'none':
-            raise ValueError(f"stage2.freeze는 'none'|'shared'|'pre_lstm' (받음: {stage2_freeze!r})")
+            raise ValueError(f"stage2.freeze는 'none'|'shared'|'pre_lstm'|'delta' (받음: {stage2_freeze!r})")
         stage2_loss = str(cfg.stage2.loss)
         model.configure_loss(
             stage2_loss,

@@ -787,6 +787,8 @@ python train.py --config-name config_<city> "description='실험 설명'" \
     weekday/hour embedding)을 고정한다. `history_lstm`·ΔW·daily/weekly LSTM·`branch_attention`·
     `output_gate`는 학습한다. 고정 부분도 train 모드(dropout 켬)로 돈다. 채택 stage 1에서 5시드 비교 결과
     대조군(`none`) 대비 울산 RMSE −0.03%·MAPE +0.12%, Porto RMSE +0.15%·MAPE −0.25%로 차이 없음.
+  - `delta`: ΔW를 0으로 고정하고 공유 가중치만 stage 2 설정(lr·손실)으로 미세조정한다(`additive`·`basis` 전용, ΔW=0이면
+    노드 적응 없는 모델과 같은 함수). stage 2 개선 중 ΔW 몫과 단순 추가 미세조정 몫을 나누는 대조군이다.
 - **`node_adaptive_schedule`** (기본 `two_stage`): `joint`면 stage를 나누지 않고 처음부터 ΔW를 포함해
   `train.learning_rate`·`model.loss_type`으로 한 번에 학습한다(`stage2.*` 무시, `init_from` 금지).
   채택 설정 3시드 비교에서 ΔW가 초반부터 train에 과적합해(best epoch 7~12, 이후 val 상승)
