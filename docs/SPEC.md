@@ -60,8 +60,8 @@ flowchart TD
         HN["h_neural [B,N,history_hidden]"]
         L1 --> L2 --> L3 --> L4
         L4 -->|"transformer_layers번 반복"| L2
-        L4 --> L5 --> L6 --> HN
-        L5 --> L7 --> HN
+        L4 --> L5 --> L6 -->|"비적응 노드 77개"| HN
+        L5 --> L7 -->|"적응 노드 91개: 공유 LSTM 출력을 대체(합 아님)"| HN
     end
 
     H --> L1
@@ -74,12 +74,12 @@ flowchart TD
         P3["적응 노드만 노드별 LSTM<br/>(울산 채택: W + ΔW[n], scope=periodic)<br/>stage 2에서 학습"]
         HD["h_daily [B,N,periodic_hidden]<br/>daily_valid [B]"]
         HW["h_weekly [B,N,periodic_hidden]<br/>weekly_valid [B]"]
-        P1 --> HD
-        P2 --> HW
+        P1 -->|"비적응 노드"| HD
+        P2 -->|"비적응 노드"| HW
         P1 --> P3
         P2 --> P3
-        P3 --> HD
-        P3 --> HW
+        P3 -->|"적응 노드: 대체"| HD
+        P3 -->|"적응 노드: 대체"| HW
     end
 
     D --> P1
