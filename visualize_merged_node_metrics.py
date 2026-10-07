@@ -162,8 +162,8 @@ def main() -> None:
     baseline.add_argument('--adformer-dir', help='도시별 *_rmse/mae/mape.npy가 있는 디렉터리')
     parser.add_argument('--variant', required=True, nargs='+',
                         help='변형 체크포인트 디렉터리(여러 개면 노드별 지표 평균)')
-    parser.add_argument('--baseline-label', default='stage1')
-    parser.add_argument('--variant-label', default='stage2')
+    parser.add_argument('--baseline-label', default='baseline')
+    parser.add_argument('--variant-label', default='variant')
     parser.add_argument('--out', required=True)
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')

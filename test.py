@@ -27,7 +27,6 @@ INPUT_KEYS = (
     'daily_mask',
     'weekly_demand',
     'weekly_mask',
-    'sample_idx',
     'weather',
     'hour_of_day',
     'day_of_week',

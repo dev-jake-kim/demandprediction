@@ -14,12 +14,11 @@ LOCK="output/merged/.ablation_queue.lock"
 
 SEEDS=(245 6835 851)
 # 중단 시 앞쪽 ablation부터 완료된다.
-ABLATIONS=(no-ir no-periodic no-extra no-branch-attn no-neighbors)
+ABLATIONS=(no-periodic no-extra no-branch-attn no-neighbors)
 
 # ablation 이름에 대응하는 Hydra 오버라이드.
 declare -A ABLATION_OVERRIDES=(
   [full]=""
-  [no-ir]="model.use_retrieval=false"
   [no-periodic]="model.use_daily=false model.use_weekly=false"
   [no-daily]="model.use_daily=false"
   [no-weekly]="model.use_weekly=false"
@@ -62,10 +61,6 @@ case "${1:-}" in
       out="output/merged/runs/${city}_mae_${ab}_zero_seed${seed}.json"
       log="output/merged/logs/${city}_mae_${ab}_zero_seed${seed}.log"
       overrides="${ABLATION_OVERRIDES[$ab]:-}"
-      # no-ir 외 ablation은 검색을 켠다.
-      if [ "$ab" != no-ir ]; then
-        overrides="model.use_retrieval=true $overrides"
-      fi
       echo "[w$GPU-$SLOT] $(date +%H:%M:%S) 시작 $ab/$city/$seed"
       # shellcheck disable=SC2086
       # 도시별 model 그룹을 선택하려면 --config-name이 필요하다.

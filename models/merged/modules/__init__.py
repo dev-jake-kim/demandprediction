@@ -2,16 +2,14 @@
 
 from .attention import BranchAttention
 from .embeddings import FourierScalarEmbedding
-from .fusion import NeuralRetrievalGate
+from .fusion import OutputHead
 from .history import LocalHistoryEncoder
 from .periodic import PeriodicLSTMEncoder
-from .retrieval import CausalRetrieval
 
 __all__ = [
     'BranchAttention',
-    'CausalRetrieval',
     'FourierScalarEmbedding',
     'LocalHistoryEncoder',
-    'NeuralRetrievalGate',
+    'OutputHead',
     'PeriodicLSTMEncoder',
 ]

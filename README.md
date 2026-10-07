@@ -13,8 +13,7 @@ conda activate DA
 ## 모델
 
 로컬 히스토리 인코더 + daily/weekly 주기 브랜치 + 브랜치 어텐션을
-`MergedDemandModel`로 합쳤다. 기본값은 검색 pass(neural 예측만 사용)이고,
-`model.use_retrieval=true`를 명시하면 인과적 검색과 출력 게이트를 켠다.
+`MergedDemandModel`로 합쳤다.
 
 ## 학습 (train.py)
 
@@ -23,9 +22,8 @@ Hydra로 설정을 관리한다. 루트 config가 도시별로 분리돼 있다
 + `configs/model/merged_porto.yaml`, 둘 다 `configs/dataset/*.yaml` 공유).
 
 ```bash
-python train.py "description='실험 설명'"                                  # ulsan, 검색 pass (기본값)
-python train.py --config-name config_porto "description='실험 설명'"      # porto, 검색 pass
-python train.py "description='실험 설명'" model.use_retrieval=true ablation=full   # 검색 켬
+python train.py "description='실험 설명'"                                  # ulsan
+python train.py --config-name config_porto "description='실험 설명'"      # porto
 python validate_merged.py --device cpu                     # 학습 전 빠른 구조/인과 검사
 ```
 
@@ -34,7 +32,7 @@ python validate_merged.py --device cpu                     # 학습 전 빠른 �
 
 - 결과(로그, 체크포인트)는 `output/${project_name}/{날짜}/{시간}/`에 저장된다 (`hydra.run.dir`).
 - 결과 요약 JSON 경로는 `run_json`, 없으면 `output/merged/runs/`. 이전 실험 기록은 `output/past/`.
-- 기능 스위치와 2-stage 학습은 `docs/SPEC.md` 4·8절 참고.
+- 기능 스위치와 학습 설정은 `docs/SPEC.md` 4·8절 참고.
 
 ## 평가 (test.py)
 

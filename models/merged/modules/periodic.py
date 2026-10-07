@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-
 import torch
 from torch import Tensor, nn
-
-from .node_delta import NodeLSTMDelta, NodeLSTMMoE, run_node_lstm
 
 
 class PeriodicLSTMEncoder(nn.Module):
@@ -17,46 +13,19 @@ class PeriodicLSTMEncoder(nn.Module):
         self,
         hidden_size: int,
         extra_dim: int = 0,
-        node_adaptive_indices: Sequence[int] | None = None,
-        node_adaptive_mode: str = "additive",
-        node_delta_rank: int = 8,
         num_nodes: int = 0,
         node_embedding_dim: int = 0,
-        node_moe_experts: int = 4,
-        node_moe_router: str = "static",
-        node_moe_top_k: int = 0,
-        node_moe_assign: Sequence[int] | None = None,
-        node_moe_residual: bool = False,
-        node_moe_routing: str = "soft",
-        node_moe_tau: float = 1.0,
     ) -> None:
         super().__init__()
         if extra_dim < 0:
             raise ValueError("extra_dim must be non-negative")
         self.extra_dim = extra_dim
-        # 노드 임베딩 입력(선택): 공용 주기 LSTM에 노드 정체성을 준다(stage 1부터 학습, 노드별 게이트 bias와 같은 효과).
+        # 노드 임베딩 입력(선택): 공용 주기 LSTM에 노드 정체성을 준다(노드별 게이트 bias와 같은 효과).
         self.node_embedding = (
             nn.Parameter(torch.randn(num_nodes, node_embedding_dim) * 0.1) if node_embedding_dim > 0 else None
         )
         input_size = 1 + extra_dim + node_embedding_dim
         self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
-        # 선택 노드만 LSTM ΔW(docs/SPEC.md §6.7 node_adaptive_scope=periodic). 노드 id는 리스트로 보관.
-        self._node_index_list = None if node_adaptive_indices is None else [int(v) for v in node_adaptive_indices]
-        self._cached_node_index: Tensor | None = None
-        if self._node_index_list is None:
-            self.node_delta = None
-        elif node_adaptive_mode == "moe":
-            self.node_delta = NodeLSTMMoE(
-                len(self._node_index_list), input_size, hidden_size, node_moe_experts, node_moe_router, node_moe_top_k,
-                node_moe_assign, node_moe_residual, node_moe_routing, node_moe_tau,
-            )
-        else:
-            self.node_delta = NodeLSTMDelta(
-                len(self._node_index_list), input_size, hidden_size, node_adaptive_mode, node_delta_rank
-            )
-
-    def node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
-        return () if self.node_delta is None else self.node_delta.node_delta_parameters()
 
     def forward(
         self, values: Tensor, invalid_mask: Tensor, extra: Tensor | None = None
@@ -99,18 +68,6 @@ class PeriodicLSTMEncoder(nn.Module):
         # 전체 길이로 돌리고 각 행의 마지막 유효 시점 출력을 읽는다(packed LSTM의 마지막 hidden과
         # 같다). host 동기화가 필요한 bool index·packing을 쓰지 않는다.
         steps, _ = self.lstm(compact)
-        if self.node_delta is not None:
-            index = self._cached_node_index
-            if index is None or index.device != compact.device:
-                index = torch.as_tensor(self._node_index_list, dtype=torch.long, device=compact.device)
-                self._cached_node_index = index
-            node_sequence = compact.reshape(batch, nodes, length, feature_dim)[:, index]
-            if isinstance(self.node_delta, NodeLSTMMoE):
-                node_steps = self.node_delta(self.lstm, node_sequence)
-            else:
-                node_steps = run_node_lstm(node_sequence, *self.node_delta.weights(self.lstm))
-            steps = steps.reshape(batch, nodes, length, -1).index_copy(1, index, node_steps.to(steps.dtype))
-            steps = steps.reshape(batch * nodes, length, -1)
         last = (lengths.clamp_min(1) - 1).repeat_interleave(nodes)
         index = last[:, None, None].expand(-1, 1, steps.shape[-1])
         hidden = steps.gather(1, index).squeeze(1)

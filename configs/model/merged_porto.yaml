@@ -1,5 +1,5 @@
 # Porto merged 모델 설정.
-# height/width/time_step/retrieval_grid_path/retrieval_train_end/temperature_min/temperature_max/precipitation_max는 train.py가 데이터에서 채운다.
+# height/width/time_step/temperature_min/temperature_max/precipitation_max는 train.py가 데이터에서 채운다.
 
 local_radius: 1
 d_model: 64
@@ -13,10 +13,6 @@ fusion_dim: 128
 dropout: 0.10
 
 attention_dropout: 0.0
-retrieval_k: 20
-retrieval_chunk_size: 256
-# observed_past는 target_time 이전 관측값만 후보로 삼는다.
-retrieval_scope: observed_past
 # 기능적 이웃: masked Transformer 수용 영역 밖에서 train 구간 상관이 가장 큰 노드 k개의 최근 수요 평균을 토큰에 더한다. 0이면 끔.
 functional_neighbor_k: 0
 # 기능적 이웃 선택 기준: raw(원 시계열 상관) | residual(요일×시각 평균을 뺀 잔차 상관).
@@ -28,7 +24,6 @@ hour_dim: 5
 # 모델 ablation 스위치.
 use_daily: true
 use_weekly: true
-use_retrieval: false
 use_weather: true
 # weather_injection은 날씨 특성의 주입 위치를 선택한다.
 weather_injection: concat
@@ -42,35 +37,8 @@ local_encoder: masked_grid
 global_nodes: []
 use_softplus: true
 
-# node_adaptive는 stage 1에서 ΔW를 고정하고 stage 2에서 학습한다.
-node_adaptive: true
-node_adaptive_min_demand: 0.1
-# additive: W + ΔW[n] | gated: g[n]·W + (1−g[n])·V[n] (V는 stage 2 시작 때 W로 복사)
-# | basis: ΔW[n] = Σ_m c[n,m]·B[m] (공유 기저 node_delta_rank개, docs/SPEC.md §6.7)
-# | moe: 공유 전문가 LSTM(W + ΔW_k) K개를 노드별 router로 섞음
-node_adaptive_mode: additive
-node_delta_rank: 8
-# basis에서 c[n]에 train 구간 노드 기술자(일중·요일 모양, 수준, 0 비율, 변동계수) 투영을 더한다.
-node_delta_descriptor: false
-# ΔW 위치: history(최근 이력 LSTM) | periodic(일·주 주기 LSTM) | fusion(branch attention) | head(출력 head)
-node_adaptive_scope: [history]
-# basis에서 history ΔW 계수를 샘플·노드별 마지막 시점 입력으로 조절(c[b,n] = c[n]·(1 + tanh(x·W_dyn))).
-node_delta_dynamic: false
-# moe 전문가 수, router(static: 노드별 표 | dynamic: + 입력 시간 평균), top-k(0이면 전체 softmax)
-node_moe_experts: 4
-node_moe_router: static
-node_moe_top_k: 0
-# moe router 초기화: random(N(0,1) 표) | cluster(train 구간 노드 기술자 k-means로 노드→전문가 배정)
-node_moe_router_init: random
-# moe에서 공유 전문가 위에 노드 고유 ΔW_n도 더함(W + ΔW_k + ΔW_n)
-node_moe_residual: false
-# moe 라우팅: soft(전문가 softmax 혼합) | gumbel(sparse, 노드별 전문가 하나: 학습은 straight-through Gumbel 표본, 추론은 argmax; static router만)
-node_moe_routing: soft
-# gumbel 표본 softmax 온도 τ
-node_moe_tau: 1.0
 # 일·주 주기 LSTM 입력에 붙이는 학습 노드 임베딩 차원(0이면 끔). 주기 branch에 노드 정체성을 준다.
 periodic_node_embedding_dim: 0
-
 
 # Porto: mse_mape(λ=6, val 기준 선택). 수요 규모가 커서 울산(λ=2)보다 MAPE 항 가중이 크다.
 loss_type: mse_mape
@@ -81,7 +49,7 @@ rmse_weight: 10.0
 # mape_weight는 loss_type='mse_mape'에서만 사용한다(error² + mape_weight·|error|/(y+1)).
 mape_weight: 6.0
 
-# node_mix_*는 loss_type(또는 stage2.loss)='node_mix'에서만 사용한다(docs/SPEC.md §7).
+# node_mix_*는 loss_type='node_mix'에서만 사용한다(docs/SPEC.md §7).
 node_mix_lambda_low: 0.9
 node_mix_lambda_high: 0.1
 node_mix_tau: 0.5

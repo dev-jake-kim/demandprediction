@@ -44,7 +44,7 @@ train:
   remove_unused_columns: false
   save_strategy: epoch
   save_total_limit: 1
-  # epoch 체크포인트는 가중치만 저장한다(학습 재개 없음, stage2.init_from은 가중치만 사용).
+  # epoch 체크포인트는 가중치만 저장한다(학습 재개 없음).
   save_only_model: true
   # batch를 GPU로 비동기 복사한다(pinned memory). 계산 결과는 같다.
   accelerator_config:
@@ -78,27 +78,6 @@ optimizer_schedule:
   cosine_epochs: 60
   eta_min: 0.0001
 
-# stage2는 node_adaptive 가중치 해제 후 적용한다.
-# init_from은 도시별 체크포인트를 지정한다.
-stage2:
-
-  learning_rate: 1e-4
-
-  loss: mse_mape
-  rmse_weight: 10.0
-  # loss=mse_mape의 상대오차 항 가중치(error² + mape_weight·|error|/(y+1)).
-  mape_weight: 6.0
-  # stage 2 고정 범위: none | shared(ΔW만 학습) | pre_lstm(LSTM 입력부 고정, LSTM 이후만 학습)
-  # | delta(ΔW 0 고정, 공유 가중치만 미세조정 — ΔW 효과 분리용).
-  freeze: none
-  # init_from은 optimizer 상태 없이 가중치만 이어받는다.
-  # null이면 stage 1부터 학습한다.
-  init_from: null
-
-# 노드별 ΔW 학습 방식: two_stage(stage 1 ΔW 고정 → stage 2 ΔW 해제) | joint(처음부터 ΔW 포함 한 번에 학습)
-# | joint_two_stage(stage 1부터 ΔW 포함 학습 → stage 2 미세조정).
-node_adaptive_schedule: two_stage
-
 callbacks:
 
   early_stopping:
@@ -107,8 +86,8 @@ callbacks:
 
 # 실험 설명(필수). 학습 로그 맨 위에 커밋 해시와 함께 출력된다.
 description: ???
-# 실행 설정 라벨(모델 스위치가 아님). 기본 검색 pass와 일치시킨다.
-ablation: no-ir
+# 실행 설정 라벨(모델 스위치가 아님). 기본 설정이면 full.
+ablation: full
 # limit_samples는 각 split에서 사용할 앞쪽 샘플 수이며 null이면 전체다.
 limit_samples: null
 # null이면 output/${project_name}/runs/<city>_<loss_type>_<ablation>_seed<seed>.json 에 쓴다.

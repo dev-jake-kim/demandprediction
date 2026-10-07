@@ -17,9 +17,8 @@ from .config import MergedDemandConfig
 from .losses import SCALAR_LOSS_TYPES, build_loss
 from .modules import (
     BranchAttention,
-    CausalRetrieval,
     LocalHistoryEncoder,
-    NeuralRetrievalGate,
+    OutputHead,
     PeriodicLSTMEncoder,
 )
 
@@ -27,7 +26,7 @@ WEATHER_CHANNELS = 2  # 기온, 강수 + g·적설
 
 
 class MergedDemandModel(PreTrainedModel):
-    """One end-to-end model for neural, periodic, and retrieval information."""
+    """One end-to-end model for local-history and periodic demand information."""
 
     config_class = MergedDemandConfig
     base_model_prefix = 'merged_demand'
@@ -43,14 +42,8 @@ class MergedDemandModel(PreTrainedModel):
             raise ValueError('time_step must be positive')
         if config.local_radius < 0:
             raise ValueError('local_radius must be non-negative')
-        retrieval_radius = (
-            config.local_radius if config.retrieval_local_radius is None
-            else config.retrieval_local_radius
-        )
-        if retrieval_radius < 0:
-            raise ValueError('retrieval_local_radius must be non-negative')
-        if config.fusion_dim <= 0 or config.retrieval_k <= 0 or config.retrieval_chunk_size <= 0:
-            raise ValueError('fusion_dim, retrieval_k, and retrieval_chunk_size must be positive')
+        if config.fusion_dim <= 0:
+            raise ValueError('fusion_dim must be positive')
         if config.transformer_heads <= 0 or config.d_model % config.transformer_heads != 0:
             raise ValueError('d_model must be divisible by transformer_heads')
         if config.weekday_dim <= 0 or config.hour_dim <= 0:
@@ -79,7 +72,6 @@ class MergedDemandModel(PreTrainedModel):
 
         self.use_daily = config.use_daily
         self.use_weekly = config.use_weekly
-        self.use_retrieval = config.use_retrieval
         self.use_weather = config.use_weather
         if config.weather_injection not in ('concat', 'cls_add'):
             raise ValueError(
@@ -90,31 +82,6 @@ class MergedDemandModel(PreTrainedModel):
         self.use_branch_attention = config.use_branch_attention
         self.use_neighbors = config.use_neighbors
         self.use_softplus = config.use_softplus
-
-        self.node_adaptive = config.node_adaptive
-        node_adaptive_indices = None
-        if self.node_adaptive:
-            if config.node_adaptive_indices is None:
-                raise ValueError(
-                    'node_adaptive=True면 node_adaptive_indices(대상 노드 id 목록)가 필요함 — '
-                    '시간 리크를 막으려면 train.py가 train 구간 평균 수요로 계산해 넘겨야 한다'
-                )
-            node_adaptive_indices = [int(value) for value in config.node_adaptive_indices]
-        # ΔW를 넣을 위치: history(최근 이력 LSTM) | periodic(일·주 주기 LSTM) | fusion(branch attention) | head(출력 head).
-        # docs/SPEC.md §6.7.
-        scope = set(getattr(config, 'node_adaptive_scope', None) or ['history'])
-        if not scope <= {'history', 'periodic', 'fusion', 'head'}:
-            raise ValueError(f"node_adaptive_scope는 history|periodic|fusion|head 중에서 (받음: {sorted(scope)})")
-        scoped = lambda name: node_adaptive_indices if name in scope else None  # noqa: E731
-        moe_kwargs = dict(
-            node_moe_experts=getattr(config, 'node_moe_experts', 4),
-            node_moe_router=getattr(config, 'node_moe_router', 'static'),
-            node_moe_top_k=getattr(config, 'node_moe_top_k', 0),
-            node_moe_assign=getattr(config, 'node_moe_assign', None),
-            node_moe_residual=getattr(config, 'node_moe_residual', False),
-            node_moe_routing=getattr(config, 'node_moe_routing', 'soft'),
-            node_moe_tau=getattr(config, 'node_moe_tau', 1.0),
-        )
 
         self.snow_scale = nn.Parameter(torch.tensor(1.0))
         self.weekday_embedding = nn.Embedding(7, config.weekday_dim)
@@ -149,51 +116,24 @@ class MergedDemandModel(PreTrainedModel):
             use_sink=config.use_sink,
             local_encoder=config.local_encoder,
             global_nodes=config.global_nodes,
-            node_adaptive_indices=scoped('history'),
-            node_adaptive_mode=config.node_adaptive_mode,
             functional_neighbors=config.functional_neighbors,
             use_event_embedding=config.use_event_embedding,
             aux_channels=getattr(config, 'aux_channels', 0),
-            node_delta_rank=getattr(config, 'node_delta_rank', 8),
-            node_descriptors=getattr(config, 'node_descriptors', None),
-            node_delta_dynamic=getattr(config, 'node_delta_dynamic', False),
-            **moe_kwargs,
         )
         self.periodic_hidden = config.periodic_hidden
-        periodic_delta = dict(
-            node_adaptive_indices=scoped('periodic'),
-            node_adaptive_mode=config.node_adaptive_mode,
-            node_delta_rank=getattr(config, 'node_delta_rank', 8),
+        periodic_kwargs = dict(
             num_nodes=height * width,
             node_embedding_dim=getattr(config, 'periodic_node_embedding_dim', 0),
-            **moe_kwargs,
         )
-        self.daily_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim, **periodic_delta)
-        self.weekly_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim, **periodic_delta)
+        self.daily_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim, **periodic_kwargs)
+        self.weekly_branch = PeriodicLSTMEncoder(config.periodic_hidden, extra_dim=self.extra_dim, **periodic_kwargs)
         self.branch_attention = BranchAttention(
             config.history_hidden,
             config.periodic_hidden,
             config.fusion_dim,
             use_attention=self.use_branch_attention,
-            node_adaptive_indices=scoped('fusion'),
         )
-        self.retrieval = (
-            CausalRetrieval(
-                height=height,
-                width=width,
-                time_step=config.time_step,
-                local_radius=retrieval_radius,
-                retrieval_grid_path=config.retrieval_grid_path,
-                retrieval_k=config.retrieval_k,
-                retrieval_chunk_size=config.retrieval_chunk_size,
-                retrieval_scope=config.retrieval_scope,
-                retrieval_train_end=config.retrieval_train_end,
-            )
-            if self.use_retrieval else None
-        )
-        self.output_gate = NeuralRetrievalGate(
-            config.fusion_dim, use_softplus=self.use_softplus, node_adaptive_indices=scoped('head')
-        )
+        self.output_head = OutputHead(config.fusion_dim, use_softplus=self.use_softplus)
         self.loss_fn: nn.Module
         self.configure_loss(config.loss_type)
 
@@ -227,55 +167,8 @@ class MergedDemandModel(PreTrainedModel):
         self.loss_type = loss_type
         self.config.loss_type = loss_type
 
-    def node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
-        """노드별 ΔW 파라미터 전부(node_adaptive가 꺼져 있으면 빈 튜플, gated면 게이트 logit 포함).
-        node_adaptive_scope의 history·periodic(일·주)·fusion·head 순서."""
-
-        return (
-            self.local_history.node_delta_parameters()
-            + self.daily_branch.node_delta_parameters()
-            + self.weekly_branch.node_delta_parameters()
-            + self.branch_attention.node_delta_parameters()
-            + self.output_gate.node_delta_parameters()
-        )
-
-    def begin_node_adaptation(self) -> None:
-        """ΔW 학습 시작 직전 호출(출력 불변). gated: V ← 공유 W, s ← 1; basis: 계수 난수; additive: 없음."""
-
-        self.local_history.begin_node_adaptation()
-        for branch in (self.daily_branch, self.weekly_branch):
-            if branch.node_delta is not None:
-                branch.node_delta.begin()
-
-    def pre_lstm_parameters(self) -> list[nn.Parameter]:
-        """LSTM 입력을 만드는 파라미터(stage2.freeze=pre_lstm에서 고정).
-
-        ``local_history`` 중 ``history_lstm``·ΔW를 뺀 전부(embedding, sink, direction bias,
-        Transformer, functional/weather projection)와 LSTM extra 입력용 ``snow_scale``·요일/시간 embedding.
-        """
-
-        history = self.local_history
-        lstm_side = {id(param) for param in history.history_lstm.parameters()}
-        lstm_side |= {id(param) for param in history.node_delta_parameters()}
-        params = [param for param in history.parameters() if id(param) not in lstm_side]
-        params.append(self.snow_scale)
-        params.extend(self.weekday_embedding.parameters())
-        params.extend(self.hour_embedding.parameters())
-        return params
-
     def _init_weights(self, module: nn.Module) -> None:
-        """PyTorch 기본 초기화를 유지하고 초기화되지 않은 노드 delta만 0으로 만든다.
-
-        HF가 meta device에서 누락된 체크포인트 키를 실체화할 수 있으므로, 체크포인트에서
-        복원된 delta에는 다시 0을 쓰지 않는다.
-        """
-
-        if module is self or not hasattr(module, 'node_delta_parameters'):
-            return
-        for param in module.node_delta_parameters():
-            if not getattr(param, '_is_hf_initialized', False):
-                param.data.zero_()
-
+        """PyTorch 기본 초기화를 그대로 둔다(HF 기본 ``normal(0, 0.02)`` 재초기화를 쓰지 않는다)."""
 
     def _weather_features(self, weather: Tensor) -> Tensor:
         """``[B,L,3]`` (기온, 강수, 적설) -> ``[B,L,2]`` (기온, 강수 + g·적설) 정규화."""
@@ -318,7 +211,6 @@ class MergedDemandModel(PreTrainedModel):
         daily_mask: Tensor,
         weekly_demand: Tensor,
         weekly_mask: Tensor,
-        sample_idx: Tensor,
         weather: Tensor,
         hour_of_day: Tensor,
         day_of_week: Tensor,
@@ -354,22 +246,13 @@ class MergedDemandModel(PreTrainedModel):
             h_neural, h_daily, h_weekly, daily_valid, weekly_valid
         )
 
-        if self.retrieval is not None:
-            ir_out = self.retrieval(demand_history, sample_idx)
-            neural_pred, lambda_weight, prediction = self.output_gate(h_attn, ir_out)
-        else:
-            # 검색 pass에서는 zero retrieval을 gate에 넣지 않고 우회한다.
-            ir_out = None
-            neural_pred, lambda_weight, prediction = self.output_gate(h_attn, None, bypass_gate=True)
+        prediction = self.output_head(h_attn)
         prediction_grid = prediction.reshape(-1, self.height, self.width)
 
         output: dict[str, Tensor | None] = {
             'logits': prediction_grid,
             'prediction': prediction_grid,
             'prediction_flat': prediction,
-            'neural_pred': neural_pred,
-            'ir_out': ir_out,
-            'lambda_weight': lambda_weight,
             'attention_weights': attention_weights,
             'h_neural': h_neural,
             'h_attn': h_attn,
@@ -393,7 +276,6 @@ class MergedDemandModel(PreTrainedModel):
         daily_mask: Tensor,
         weekly_demand: Tensor,
         weekly_mask: Tensor,
-        sample_idx: Tensor,
         weather: Tensor,
         hour_of_day: Tensor,
         day_of_week: Tensor,
@@ -421,7 +303,6 @@ class MergedDemandModel(PreTrainedModel):
             daily_mask=daily_mask,
             weekly_demand=weekly_demand,
             weekly_mask=weekly_mask,
-            sample_idx=sample_idx,
             weather=weather,
             hour_of_day=hour_of_day,
             day_of_week=day_of_week,

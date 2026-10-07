@@ -18,7 +18,6 @@ from pathlib import Path
 
 import hydra
 import numpy as np
-import torch
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from torch.optim.lr_scheduler import LRScheduler
@@ -227,80 +226,6 @@ def compute_metrics(eval_pred) -> dict[str, float]:
     return compute_merged_metrics(eval_pred.predictions, eval_pred.label_ids)
 
 
-def make_rmse_mape_metrics(rmse_weight: float):
-    """전체 validation 예측에서 목적함수를 계산하는 metric callback을 만든다."""
-
-    def compute_stage2_metrics(eval_pred) -> dict[str, float]:
-        metrics = compute_merged_metrics(eval_pred.predictions, eval_pred.label_ids)
-        metrics['rmse_mape_objective'] = rmse_weight * metrics['rmse'] + metrics['mape_plus1']
-        return metrics
-
-    return compute_stage2_metrics
-
-
-def select_node_adaptive_indices(train_ds: UnifiedDemandDataset, min_demand: float) -> list[int]:
-    """train 구간 평균 수요가 ``min_demand``를 넘는 노드를 선택한다.
-
-    선택은 시간 리크를 막기 위해 ``[time_step, train_end)``만 사용한다.
-    """
-
-    window = train_ds.grid[train_ds.time_step : train_ds.train_end]
-    node_mean = window.reshape(len(window), -1).mean(axis=0)
-    indices = [int(node) for node in (node_mean > min_demand).nonzero()[0]]
-    if not indices:
-        raise ValueError(
-            f'node_adaptive_min_demand={min_demand}를 넘는 노드가 없다 — 임계값을 낮춰야 한다 '
-            f'(노드 평균 수요 최댓값 {float(node_mean.max()):.3f})'
-        )
-    return indices
-
-
-def compute_node_descriptors(train_ds: UnifiedDemandDataset, indices: list[int]) -> list[list[float]]:
-    """basis ΔW·MoE router 배정용 노드 기술자 φ[n] (34차원, 적응 노드 사이 표준화). ``[time_step, train_end)``만 사용.
-
-    시각별(24)·요일별(7, 시작일 기준 상대 요일) 평균 / 노드 평균, log1p 평균, 0 비율, 변동계수.
-    """
-
-    start, end = train_ds.time_step, train_ds.train_end
-    values = train_ds.grid[start:end].reshape(end - start, -1)[:, indices].astype(np.float64)
-    hours = np.asarray(train_ds.hour_table[start:end]).astype(int)
-    days = np.asarray(train_ds.day_of_week_table[start:end]).astype(int)
-    mean = values.mean(axis=0)
-    safe_mean = np.maximum(mean, 1e-6)
-    hour_profile = np.stack([values[hours == h].mean(axis=0) for h in range(24)], axis=1) / safe_mean[:, None]
-    day_profile = np.stack([values[days == d].mean(axis=0) for d in range(7)], axis=1) / safe_mean[:, None]
-    features = np.column_stack([
-        hour_profile, day_profile, np.log1p(mean), (values == 0).mean(axis=0), values.std(axis=0) / safe_mean,
-    ])
-    features = (features - features.mean(axis=0)) / np.maximum(features.std(axis=0), 1e-6)
-    return features.tolist()
-
-
-def cluster_nodes(descriptors: list[list[float]], clusters: int, seed: int, iterations: int = 100) -> list[int]:
-    """노드 기술자 k-means(k-means++ 시작, 유클리드). MoE router 초기 배정용. 빈 군집은 가장 먼 점으로 다시 채운다."""
-
-    points = np.asarray(descriptors, dtype=np.float64)
-    rng = np.random.default_rng(seed)
-    centers = [points[rng.integers(len(points))]]
-    for _ in range(1, clusters):
-        distance = np.min([((points - c) ** 2).sum(1) for c in centers], axis=0)
-        centers.append(points[rng.choice(len(points), p=distance / distance.sum())])
-    centers = np.stack(centers)
-    assign = np.zeros(len(points), dtype=int)
-    for _ in range(iterations):
-        distance = ((points[:, None] - centers[None]) ** 2).sum(-1)
-        assign = distance.argmin(1)
-        for k in range(clusters):
-            if not (assign == k).any():
-                far = distance[np.arange(len(points)), assign].argmax()
-                assign[far] = k
-        new_centers = np.stack([points[assign == k].mean(0) for k in range(clusters)])
-        if np.allclose(new_centers, centers):
-            break
-        centers = new_centers
-    return assign.tolist()
-
-
 def compute_node_mix(
     train_ds: UnifiedDemandDataset, lam_low: float, lam_high: float, tau: float, width: float, scaler: bool
 ) -> tuple[list[float], list[float], list[float], list[float]]:
@@ -326,10 +251,8 @@ def compute_node_mix(
     return lam.tolist(), (1.0 / b).tolist(), (1.0 / (2.0 * a)).tolist(), weight.tolist()
 
 
-def _summarize_history(
-    log_history: list[dict], best_metric_key: str = 'loss'
-) -> tuple[list[dict], int, float]:
-    """Trainer 로그를 epoch별로 합치고 최적 validation 지표를 반환한다."""
+def _summarize_history(log_history: list[dict]) -> tuple[list[dict], int, float]:
+    """Trainer 로그를 epoch별로 합치고 최적 validation loss와 그 epoch를 반환한다."""
 
     per_epoch: dict[int, dict] = {}
     for entry in log_history:
@@ -349,68 +272,10 @@ def _summarize_history(
 
     best_epoch, best_val = 0, float('inf')
     for record in history:
-        val = record.get('val', {}).get(best_metric_key)
+        val = record.get('val', {}).get('loss')
         if val is not None and val < best_val:
             best_val, best_epoch = float(val), record['epoch']
     return history, best_epoch, best_val
-
-
-def load_stage1_with_new_nodes(init_from: str, config: MergedDemandConfig) -> MergedDemandModel:
-    """공유 stage-1 가중치를 불러오고 노드 ΔW를 0으로 초기화한다."""
-    source_config = MergedDemandConfig.from_pretrained(init_from)
-    # 체크포인트를 다시 지정하기 전에 저장된 목적함수와 구조를 검증한다.
-    ignored = {
-        'node_adaptive_indices', 'node_adaptive_min_demand', 'node_adaptive', 'node_adaptive_mode',
-        'node_delta_rank', 'node_delta_descriptor', 'node_descriptors', 'node_adaptive_scope', 'node_delta_dynamic',
-        'node_moe_experts', 'node_moe_router', 'node_moe_top_k', 'node_moe_router_init', 'node_moe_assign',
-        'node_moe_residual', 'node_moe_routing', 'node_moe_tau',
-        # stage 2 손실 전용 설정(node_mix 벡터·하이퍼파라미터)은 stage 1 가중치와 무관하다.
-        'node_mix_lambda', 'node_mix_mape_scale', 'node_mix_mse_scale', 'node_mix_weight', 'node_mix_lambda_low',
-        'node_mix_lambda_high', 'node_mix_tau', 'node_mix_width', 'node_mix_scaler',
-        'architectures', 'dtype',
-    }
-    saved = source_config.to_dict()
-    requested = config.to_dict()
-    differing = [
-        key for key in saved.keys() | requested.keys()
-        if key not in ignored and saved.get(key) != requested.get(key)
-    ]
-    if differing:
-        raise ValueError(
-            f'stage2.init_from={init_from}은 현재 stage 1 설정과 다름: '
-            f'{[(key, saved.get(key), requested.get(key)) for key in sorted(differing)]}'
-        )
-
-    source = MergedDemandModel.from_pretrained(init_from)
-    nonzero = [
-        name for name, param in source.named_parameters()
-        if 'node_delta_' in name and torch.count_nonzero(param.detach()).item()
-    ]
-    if nonzero:
-        raise ValueError(
-            f'stage2.init_from은 ΔW=0인 stage1 체크포인트여야 함 — 0이 아닌 항목: {nonzero}'
-        )
-
-    model = MergedDemandModel(config)
-    source_weights = {
-        name: value for name, value in source.state_dict().items()
-        if 'node_delta_' not in name
-    }
-    expected = {
-        name for name in model.state_dict() if 'node_delta_' in name
-    }
-    loaded = model.load_state_dict(source_weights, strict=False)
-    if set(loaded.missing_keys) != expected or loaded.unexpected_keys:
-        raise ValueError(
-            f'stage2.init_from 공유 가중치 불일치: '
-            f'missing={loaded.missing_keys}, unexpected={loaded.unexpected_keys}'
-        )
-    logger.info(
-        f'[stage2] stage1 공유 가중치 {len(source_weights)}개 복원; '
-        f'ΔW 노드 {len(source_config.node_adaptive_indices or [])}'
-        f' -> {len(config.node_adaptive_indices or [])} (0으로 재초기화)'
-    )
-    return model
 
 
 def git_commit() -> str:
@@ -456,33 +321,9 @@ def main(cfg: DictConfig) -> None:
 
     model_kwargs = OmegaConf.to_container(cfg.model, resolve=True)
 
-    # train 구간에서만 노드별 ΔW 대상을 고르고, None이면 해당 파라미터를 만들지 않는다.
-    node_adaptive = bool(model_kwargs.get('node_adaptive', False))
-    node_adaptive_indices = None
-    if node_adaptive:
-        node_adaptive_indices = select_node_adaptive_indices(
-            train_ds, float(model_kwargs['node_adaptive_min_demand'])
-        )
-        total_nodes = train_ds.height * train_ds.width
-        logger.info(
-            f'[node_adaptive] train 구간 평균 수요 > {model_kwargs["node_adaptive_min_demand"]}인 '
-            f'노드 {len(node_adaptive_indices)}/{total_nodes} '
-            f'({len(node_adaptive_indices) / total_nodes * 100:.1f}%)에만 ΔW를 준다'
-        )
-        if model_kwargs.get('node_delta_descriptor'):
-            if model_kwargs.get('node_adaptive_mode') != 'basis':
-                raise ValueError('node_delta_descriptor는 node_adaptive_mode=basis에서만 쓴다')
-            model_kwargs['node_descriptors'] = compute_node_descriptors(train_ds, node_adaptive_indices)
-        if model_kwargs.get('node_adaptive_mode') == 'moe' and model_kwargs.get('node_moe_router_init') == 'cluster':
-            model_kwargs['node_moe_assign'] = cluster_nodes(
-                compute_node_descriptors(train_ds, node_adaptive_indices), int(model_kwargs['node_moe_experts']),
-                int(cfg.train.seed),
-            )
-            logger.info(f'[moe] 노드 기술자 k-means 배정 크기: {np.bincount(model_kwargs["node_moe_assign"]).tolist()}')
-
-    # node_mix 손실(stage 1 또는 stage 2)을 쓰면 노드별 λ·정규화·scaler를 train 구간에서 계산한다.
+    # node_mix 손실을 쓰면 노드별 λ·정규화·scaler를 train 구간에서 계산한다.
     node_mix = None
-    if 'node_mix' in (str(model_kwargs.get('loss_type')), str(cfg.stage2.loss)):
+    if str(model_kwargs.get('loss_type')) == 'node_mix':
         node_mix = compute_node_mix(
             train_ds,
             float(model_kwargs['node_mix_lambda_low']),
@@ -513,10 +354,7 @@ def main(cfg: DictConfig) -> None:
         height=train_ds.height,
         width=train_ds.width,
         time_step=train_ds.time_step,
-        retrieval_grid_path=str(data_path),
-        retrieval_train_end=train_ds.train_end,
         **weather_stats,
-        node_adaptive_indices=node_adaptive_indices,
         **model_kwargs,
         context_extra_dim=len(dataset_kwargs['context_features']),
         context_features=dataset_kwargs['context_features'],
@@ -539,18 +377,7 @@ def main(cfg: DictConfig) -> None:
     # Trainer 초기화보다 먼저 seed를 고정해 모델 초기화를 재현한다.
     set_seed(cfg.train.seed)
 
-    configured_init_from = cfg.get('stage2', {}).get('init_from')
-    init_from = configured_init_from if node_adaptive else None
-    if configured_init_from and not node_adaptive:
-        logger.warning(
-            f'stage2.init_from={configured_init_from}이 주어졌지만 model.node_adaptive=false라 '
-            '2-stage 학습을 하지 않는다 — 무시한다'
-        )
-    if init_from:
-        model = load_stage1_with_new_nodes(init_from, model_config)
-        logger.info(f'[stage2] stage1 체크포인트에서 이어받음: {init_from}')
-    else:
-        model = MergedDemandModel(model_config)
+    model = MergedDemandModel(model_config)
 
     output_dir = HydraConfig.get().runtime.output_dir
     train_cfg = OmegaConf.to_container(cfg.train, resolve=True)
@@ -580,31 +407,17 @@ def main(cfg: DictConfig) -> None:
             f'{train_cfg["per_device_train_batch_size"] * per_sample:,}).'
         )
 
-    def build_trainer(
-        stage_dir: str | None,
-        learning_rate: float,
-        *,
-        metrics_fn=compute_metrics,
-        metric_for_best_model: str = 'loss',
-    ) -> Trainer:
-        """각 학습 stage마다 독립된 Trainer를 만든다.
+    def build_trainer() -> Trainer:
+        """학습 Trainer를 만든다. 최적 epoch는 validation loss(`train.metric_for_best_model`)로 고른다."""
 
-        optimizer, scheduler, early stopping, checkpoint 상태는 stage 사이에 공유하지 않는다.
-        """
+        training_args = TrainingArguments(output_dir=output_dir, **train_cfg)
 
-        stage_cfg = dict(train_cfg)
-        stage_cfg['learning_rate'] = learning_rate
-        stage_cfg['metric_for_best_model'] = metric_for_best_model
-        stage_args = TrainingArguments(
-            output_dir=output_dir if stage_dir is None else str(Path(output_dir) / stage_dir),
-            **stage_cfg,
-        )
         trainer_kwargs = dict(
             model=model,
-            args=stage_args,
+            args=training_args,
             train_dataset=train_set,
             eval_dataset=val_set,
-            compute_metrics=metrics_fn,
+            compute_metrics=compute_metrics,
             callbacks=[
                 LoggingCallback(),
                 MinEpochEarlyStoppingCallback(
@@ -615,183 +428,41 @@ def main(cfg: DictConfig) -> None:
         )
         if schedule_name is None:
             return Trainer(**trainer_kwargs)
-        accumulation = int(stage_cfg.get('gradient_accumulation_steps', 1) or 1)
+        accumulation = int(train_cfg.get('gradient_accumulation_steps', 1) or 1)
         steps_per_epoch = max(
             1, math.ceil(
-                math.ceil(len(train_set) / int(stage_cfg['per_device_train_batch_size']))
+                math.ceil(len(train_set) / int(train_cfg['per_device_train_batch_size']))
                 / accumulation
             ),
         )
         logger.info(
             f'[schedule] ADFormer warmup-cosine: warmup {schedule_cfg["warmup_epochs"]} '
-            f'epochs ({schedule_cfg["warmup_lr_init"]} -> {learning_rate}), '
+            f'epochs ({schedule_cfg["warmup_lr_init"]} -> {train_cfg["learning_rate"]}), '
             f'cosine {schedule_cfg["cosine_epochs"]} epochs '
-            f'({learning_rate} -> {schedule_cfg["eta_min"]}), '
+            f'({train_cfg["learning_rate"]} -> {schedule_cfg["eta_min"]}), '
             f'이후 {schedule_cfg["eta_min"]} | steps/epoch={steps_per_epoch}'
         )
         return WarmupCosineTrainer(
             schedule=schedule_cfg, steps_per_epoch=steps_per_epoch, **trainer_kwargs
         )
 
-    def trainable_count(trainer: Trainer) -> int:
-        return sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
-
-    deltas = model.node_delta_parameters()
-    stage_records: dict[str, dict] = {}
-    stage1_metrics: dict[str, float] | None = None
-    # node_adaptive_schedule: two_stage(기본, stage 1 ΔW 고정 → stage 2 ΔW 해제) | joint(처음부터 ΔW 포함 한 번에 학습)
-    # | joint_two_stage(stage 1부터 ΔW 포함 학습 → stage 2 미세조정).
-    schedule = str(cfg.get('node_adaptive_schedule', 'two_stage'))
-    if schedule not in ('two_stage', 'joint', 'joint_two_stage'):
-        raise ValueError(f"node_adaptive_schedule은 'two_stage'|'joint'|'joint_two_stage' (받음: {schedule!r})")
-    joint = bool(deltas) and schedule == 'joint'
-    early_delta = bool(deltas) and schedule == 'joint_two_stage'
-    if (joint or early_delta) and init_from:
-        raise ValueError(f'node_adaptive_schedule={schedule}에서는 stage2.init_from을 쓸 수 없다')
-
-    if not deltas or joint:
-        model.begin_node_adaptation()
-        for param in deltas:
-            param.requires_grad_(True)
-        trainer = build_trainer(None, train_cfg['learning_rate'])
-        if joint:
-            logger.info(
-                f'[joint] 처음부터 ΔW 포함 학습, lr={train_cfg["learning_rate"]}, '
-                f'학습 파라미터 {trainable_count(trainer):,}개 (ΔW {sum(p.numel() for p in deltas):,}개 포함)'
-            )
-        trainer.train()
-        best_metric_key = 'loss'
-    else:
-        if init_from:
-            # stage 2 전에 weights-only 초기화를 검증한다.
-            nonzero = [
-                name
-                for name, param in model.named_parameters()
-                if 'node_delta' in name and float(param.detach().abs().sum()) != 0.0
-            ]
-            if nonzero:
-                raise ValueError(
-                    f'stage2.init_from은 ΔW=0인 stage1 체크포인트여야 함 — 0이 아닌 항목: {nonzero}'
-                )
-            # 같은 목적함수 기준의 stage 1 test 지표를 기록한다.
-            model.configure_loss(str(cfg.model.loss_type))
-            for param in deltas:
-                param.requires_grad_(False)
-            probe = build_trainer('stage1_eval', train_cfg['learning_rate'])
-            # persistent worker의 eval dataloader 캐시를 피하도록 test는 predict로 평가한다.
-            stage1_metrics = probe.predict(eval_test_set, metric_key_prefix='stage1_test').metrics
-            logger.info(f'[stage1] Test metrics: {stage1_metrics}')
-            del probe
-        else:
-            model.configure_loss(str(cfg.model.loss_type))
-            if early_delta:
-                # stage 1부터 ΔW(MoE 등)를 켜고 같이 학습한다. begin은 여기서 한 번만 부른다.
-                model.begin_node_adaptation()
-            for param in deltas:
-                param.requires_grad_(early_delta)
-            stage1 = build_trainer('stage1', train_cfg['learning_rate'])
-            logger.info(
-                f'[stage1] ΔW {"포함 학습" if early_delta else "고정(node_adaptive=false와 동일)"}, '
-                f'학습 파라미터 {trainable_count(stage1):,}개'
-            )
-            stage1.train()
-            stage1_metrics = stage1.predict(eval_test_set, metric_key_prefix='stage1_test').metrics
-            logger.info(f'[stage1] Test metrics: {stage1_metrics}')
-            history1, best_epoch1, best_val1 = _summarize_history(stage1.state.log_history)
-            stage_records['stage1'] = {
-                'history': history1,
-                'best_epoch': best_epoch1,
-                'best_val_loss': best_val1,
-                'best_metric': 'loss',
-                'checkpoint': str(Path(output_dir) / 'stage1'),
-            }
-            # stage 1 Trainer가 optimizer와 모델 wrapper를 계속 붙들고 있지 않게 놓아준다.
-            del stage1
-
-        if not early_delta:
-            model.begin_node_adaptation()
-        for param in deltas:
-            param.requires_grad_(True)
-        # stage2.freeze: none | shared(ΔW만 학습) | pre_lstm(LSTM 입력부 고정, LSTM 이후만 학습)
-        # | delta(ΔW를 0으로 고정, 공유 가중치만 미세조정 — ΔW 효과 분리용 대조군).
-        stage2_freeze = str(cfg.stage2.get('freeze', 'none'))
-        if stage2_freeze == 'shared':
-            for name, param in model.named_parameters():
-                if 'node_delta' not in name:
-                    param.requires_grad_(False)
-        elif stage2_freeze == 'pre_lstm':
-            for param in model.pre_lstm_parameters():
-                param.requires_grad_(False)
-        elif stage2_freeze == 'delta':
-            if model.config.node_adaptive_mode not in ('additive', 'basis'):
-                raise ValueError('stage2.freeze=delta는 ΔW=0이 공유 모델과 같은 additive|basis에서만 쓴다')
-            for param in deltas:
-                param.requires_grad_(False)
-        elif stage2_freeze != 'none':
-            raise ValueError(f"stage2.freeze는 'none'|'shared'|'pre_lstm'|'delta' (받음: {stage2_freeze!r})")
-        stage2_loss = str(cfg.stage2.loss)
-        model.configure_loss(
-            stage2_loss,
-            rmse_weight=float(cfg.stage2.rmse_weight),
-            mape_weight=float(cfg.stage2.mape_weight),
-        )
-        if stage2_loss == 'rmse_mape':
-            rmse_weight = float(cfg.stage2.rmse_weight)
-            metrics_fn = make_rmse_mape_metrics(rmse_weight)
-            best_metric_key = 'rmse_mape_objective'
-            logger.info(f'[stage2] loss = {rmse_weight} * RMSE + MAPE(+1)')
-        else:
-            metrics_fn = compute_metrics
-            best_metric_key = 'loss'
-            logger.info(f'[stage2] loss = {stage2_loss}')
-
-        trainer = build_trainer(
-            'stage2',
-            float(cfg.stage2.learning_rate),
-            metrics_fn=metrics_fn,
-            metric_for_best_model=best_metric_key,
-        )
-        logger.info(
-            f'[stage2] ΔW 해제 (freeze={stage2_freeze}), lr={cfg.stage2.learning_rate}, '
-            f'학습 파라미터 {trainable_count(trainer):,}개 '
-            f'(ΔW {sum(p.numel() for p in deltas):,}개 포함)'
-        )
-        trainer.train()
-
+    trainer = build_trainer()
+    logger.info(f'[train] 학습 파라미터 {sum(p.numel() for p in model.parameters() if p.requires_grad):,}개')
+    trainer.train()
     trainer.save_model(output_dir)
     logger.info(f'Model saved to: {output_dir}')
 
     test_metrics = trainer.predict(eval_test_set, metric_key_prefix='test').metrics
     logger.info(f'Test metrics: {test_metrics}')
 
-    node_gate = model.local_history.node_gate()
-    if deltas:
-        for name, param in model.named_parameters():
-            if 'node_delta' in name:
-                logger.info(
-                    f'[ΔW] {name}: norm={param.norm():.4f} '
-                    f'max_abs={param.abs().max():.4f}'
-                )
-        if node_gate is not None:
-            logger.info(
-                f'[ΔW] gate g: mean={node_gate.mean():.4f} min={node_gate.min():.4f} '
-                f'max={node_gate.max():.4f}'
-            )
-
-    history, best_epoch, best_val = _summarize_history(trainer.state.log_history, best_metric_key)
+    history, best_epoch, best_val = _summarize_history(trainer.state.log_history)
     result = {
         'dataset': cfg.dataset.city,
         'data_path': str(data_path),
         'weather_path': str(dataset_kwargs['weather_csv_path']),
         'weather_stats': weather_stats,
         'device': str(trainer.args.device),
-        'retrieval_scope': cfg.model.retrieval_scope,
-        # stage별 목적함수를 별도로 기록한다.
         'objective': cfg.model.loss_type,
-        'stage1_loss': cfg.model.loss_type,
-        'final_loss': str(cfg.stage2.loss) if deltas and not joint else cfg.model.loss_type,
-        'stage2_freeze': str(cfg.stage2.get('freeze', 'none')) if deltas and not joint else None,
-        'node_adaptive_schedule': schedule if deltas else None,
         'ablation': cfg.ablation,
         'ablation_mode': ABLATION_MODE,
         # ablation 라벨이 아닌 실제 적용된 스위치를 기록한다.
@@ -800,7 +471,6 @@ def main(cfg: DictConfig) -> None:
             for key in (
                 'use_daily',
                 'use_weekly',
-                'use_retrieval',
                 'use_weather',
                 'weather_injection',
                 'use_calendar',
@@ -812,23 +482,7 @@ def main(cfg: DictConfig) -> None:
             )
         },
         'seed': int(cfg.train.seed),
-        # node-adaptive 설정과 stage 메타데이터를 기록한다.
-        'node_adaptive': node_adaptive,
-        'node_adaptive_min_demand': (
-            float(model_kwargs['node_adaptive_min_demand']) if node_adaptive else None
-        ),
-        'node_adaptive_nodes': len(node_adaptive_indices) if node_adaptive_indices else 0,
-        'node_adaptive_indices': node_adaptive_indices,
-        'node_delta_params': sum(p.numel() for p in deltas),
-        'node_adaptive_mode': model.config.node_adaptive_mode if node_adaptive else None,
-        # gated일 때 노드별 g[n](node_adaptive_indices 순서).
-        'node_gate': node_gate.detach().cpu().tolist() if node_gate is not None else None,
-        'stages': ['joint'] if joint else (['stage1', 'stage2'] if deltas else ['single']),
-        'stage2_loss': str(cfg.stage2.loss) if deltas and not joint else None,
-        'stage1_init_from': str(init_from) if init_from else None,
-        'stage1': stage_records.get('stage1'),
-        'stage1_test': stage1_metrics,
-        'best_metric': best_metric_key,
+        'best_metric': 'loss',
         'best_epoch': best_epoch,
         'best_val_loss': best_val,
         'checkpoint': str(output_dir),
@@ -844,14 +498,11 @@ def main(cfg: DictConfig) -> None:
 
     run_json = cfg.get('run_json')
     if run_json is None:
-        # node-adaptive 실행을 구분하는 접미사를 사용한다.
-        suffix = '_nodeadaptive' if node_adaptive else ''
         run_json = (
             Path('output')
             / cfg.project_name
             / 'runs'
-            / f'{cfg.dataset.city}_{cfg.model.loss_type}_{cfg.ablation}{suffix}'
-            f'_seed{cfg.train.seed}.json'
+            / f'{cfg.dataset.city}_{cfg.model.loss_type}_{cfg.ablation}_seed{cfg.train.seed}.json'
         )
     run_json = Path(run_json).expanduser()
     if not run_json.is_absolute():

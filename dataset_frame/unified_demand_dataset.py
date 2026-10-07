@@ -112,8 +112,8 @@ class SplitBounds:
 class UnifiedDemandDataset(Dataset):
     """One sample per target time from a ``[T, H, W]`` temporal grid.
 
-    ``daily_mask`` and ``weekly_mask`` use ``True`` for invalid lags.
-    ``sample_idx`` is the absolute index in the original temporal grid.
+    ``daily_mask`` and ``weekly_mask`` use ``True`` for invalid lags. The absolute target time
+    index of sample ``i`` is ``indices[i]``.
     """
 
     def __init__(
@@ -314,7 +314,6 @@ class UnifiedDemandDataset(Dataset):
             'weekly_demand': torch.from_numpy(self.weekly_values[target_time]),
             'weekly_mask': torch.from_numpy(self.weekly_mask[target_time]),
             'labels': torch.from_numpy(np.array(target, dtype=np.float32, copy=True)),
-            'sample_idx': torch.tensor(target_time, dtype=torch.long),
             'weather': torch.from_numpy(np.array(recent_weather, dtype=np.float32, copy=True)),
             'hour_of_day': torch.from_numpy(recent_hour),
             'day_of_week': torch.from_numpy(recent_day_of_week),

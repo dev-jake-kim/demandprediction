@@ -10,7 +10,6 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .embeddings import FourierScalarEmbedding
-from .node_delta import NodeLSTMMoE, run_dynamic_basis_lstm, run_node_lstm
 
 
 class LocalHistoryEncoder(nn.Module):
@@ -37,21 +36,9 @@ class LocalHistoryEncoder(nn.Module):
         use_sink: bool = True,
         local_encoder: str = "masked_grid",
         global_nodes: Sequence[int] | None = None,
-        node_adaptive_indices: Sequence[int] | None = None,
-        node_adaptive_mode: str = "additive",
         functional_neighbors: Sequence[Sequence[int]] | None = None,
         use_event_embedding: bool = False,
         aux_channels: int = 0,
-        node_delta_rank: int = 8,
-        node_descriptors: Sequence[Sequence[float]] | None = None,
-        node_delta_dynamic: bool = False,
-        node_moe_experts: int = 4,
-        node_moe_router: str = "static",
-        node_moe_top_k: int = 0,
-        node_moe_assign: Sequence[int] | None = None,
-        node_moe_residual: bool = False,
-        node_moe_routing: str = "soft",
-        node_moe_tau: float = 1.0,
     ) -> None:
         super().__init__()
         if extra_dim < 0:
@@ -136,201 +123,6 @@ class LocalHistoryEncoder(nn.Module):
         )
         self.history_lstm = nn.LSTM(d_model + extra_dim, history_hidden, batch_first=True)
         self.history_hidden = history_hidden
-
-        self.node_adaptive = node_adaptive_indices is not None
-        if node_adaptive_mode not in ("additive", "gated", "basis", "moe"):
-            raise ValueError(f"node_adaptive_mode는 'additive'|'gated'|'basis'|'moe' (받음: {node_adaptive_mode!r})")
-        self.node_adaptive_mode = node_adaptive_mode
-        if self.node_adaptive:
-            # meta device 초기화에서도 검사할 수 있도록 파이썬 리스트로 다룬다.
-            index_list = [int(value) for value in node_adaptive_indices]
-            if not index_list:
-                raise ValueError("node_adaptive_indices는 비어 있지 않은 노드 id 목록이어야 함")
-            if min(index_list) < 0 or max(index_list) >= self.num_nodes:
-                raise ValueError(
-                    f"node_adaptive_indices가 노드 범위(0..{self.num_nodes - 1})를 벗어남"
-                )
-            if len(set(index_list)) != len(index_list):
-                raise ValueError("node_adaptive_indices에 중복이 있음")
-            num_adaptive = len(index_list)
-            n_gates = 4 * history_hidden
-            # 노드 id는 버퍼가 아니라 리스트로 보관한다: 체크포인트에 없는 버퍼는
-            # from_pretrained에서 torch.empty 값으로 남는다. 텐서는 device별로 캐시한다.
-            self._node_adaptive_index_list = index_list
-            self._cached_node_index: Tensor | None = None
-            if node_adaptive_mode == "basis":
-                # basis: ΔW[n] = Σ_m c[n,m]·B[m], c[n] = C[n] (+ φ[n]·W_φ). 전부 0으로 생성, begin_node_adaptation이 C·W_φ를 채운다.
-                rank = int(node_delta_rank)
-                if rank < 1:
-                    raise ValueError("node_delta_rank는 1 이상이어야 함")
-                self.node_delta_rank = rank
-                self.node_delta_basis_ih = nn.Parameter(torch.zeros(rank, n_gates, d_model + extra_dim))
-                self.node_delta_basis_hh = nn.Parameter(torch.zeros(rank, n_gates, history_hidden))
-                self.node_delta_basis_bias = nn.Parameter(torch.zeros(rank, n_gates))
-                self.node_delta_coef = nn.Parameter(torch.zeros(num_adaptive, rank))
-                self.node_delta_descriptor_weight = None
-                if node_descriptors is not None:
-                    # 버퍼 대신 리스트(meta device 초기화·from_pretrained 안전). 텐서는 device별 캐시.
-                    self._node_descriptor_list = [[float(v) for v in row] for row in node_descriptors]
-                    widths = {len(row) for row in self._node_descriptor_list}
-                    if len(self._node_descriptor_list) != num_adaptive or len(widths) != 1:
-                        raise ValueError(f"node_descriptors는 [A={num_adaptive}, F] 이어야 함")
-                    self._cached_descriptor_table: Tensor | None = None
-                    self.node_delta_descriptor_weight = nn.Parameter(torch.zeros(widths.pop(), rank))
-                # dynamic: 샘플·노드별 계수 c[b,n] = c[n] ⊙ (1 + tanh(x_last[b,n]·W_dyn)), W_dyn 0 시작(정적 basis와 같음).
-                self.node_delta_dynamic_weight = (
-                    nn.Parameter(torch.zeros(d_model + extra_dim, rank)) if node_delta_dynamic else None
-                )
-            elif node_delta_dynamic:
-                raise ValueError("node_delta_dynamic은 node_adaptive_mode=basis에서만 쓴다")
-            elif node_adaptive_mode == "moe":
-                if node_descriptors is not None:
-                    raise ValueError("node_descriptors는 node_adaptive_mode=basis에서만 쓴다")
-                # moe: 공유 전문가 K개(W + ΔW_k)를 노드별 router로 섞는다(docs/SPEC.md §6.7).
-                self.node_moe = NodeLSTMMoE(
-                    num_adaptive, d_model + extra_dim, history_hidden,
-                    node_moe_experts, node_moe_router, node_moe_top_k, node_moe_assign, node_moe_residual,
-                    node_moe_routing, node_moe_tau,
-                )
-            else:
-                if node_descriptors is not None:
-                    raise ValueError("node_descriptors는 node_adaptive_mode=basis에서만 쓴다")
-                self.node_delta_weight_ih = nn.Parameter(
-                    torch.zeros(num_adaptive, n_gates, d_model + extra_dim)
-                )
-                self.node_delta_weight_hh = nn.Parameter(
-                    torch.zeros(num_adaptive, n_gates, history_hidden)
-                )
-                # One delta bias offsets the combined ``bias_ih + bias_hh``.
-                self.node_delta_bias = nn.Parameter(torch.zeros(num_adaptive, n_gates))
-            if node_adaptive_mode == "gated":
-                # gated: node_delta_*는 노드 고유 가중치 V[n]. g[n] = sigmoid(logit[n]).
-                self.node_delta_gate_logit = nn.Parameter(torch.zeros(num_adaptive))
-                # s: 0이면 공유 가중치와 같은 함수(stage 1). begin_node_adaptation이 1로 둔다.
-                self.register_buffer("node_delta_started", torch.zeros(()), persistent=True)
-
-    def node_adaptive_index(self, device: torch.device) -> Tensor:
-        """ΔW를 받는 노드 id 텐서. config에서 온 파이썬 리스트로 매번 만들되 device별로 캐시한다."""
-
-        cached = self._cached_node_index
-        if cached is None or cached.device != device:
-            cached = torch.as_tensor(
-                self._node_adaptive_index_list, dtype=torch.long, device=device
-            )
-            self._cached_node_index = cached
-        return cached
-
-    def node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
-        """노드별 weight offset 파라미터 전부. 초기화/동결/검증에서 한 곳으로 모아 쓴다."""
-
-        if not self.node_adaptive:
-            return ()
-        if self.node_adaptive_mode == "moe":
-            return self.node_moe.node_delta_parameters()
-        if self.node_adaptive_mode == "basis":
-            deltas = (
-                self.node_delta_basis_ih,
-                self.node_delta_basis_hh,
-                self.node_delta_basis_bias,
-                self.node_delta_coef,
-            )
-            if self.node_delta_descriptor_weight is not None:
-                deltas += (self.node_delta_descriptor_weight,)
-            if self.node_delta_dynamic_weight is not None:
-                deltas += (self.node_delta_dynamic_weight,)
-            return deltas
-        deltas = (
-            self.node_delta_weight_ih,
-            self.node_delta_weight_hh,
-            self.node_delta_bias,
-        )
-        if self.node_adaptive_mode == "gated":
-            deltas += (self.node_delta_gate_logit,)
-        return deltas
-
-    def node_delta_coefficients(self) -> Tensor:
-        """basis 모드의 노드별 결합 계수 c[n] ``[A, M]``."""
-
-        coef = self.node_delta_coef
-        if self.node_delta_descriptor_weight is not None:
-            table = self._cached_descriptor_table
-            if table is None or table.device != coef.device:
-                table = torch.as_tensor(self._node_descriptor_list, dtype=torch.float32, device=coef.device)
-                self._cached_descriptor_table = table
-            coef = coef + table.to(coef.dtype) @ self.node_delta_descriptor_weight
-        return coef
-
-    @torch.no_grad()
-    def begin_node_adaptation(self) -> None:
-        """ΔW 학습 시작 직전 호출(출력 불변). gated: V[n] ← 현재 공유 가중치, s ← 1.
-        basis: 기저 B=0을 유지하고 계수 C(·W_φ)만 난수로 채운다. moe: router 표만 난수로 채운다."""
-
-        if not self.node_adaptive:
-            return
-        if self.node_adaptive_mode == "moe":
-            self.node_moe.begin()
-            return
-        if self.node_adaptive_mode == "basis":
-            rank = self.node_delta_rank
-            if self.node_delta_descriptor_weight is None:
-                self.node_delta_coef.normal_(0.0, (1.0 / rank) ** 0.5)
-            else:
-                features = self.node_delta_descriptor_weight.shape[0]
-                self.node_delta_coef.normal_(0.0, (0.5 / rank) ** 0.5)
-                self.node_delta_descriptor_weight.normal_(0.0, (0.5 / (rank * features)) ** 0.5)
-            return
-        if self.node_adaptive_mode != "gated":
-            return
-        lstm = self.history_lstm
-        self.node_delta_weight_ih.copy_(lstm.weight_ih_l0.expand_as(self.node_delta_weight_ih))
-        self.node_delta_weight_hh.copy_(lstm.weight_hh_l0.expand_as(self.node_delta_weight_hh))
-        self.node_delta_bias.copy_(
-            (lstm.bias_ih_l0 + lstm.bias_hh_l0).expand_as(self.node_delta_bias)
-        )
-        self.node_delta_started.fill_(1.0)
-
-    def node_gate(self) -> Tensor | None:
-        """gated면 노드별 g[n] = sigmoid(logit) ``[A]``, 아니면 None."""
-
-        if not self.node_adaptive or self.node_adaptive_mode != "gated":
-            return None
-        return self.node_delta_gate_logit.sigmoid()
-
-    def _node_adaptive_hidden(self, sequence: Tensor) -> Tensor:
-        """Compute adaptive-node hidden states with per-node LSTM offsets.
-
-        ``sequence`` has shape ``[B, A, k, d_model + extra_dim]`` and the
-        returned tensor has shape ``[B, A, history_hidden]``.
-        """
-
-        lstm = self.history_lstm
-        if self.node_adaptive_mode == "moe":
-            return self.node_moe(lstm, sequence)[:, :, -1]
-        shared_bias = lstm.bias_ih_l0 + lstm.bias_hh_l0
-        if self.node_adaptive_mode == "gated":
-            # W + s·(1−g)·(V − W); s=1이면 g·W + (1−g)·V.
-            mix = self.node_delta_started * (1.0 - self.node_delta_gate_logit.sigmoid())  # (A,)
-            weight_ih = lstm.weight_ih_l0 + mix[:, None, None] * (self.node_delta_weight_ih - lstm.weight_ih_l0)
-            weight_hh = lstm.weight_hh_l0 + mix[:, None, None] * (self.node_delta_weight_hh - lstm.weight_hh_l0)
-            bias = shared_bias + mix[:, None] * (self.node_delta_bias - shared_bias)
-        elif self.node_adaptive_mode == "basis":
-            coef = self.node_delta_coefficients()  # (A,M)
-            if self.node_delta_dynamic_weight is not None:
-                # 마지막 시점 입력(Transformer 토큰 + 시각·날씨 context)으로 노드 계수를 샘플마다 조절한다.
-                scale = 1.0 + torch.tanh(sequence[:, :, -1] @ self.node_delta_dynamic_weight)  # (B,A,M)
-                return run_dynamic_basis_lstm(
-                    sequence, lstm, coef[None] * scale,
-                    self.node_delta_basis_ih, self.node_delta_basis_hh, self.node_delta_basis_bias,
-                )
-            weight_ih = lstm.weight_ih_l0 + torch.einsum("am,mgf->agf", coef, self.node_delta_basis_ih)
-            weight_hh = lstm.weight_hh_l0 + torch.einsum("am,mgh->agh", coef, self.node_delta_basis_hh)
-            bias = shared_bias + coef @ self.node_delta_basis_bias
-        else:
-            weight_ih = lstm.weight_ih_l0 + self.node_delta_weight_ih  # (A,4h,F)
-            weight_hh = lstm.weight_hh_l0 + self.node_delta_weight_hh  # (A,4h,h)
-            bias = shared_bias + self.node_delta_bias  # (A,4h)
-
-        return run_node_lstm(sequence, weight_ih, weight_hh, bias)[:, :, -1]
 
     def _make_neighbor_direction(self) -> Tensor:
         """``[N, N]`` long. query 노드 기준 key 노드의 창 내 방향 index, 창 밖이면 -1.
@@ -418,16 +210,7 @@ class LocalHistoryEncoder(nn.Module):
             sequence = torch.cat([sequence, expanded_extra], dim=-1)
 
         _, (hidden, _) = self.history_lstm(sequence)
-        node_hidden = hidden[-1].reshape(batch, nodes, -1)
-
-        if self.node_adaptive:
-            index = self.node_adaptive_index(sequence.device)
-            adaptive_sequence = sequence.reshape(batch, nodes, steps, -1).index_select(1, index)
-            adaptive_hidden = self._node_adaptive_hidden(adaptive_sequence)
-            # Use out-of-place index_copy so both paths remain differentiable.
-            node_hidden = node_hidden.index_copy(1, index, adaptive_hidden)
-
-        return node_hidden
+        return hidden[-1].reshape(batch, nodes, -1)
 
     def _masked_grid_summary(
         self, demands: Tensor, weather_cls: Tensor | None, event_mask: Tensor | None,

@@ -6,8 +6,8 @@ from transformers import PretrainedConfig
 class MergedDemandConfig(PretrainedConfig):
     """Configuration for the merged demand forecasting model.
 
-    Data-derived values such as grid dimensions, train-split weather extremes, and retrieval
-    bounds are supplied by the training pipeline; the remaining fields are model settings.
+    Data-derived values such as grid dimensions and train-split weather extremes are supplied
+    by the training pipeline; the remaining fields are model settings.
     """
 
     model_type = 'merged_demand'
@@ -18,7 +18,6 @@ class MergedDemandConfig(PretrainedConfig):
         width: int = 12,
         time_step: int = 24,
         local_radius: int = 2,
-        retrieval_local_radius: int | None = None,
         d_model: int = 64,
         num_fourier_bands: int = 8,
         transformer_layers: int = 2,
@@ -29,11 +28,6 @@ class MergedDemandConfig(PretrainedConfig):
         fusion_dim: int = 128,
         dropout: float = 0.1,
         attention_dropout: float | None = None,
-        retrieval_grid_path: str | None = None,
-        retrieval_k: int = 20,
-        retrieval_chunk_size: int = 256,
-        retrieval_scope: str = 'observed_past',
-        retrieval_train_end: int | None = None,
         context_extra_dim: int = 0,
         context_features: list[str] | None = None,
         functional_neighbor_k: int = 0,
@@ -46,7 +40,6 @@ class MergedDemandConfig(PretrainedConfig):
         hour_dim: int = 5,
         use_daily: bool = True,
         use_weekly: bool = True,
-        use_retrieval: bool = True,
         use_weather: bool = True,
         weather_injection: str = 'concat',
         use_calendar: bool = True,
@@ -58,27 +51,10 @@ class MergedDemandConfig(PretrainedConfig):
         aux_channels: int = 0,
         aux_grid_path: str | None = None,
         use_softplus: bool = True,
-        node_adaptive: bool = False,
-        node_adaptive_min_demand: float = 0.8,
-        node_adaptive_indices: list[int] | None = None,
         use_event_embedding: bool = False,
         event_csv_path: str | None = None,
         weather_lead: int = 0,
-        node_adaptive_mode: str = 'additive',
-        node_delta_rank: int = 8,
-        node_delta_descriptor: bool = False,
-        node_descriptors: list[list[float]] | None = None,
-        node_adaptive_scope: list[str] | None = None,
-        node_delta_dynamic: bool = False,
         periodic_node_embedding_dim: int = 0,
-        node_moe_experts: int = 4,
-        node_moe_router: str = 'static',
-        node_moe_top_k: int = 0,
-        node_moe_router_init: str = 'random',
-        node_moe_assign: list[int] | None = None,
-        node_moe_residual: bool = False,
-        node_moe_routing: str = 'soft',
-        node_moe_tau: float = 1.0,
         loss_type: str = 'combined',
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
@@ -101,7 +77,6 @@ class MergedDemandConfig(PretrainedConfig):
         self.width = width
         self.time_step = time_step
         self.local_radius = local_radius
-        self.retrieval_local_radius = retrieval_local_radius
         self.d_model = d_model
         self.num_fourier_bands = num_fourier_bands
         self.transformer_layers = transformer_layers
@@ -112,11 +87,6 @@ class MergedDemandConfig(PretrainedConfig):
         self.fusion_dim = fusion_dim
         self.dropout = dropout
         self.attention_dropout = dropout if attention_dropout is None else float(attention_dropout)
-        self.retrieval_grid_path = retrieval_grid_path
-        self.retrieval_k = retrieval_k
-        self.retrieval_chunk_size = retrieval_chunk_size
-        self.retrieval_scope = retrieval_scope
-        self.retrieval_train_end = retrieval_train_end
         # 데이터셋 추가 context 채널(train.py가 data.context_features에서 주입, test.py가 재구성에 씀).
         self.context_extra_dim = context_extra_dim
         self.context_features = list(context_features or [])
@@ -132,7 +102,6 @@ class MergedDemandConfig(PretrainedConfig):
         self.hour_dim = hour_dim
         self.use_daily = use_daily
         self.use_weekly = use_weekly
-        self.use_retrieval = use_retrieval
         self.use_weather = use_weather
         self.weather_injection = weather_injection
         self.use_calendar = use_calendar
@@ -147,41 +116,14 @@ class MergedDemandConfig(PretrainedConfig):
         self.aux_channels = aux_channels
         self.aux_grid_path = aux_grid_path
         self.use_softplus = use_softplus
-        self.node_adaptive = node_adaptive
-        self.node_adaptive_min_demand = node_adaptive_min_demand
-        # train.py가 train 구간에서 계산해 주입하고, 체크포인트 복원에 쓰인다.
-        self.node_adaptive_indices = node_adaptive_indices
         # 공연·축제 등 이벤트 노드·시각에 공유 학습 임베딩을 더한다. 표 경로는 train.py가 절대경로로 주입.
         self.use_event_embedding = use_event_embedding
         self.event_csv_path = event_csv_path
         # 최근 창 날씨 행을 당기는 칸 수(데이터셋 설정). 모델 연산에는 쓰지 않고 test.py 재현용으로 기록.
         self.weather_lead = weather_lead
-        # additive: W + ΔW[n] | gated: W + s·(1−g[n])·(V[n] − W) (docs/SPEC.md §6.7)
-        self.node_adaptive_mode = node_adaptive_mode
-        # basis: ΔW[n] = Σ_m c[n,m]·B[m] (rank M), descriptor면 c[n]에 노드 기술자 φ[n]·W_φ를 더한다.
-        # node_descriptors [A, F_φ]는 train.py가 train 구간에서 계산해 넣는다(docs/SPEC.md §6.7).
-        self.node_delta_rank = node_delta_rank
-        self.node_delta_descriptor = node_delta_descriptor
-        self.node_descriptors = node_descriptors
-        # ΔW 위치: history | periodic | head (기본 history만, docs/SPEC.md §6.7).
-        self.node_adaptive_scope = list(node_adaptive_scope or ['history'])
-        # basis + dynamic: history ΔW 계수를 샘플·노드별 입력으로 조절(docs/SPEC.md §6.7).
-        self.node_delta_dynamic = node_delta_dynamic
-        # 일·주 주기 LSTM 입력에 붙이는 학습 노드 임베딩 차원(0이면 끔, docs/SPEC.md §6.4).
+        # 일·주 주기 LSTM 입력에 붙이는 학습 노드 임베딩 차원(0이면 끔, docs/SPEC.md §6.3).
         self.periodic_node_embedding_dim = periodic_node_embedding_dim
-        # moe: 공유 전문가 수, router(static: 노드 표만 | dynamic: + 입력 시간 평균), top-k(0=전체) (docs/SPEC.md §6.7).
-        self.node_moe_experts = node_moe_experts
-        self.node_moe_router = node_moe_router
-        self.node_moe_top_k = node_moe_top_k
-        # router 초기화: random | cluster(train 구간 노드 기술자 k-means 배정 node_moe_assign, train.py가 계산).
-        self.node_moe_router_init = node_moe_router_init
-        self.node_moe_assign = node_moe_assign
-        # 공유 전문가 위에 노드 고유 ΔW_n을 더함(전문가 k의 노드 n 가중치 = W + ΔW_k + ΔW_n).
-        self.node_moe_residual = node_moe_residual
-        # soft: 전문가 softmax 혼합 | gumbel: 노드별 전문가 하나(학습 straight-through Gumbel 표본, 추론 argmax), τ = node_moe_tau.
-        self.node_moe_routing = node_moe_routing
-        self.node_moe_tau = node_moe_tau
-        # configure_loss가 stage마다 갱신한다(체크포인트가 마지막 학습 손실을 기록).
+        # configure_loss가 갱신한다(체크포인트가 학습 손실을 기록).
         self.loss_type = loss_type
         self.loss_gamma = loss_gamma
         self.loss_eps = loss_eps

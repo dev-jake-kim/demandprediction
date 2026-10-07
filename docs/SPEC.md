@@ -24,8 +24,7 @@
 
 ## 1. 데이터 흐름
 
-기본 경로는 **검색 pass(`use_retrieval=false`)**다. 점선은
-`model.use_retrieval=true`일 때만 실행된다.
+점선은 선택 입력(`data.aux_grid`)일 때만 쓰인다.
 
 ```mermaid
 flowchart TD
@@ -55,13 +54,11 @@ flowchart TD
         L3["masked Transformer 층<br/>노드는 sink + 자기 창만 봄<br/>+ 방향별·head별 bias"]
         L4["sink 출력 버림<br/>노드 출력만 다음 층으로"]
         L5["최종 노드 출력 [B,N,k,D]<br/>+ 최근 context 14"]
-        L6["공유 history LSTM"]
-        L7["적응 노드(train 평균 수요 > 0.1)만 노드별 LSTM<br/>additive(채택): W + ΔW[n]<br/>(선택) gated · basis · moe(공유 전문가 + router)<br/>stage 2에서 학습"]
+        L6["history LSTM (전체 노드 공유)"]
         HN["h_neural [B,N,history_hidden]"]
         L1 --> L2 --> L3 --> L4
         L4 -->|"transformer_layers번 반복"| L2
-        L4 --> L5 --> L6 -->|"비적응 노드 77개"| HN
-        L5 --> L7 -->|"적응 노드 91개: 공유 LSTM 출력을 대체(합 아님)"| HN
+        L4 --> L5 --> L6 --> HN
     end
 
     H --> L1
@@ -71,15 +68,10 @@ flowchart TD
     subgraph PER["PeriodicLSTMEncoder ×2"]
         P1["daily: log1p lag + context<br/>(선택) + 노드 임베딩<br/>유효 lag 압축 → LSTM"]
         P2["weekly: log1p lag + context<br/>(선택) + 노드 임베딩<br/>유효 lag 압축 → LSTM"]
-        P3["적응 노드만 노드별 LSTM<br/>(울산 채택: W + ΔW[n], scope=periodic)<br/>stage 2에서 학습"]
         HD["h_daily [B,N,periodic_hidden]<br/>daily_valid [B]"]
         HW["h_weekly [B,N,periodic_hidden]<br/>weekly_valid [B]"]
-        P1 -->|"비적응 노드"| HD
-        P2 -->|"비적응 노드"| HW
-        P1 --> P3
-        P2 --> P3
-        P3 -->|"적응 노드: 대체"| HD
-        P3 -->|"적응 노드: 대체"| HW
+        P1 --> HD
+        P2 --> HW
     end
 
     D --> P1
@@ -89,7 +81,7 @@ flowchart TD
 
     subgraph ATT["BranchAttention: 노드별 브랜치 선택"]
         A1["세 표현을 fusion_dim으로 projection<br/>z_neural, z_daily, z_weekly"]
-        A2["query = z_neural<br/>keys·values = daily, weekly, neural<br/>(선택, scope=fusion) + 노드별 Δq·Δv"]
+        A2["query = z_neural<br/>keys·values = daily, weekly, neural"]
         A3["무효 daily·weekly 후보 mask<br/>softmax attention"]
         A4["z_neural + fused<br/>LayerNorm"]
         HA["h_attn [B,N,fusion_dim]"]
@@ -100,8 +92,8 @@ flowchart TD
     HD --> A1
     HW --> A1
 
-    subgraph OUT["기본 출력: 검색 pass"]
-        O1["neural_head Linear<br/>(선택, scope=head) + 노드별 Δw·Δb"]
+    subgraph OUT["출력 OutputHead"]
+        O1["neural_head Linear"]
         O2["Softplus"]
         PRED["예측 수요 logits<br/>[B,H,W]"]
         O1 --> O2 --> PRED
@@ -110,19 +102,6 @@ flowchart TD
     HA --> O1
     PRED --> LOSS["손실 mse_mape<br/>d² + λ·|d|/(y+1), 울산 λ=2 / Porto λ=6"]
     Y --> LOSS
-
-    subgraph RET["선택 경로: use_retrieval=true"]
-        R1["검색용 raw 창<br/>+ absolute sample_idx"]
-        R2["CausalRetrieval<br/>후보 τ < t, top-k 유사 과거"]
-        R3["ir_out [B,N]"]
-        R4["NeuralRetrievalGate<br/>λ·neural + (1-λ)·ir_out"]
-        R1 --> R2 --> R3 --> R4
-    end
-
-    H -.->|"검색 켬"| R1
-    HA -.->|"gate 입력"| R4
-    O2 -.->|"neural_pred"| R4
-    R4 -.->|"검색 켬 예측"| PRED
 ```
 
 기호: `B` batch, `k=time_step=8`(입력 시간 창), `N=H×W` 노드 수, `D=d_model`,
@@ -138,13 +117,11 @@ flowchart TD
 | `dataset_frame/unified_demand_dataset.py` | `UnifiedDemandDataset`: 시간 격자 → 학습 샘플 |
 | `models/merged/config.py` | `MergedDemandConfig` (`PretrainedConfig`) |
 | `models/merged/modeling.py` | `MergedDemandModel`: 조립, 데이터 흐름, 손실 |
-| `models/merged/modules/history.py` | `LocalHistoryEncoder` (+ 노드별 ΔW: additive·gated·basis·moe) |
-| `models/merged/modules/node_delta.py` | 노드별 LSTM 부품: `run_node_lstm`, `NodeLSTMDelta`(주기 LSTM ΔW), `NodeLSTMMoE`(MoE), `run_dynamic_basis_lstm` |
+| `models/merged/modules/history.py` | `LocalHistoryEncoder` |
 | `models/merged/modules/embeddings.py` | `FourierScalarEmbedding` |
-| `models/merged/modules/periodic.py` | `PeriodicLSTMEncoder` (+ 선택: 노드 임베딩, 노드별 ΔW·MoE) |
-| `models/merged/modules/attention.py` | `BranchAttention` (+ 선택: 노드별 query·value ΔW) |
-| `models/merged/modules/fusion.py` | `NeuralRetrievalGate` (출력 head + 검색 gate, + 선택: 노드별 head ΔW) |
-| `models/merged/modules/retrieval.py` | `CausalRetrieval` (선택 경로) |
+| `models/merged/modules/periodic.py` | `PeriodicLSTMEncoder` (+ 선택: 노드 임베딩) |
+| `models/merged/modules/attention.py` | `BranchAttention` |
+| `models/merged/modules/fusion.py` | `OutputHead` (출력 head) |
 | `models/merged/losses.py`, `models/losses.py` | `build_loss`와 손실 구현 (`mse_mape`, `poisson` 등) |
 | `models/merged/metrics.py`, `models/metrics.py` | `compute_merged_metrics`와 공용 지표 |
 | `configs/config_{ulsan,porto}.yaml` | 도시별 Hydra 루트 설정 |
@@ -179,7 +156,6 @@ UnifiedDemandDataset(
 |---|---|---|
 | `demand_history` | `[k,H,W]` float32 | 수요 `[t-k, t)` (raw) |
 | `labels` | `[H,W]` float32 | 수요 `t` |
-| `sample_idx` | `[]` long | 절대 시간 인덱스 `t` |
 | `weather` | `[k,3]` float32 | 기온·강수·적설 CSV 행 `[t-k+1+ℓ, t+1+ℓ)` (예측 시점 날씨 포함, `ℓ = data.weather_lead`, 기본 0) |
 | `hour_of_day`, `day_of_week` | `[k]` long | `[t-k, t)`의 시각(0–23)·요일(0–6) |
 | `daily_demand` / `weekly_demand` | `[L,N,1]` float32 | lag 시점의 raw 수요 |
@@ -192,7 +168,7 @@ UnifiedDemandDataset(
 
 - 분할 경계: `train_end = int(T·train_ratio)`, `val_end = int(T·(train_ratio+val_ratio))`.
   예측 시점은 train `[k, train_end)`, val `[max(k,train_end), val_end)`,
-  test `[max(k,val_end), T)`. 세 split 모두 `sample_idx`는 절대 인덱스를 유지한다.
+  test `[max(k,val_end), T)`. 샘플 `i`의 절대 시간 인덱스는 `dataset.indices[i]`다.
 - lag: `period·i` (`i=1..count`)마다 `[-lag_radius, +lag_radius]` 오프셋을 펼치고
   양수만 남겨 **오래된 것부터** 정렬한다. `lag_radius=0`이면 정확한 배수만 쓴다.
   lag 원천 시점이 `<0`이면 수요·context를 0으로 채우고 mask를 True로 둔다.
@@ -225,8 +201,6 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | 데이터 파생 | `height`, `width`, `time_step` | 14×12 / 10×20, 8 (`configs/dataset/<city>.yaml`) |
 | | `temperature_min`, `temperature_max` | train 구간 기온 최솟값·최댓값 |
 | | `precipitation_max` | train 구간 `강수 + 1·적설`의 최댓값 (> 0) |
-| | `node_adaptive_indices` | train 구간 평균 수요 > `node_adaptive_min_demand`인 노드 id |
-| | `retrieval_grid_path`, `retrieval_train_end` | 수요 `.npy` 절대경로, `train_end` |
 | local | `local_radius` | 1 (3×3) |
 | | `d_model` | 16 / 64 |
 | | `num_fourier_bands` | 8 |
@@ -236,29 +210,22 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | periodic | `periodic_hidden` | 64 |
 | fusion | `fusion_dim` | 128 |
 | context | `weekday_dim`, `hour_dim` | 7, 5 |
-| 검색 | `use_retrieval` | **false** |
-| | `retrieval_local_radius` | 미지정 → `local_radius` |
-| | `retrieval_k`, `retrieval_chunk_size`, `retrieval_scope` | 20, 256, `observed_past` |
 | 기능적 이웃 | `functional_neighbor_k`, `functional_neighbor_mode` | 0 (끔), `raw` — masked Transformer 수용 영역(`local_radius × transformer_layers`) 밖에서 train 구간 상관(`raw` 원 시계열 / `residual` 요일×시각 평균을 뺀 잔차)이 가장 큰 노드 k개를 train.py가 골라 `functional_neighbors`로 주입. 그 최근 수요 평균의 `Linear(1→D)(log1p)`를 노드 토큰에 더한다 |
 | 추가 context | `context_extra_dim`, `context_features` | 0, [] — train.py가 `data.context_features`에서 주입. 채널은 날씨·요일·시간 뒤에 붙는다 |
 | 이벤트 | `use_event_embedding`, `event_csv_path` | false, null — train.py가 `data.event_csv`가 있으면 켜고 절대경로를 저장. 공연·축제 등 모든 이벤트에 **같은** 학습 임베딩 `event_embedding [D]`(0 초기화)을 이벤트 시각·노드의 Transformer 입력 토큰에 더한다(§6.2) |
 | 배차 상태 | `aux_channels`, `aux_grid_path` | 0, null — train.py가 `data.aux_grid`가 있으면 채널 수와 절대경로를 넣는다. 최근 창 `[t−k, t)`의 노드별 배차 상태 `log1p` 값을 `Linear(C→D)`로 Transformer 입력 토큰에 더한다(§6.2) |
-| 노드 적응 | `node_adaptive`, `node_adaptive_min_demand`, `node_adaptive_mode`, `node_adaptive_scope` | true, 0.1, `additive`, 울산 `[history, periodic]` / Porto `[history]` |
-| ΔW 변형 (선택) | `node_delta_rank`, `node_delta_descriptor`, `node_delta_dynamic`, `node_descriptors` | 8, false, false, null — `basis` 전용(§6.7). `node_descriptors`는 train.py가 채움 |
-| MoE (선택) | `node_moe_experts`, `node_moe_router`, `node_moe_top_k`, `node_moe_router_init`, `node_moe_residual`, `node_moe_routing`, `node_moe_tau`, `node_moe_assign` | 4, `static`, 0, `random`, false, `soft`, 1.0, null — `node_adaptive_mode=moe` 전용(§6.7). `node_moe_assign`은 `cluster`일 때 train.py가 채움 |
 | 주기 노드 임베딩 (선택) | `periodic_node_embedding_dim` | 0 (§6.3) |
-| 손실 | `loss_type`, `mape_weight` | `mse_mape`, 울산 2.0 / Porto 6.0 (stage 2도 같은 손실: `stage2.loss`, `stage2.mape_weight`) |
+| 손실 | `loss_type`, `mape_weight` | `mse_mape`, 울산 2.0 / Porto 6.0 |
 | | `loss_gamma`, `loss_eps`, `rmse_weight`, `split_threshold`, `split_high_weight` | 1.0, 0.5, 10.0, 1.0, 1.0 |
 
 ### 4.2 기능 스위치
 
-모든 스위치는 `model.<name>=...` Hydra 오버라이드로 바꾼다. 검색을 제외한 스위치는
+모든 스위치는 `model.<name>=...` Hydra 오버라이드로 바꾼다. 스위치는
 **0-치환**이다: 모듈은 항상 생성·실행하고 결과 텐서만 0으로 바꿔 shape과 파라미터 수를
 유지한다.
 
 | 스위치 | 기본 | false일 때 |
 |---|---|---|
-| `use_retrieval` | false | 검색기·raw grid를 만들지 않고 neural 예측을 그대로 출력 |
 | `use_daily` / `use_weekly` | true | `h_daily` / `h_weekly`를 0으로 (valid mask는 유지) |
 | `use_weather` | true | 정규화 날씨를 0으로 (train 평균에 해당) |
 | `use_calendar` | true | 요일·시간 임베딩을 0으로 |
@@ -270,7 +237,7 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | `weather_injection` | `concat` | `cls_add`: 날씨를 LSTM 입력 대신 Transformer 노드 토큰에 더함 |
 
 루트 설정의 `ablation`은 결과 파일 이름·JSON 메타데이터용 라벨이며 모델을 바꾸지 않는다.
-기본값은 검색 pass와 맞춘 `no-ir`이다.
+기본값은 `full`이다.
 
 <details>
 <summary>루트 설정 값 (두 도시 공통, 배치만 다름)</summary>
@@ -309,7 +276,6 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
   영향), `save_only_model=true`(epoch 체크포인트에 optimizer·scheduler 미저장, 학습 재개 불가).
 - `optimizer_schedule`: `warmup_cosine`, `warmup_epochs=5`, `warmup_lr_init=1e-6`,
   `cosine_epochs=60`, `eta_min=1e-4`.
-- `stage2`: `learning_rate=1e-4`, `loss=mae`, `rmse_weight=10.0`, `init_from=null`.
 - `callbacks.early_stopping`: `min_epochs=0`, `early_stopping_patience=20`.
 - `description=???` (필수, 실험 설명), `limit_samples=null`, `run_json=null`.
 - Hydra 실행 디렉터리 `output/${project_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}`.
@@ -324,44 +290,35 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 
 ```python
 forward(demand_history, daily_demand, daily_mask, weekly_demand, weekly_mask,
-        sample_idx, weather, hour_of_day, day_of_week,
+        weather, hour_of_day, day_of_week,
         daily_weather, daily_hour, daily_day_of_week,
         weekly_weather, weekly_hour, weekly_day_of_week,
-        labels=None) -> {'logits': [B,H,W], 'loss'?: scalar}
+        labels=None, context_extra=None, daily_context_extra=None, weekly_context_extra=None,
+        event_mask=None, aux_history=None) -> {'logits': [B,H,W], 'loss'?: scalar}
 forward_debug(**batch) -> dict   # 분석·검증 전용
-configure_loss(loss_type, *, rmse_weight=None) -> None
-node_delta_parameters() -> tuple[nn.Parameter, ...]
+configure_loss(loss_type, *, rmse_weight=None, mape_weight=None) -> None
 ```
 
 - `forward`는 HF `Trainer`용으로 `logits`와(라벨이 있으면) `loss`만 반환한다.
 - `forward_debug`는 같은 계산의 전체 결과를 반환한다: `logits`, `prediction`,
-  `prediction_flat`, `neural_pred`, `ir_out`, `lambda_weight`, `attention_weights`,
-  `h_neural`, `h_attn`, `daily_valid`, `weekly_valid`, `loss`, `loss_sum`.
-  검색 pass에서는 `ir_out=None`, `lambda_weight=1`이다.
-- `configure_loss`는 손실을 교체하고 `config.loss_type`(및 `rmse_weight`)을 함께 갱신해
-  체크포인트가 마지막 학습 손실을 기록하게 한다.
-- `node_delta_parameters`는 노드별 ΔW 파라미터를 반환한다(적응 꺼짐이면 빈 튜플,
-  gated면 게이트 logit 포함).
-- `begin_node_adaptation`은 ΔW 학습 시작 직전에 부른다(gated: `V ← W`, `s ← 1`;
-  additive: 아무것도 안 함).
-- `pre_lstm_parameters`는 LSTM 입력을 만드는 파라미터를 반환한다(`stage2.freeze=pre_lstm`용, §8).
+  `prediction_flat`, `attention_weights`, `h_neural`, `h_attn`, `daily_valid`, `weekly_valid`,
+  `loss`, `loss_sum`.
+- `configure_loss`는 손실을 교체하고 `config.loss_type`(및 `rmse_weight`·`mape_weight`)을 함께 갱신해
+  체크포인트가 학습 손실을 기록하게 한다.
 
 <details>
 <summary>조립·손실 집계·초기화 세부</summary>
 
-- 생성 시 검증: `height,width,time_step>0`, `local_radius≥0`, 검색 반지름 ≥0,
-  `fusion_dim,retrieval_k,retrieval_chunk_size>0`, `d_model % transformer_heads == 0`,
-  `weekday_dim,hour_dim>0`, `temperature_min/max`·`precipitation_max`가 있고
-  `temperature_max > temperature_min`, `precipitation_max > 0`,
-  `weather_injection ∈ {concat, cls_add}`, `node_adaptive_mode ∈ {additive, gated}`, `node_adaptive=true`면
-  `node_adaptive_indices` 필수. 값 검사는 파이썬 리스트에서 한다(`from_pretrained`의
+- 생성 시 검증: `height,width,time_step>0`, `local_radius≥0`, `fusion_dim>0`,
+  `d_model % transformer_heads == 0`, `weekday_dim,hour_dim>0`, `temperature_min/max`·
+  `precipitation_max`가 있고 `temperature_max > temperature_min`, `precipitation_max > 0`,
+  `weather_injection ∈ {concat, cls_add}`. 값 검사는 파이썬 값에서 한다(`from_pretrained`의
   meta device 초기화와 호환).
-- 버퍼 `local_history.neighbor_direction`은 persistent로
-  체크포인트에 저장된다. 검색 CPU cache는 저장하지 않는다.
-- 손실 집계: 요소별 손실(`combined`, `mae`, `demand_split`, `mse_mape`)은 전체 원소 평균을 `loss`로,
-  합을 `loss_sum`으로 낸다. `rmse_mape`는 손실 객체가 스칼라를 직접 반환한다.
-- `_init_weights`는 PyTorch 기본 초기화를 유지하고, 체크포인트에서 오지 않은 노드별
-  ΔW만 0으로 채운다. HF 기본 재초기화(std 0.02)는 적용하지 않는다.
+- 버퍼 `local_history.neighbor_direction`은 persistent로 체크포인트에 저장된다.
+- 손실 집계: 요소별 손실(`combined`, `mae`, `demand_split`, `mse_mape`, `node_mix`, `poisson`)은 전체 원소
+  평균을 `loss`로, 합을 `loss_sum`으로 낸다. `rmse_mape`는 손실 객체가 스칼라를 직접 반환한다.
+- `_init_weights`는 아무것도 하지 않는다: PyTorch 기본 초기화를 유지하고 HF 기본 재초기화(std 0.02)를
+  적용하지 않는다.
 
 </details>
 
@@ -426,8 +383,6 @@ attention mask로 표현한다.
 5. 수용 영역은 층마다 넓어진다: `L`층 뒤 노드 출력은 반경 `a·L` 창의 정보를 가진다.
 6. 최종 노드 출력 `[B·N, k, D]`에 `extra`를 브로드캐스트해 붙이고 공유
    `history_lstm (D+E → history_hidden)`의 마지막 hidden을 `h_neural`로 쓴다.
-7. 노드 적응(6.7)이 켜져 있으면 선택된 노드의 hidden만 `W+ΔW` 경로 결과로 덮어쓴다
-   (out-of-place `index_copy`).
 
 </details>
 
@@ -437,7 +392,7 @@ attention mask로 표현한다.
 
 - `valid[b]` = 유효 lag가 하나 이상인지.
 - `periodic_node_embedding_dim = d > 0` (선택, 기본 0): 학습 노드 임베딩 `[N, d]`(N(0, 0.1²) 초기화)를 모든 lag 입력에
-  붙인다(`1+E → 1+E+d`). 공용 주기 LSTM이 stage 1부터 노드 정체성을 본다(노드별 게이트 bias `W_e·e_n`와 같은 효과).
+  붙인다(`1+E → 1+E+d`). 공용 주기 LSTM이 노드 정체성을 본다(노드별 게이트 bias `W_e·e_n`와 같은 효과).
 
 <details>
 <summary>세부</summary>
@@ -469,211 +424,16 @@ attention mask로 표현한다.
 
 </details>
 
-### 6.5 출력 `NeuralRetrievalGate`
+### 6.5 출력 `OutputHead`
 
-`forward(h_attn, ir_out | None, *, bypass_gate=False) → (neural_pred [B,N], lambda [B,N], prediction [B,N])`
+`forward(h_attn [B,N,fusion_dim]) → prediction [B,N]`
 
-- `neural_pred = Softplus(neural_head(h_attn))` (`use_softplus=false`면 raw).
-- 검색 pass(`bypass_gate=True`): `prediction = neural_pred`, `lambda = 1`.
-  `lambda_layer`는 사용하지 않는다.
-- 검색 켬: `λ = σ(lambda_layer([h_attn, ir_out]))`,
-  `prediction = λ·neural_pred + (1−λ)·ir_out`.
+- `prediction = Softplus(neural_head(h_attn))` (`use_softplus=false`면 raw). `neural_head`는 `Linear(fusion_dim→1)`.
 - `prediction`을 `[B,H,W]`로 reshape한 것이 `logits`다.
 
-### 6.6 `CausalRetrieval` (선택 경로)
-
-`forward(demands [B,k,H,W], sample_idx [B]) → ir_out [B,N]`, `use_retrieval=true`일 때만
-생성된다. 학습 파라미터·gradient가 없다.
-
-<details>
-<summary>세부</summary>
-
-- 생성 시 `retrieval_grid_path`의 `[T,H,W]` 격자를 읽어 모든 시점의 이웃 창
-  (`P_r=(2r+1)²`, `r = retrieval_local_radius ?? local_radius`)을 CPU에 만든다.
-- query: 최근 수요에서 노드별 `[k·P_r]` raw 창(격자 밖 0)을 잘라 L2 정규화. 후보 시점 τ의
-  창은 `[τ−k, τ)`.
-- 후보 범위: `τ ∈ [k, end)`, `end = t`(`observed_past`) 또는 `min(t, retrieval_train_end)`
-  (`train_prefix`). 예측 시점과 미래는 후보가 될 수 없다.
-- 코사인 유사도 top-`retrieval_k`를 `retrieval_chunk_size` 단위로 병합하고,
-  softmax(score) 가중으로 각 τ의 수요 `grid[τ]`를 평균한다. 후보가 없으면 0.
-- 결과는 `t`별 CPU cache에 저장해 재사용한다.
-- grid 경로가 없으면 0을 반환한다.
-
-</details>
-
-### 6.7 노드별 LSTM 적응 (`node_adaptive`)
-
-선택된 노드 `A`개에만 `history_lstm` 가중치 offset을 준다.
-
-```text
-W_ih(n) = W_ih + ΔW_ih[n]   ΔW_ih: [A, 4h, D+E]
-W_hh(n) = W_hh + ΔW_hh[n]   ΔW_hh: [A, 4h, h]
-b(n)    = b_ih + b_hh + Δb[n]   Δb: [A, 4h]
-```
-
-- ΔW는 0으로 초기화되므로 학습 전에는 적응이 없는 모델과 같은 함수다.
-- 선택 노드: train 구간 `demand[k:train_end]`의 노드 평균이 `node_adaptive_min_demand`를
-  **초과**하는 노드. 선택이 비면 학습을 중단한다. 목록은 config에 저장되어
-  `from_pretrained`로 복원된다(버퍼로 두지 않는다).
-- `node_adaptive=false`면 ΔW 파라미터가 생성되지 않는다.
-
-**`node_adaptive_mode=gated`** (선택, 기본 `additive`는 위 식): 같은 모양의 `node_delta_*`를
-offset이 아닌 노드 고유 가중치 `V[n]`으로 쓰고, 노드별 스칼라 게이트로 공유 가중치와 섞는다.
-
-```text
-g[n]    = sigmoid(node_delta_gate_logit[n])            gate_logit: [A], 0으로 초기화 (g=0.5)
-W_ih(n) = W_ih + s·(1 − g[n])·(V_ih[n] − W_ih)        s=1이면 g·W_ih + (1−g)·V_ih[n]
-W_hh(n), b(n)도 같은 식 (공유 b = b_ih + b_hh)
-```
-
-- `s`는 persistent 버퍼 `node_delta_started`(0 또는 1)다. 생성 시 0이라 stage 1에서는
-  공유 가중치와 같은 함수다.
-- `begin_node_adaptation()`이 stage 2(또는 joint) 시작 직전에 `V[n] ← W`(현재 공유 가중치)로
-  복사하고 `s ← 1`로 둔다. 그래서 stage 2 시작 시점의 출력은 stage 1과 같다.
-  `additive`에서는 아무것도 하지 않는다.
-- 게이트는 노드당 스칼라 1개로 `ih`·`hh`·bias에 같이 쓴다. 파라미터는 additive보다 `A`개 많다.
-- 채택 stage 1 체크포인트에서 stage 2만 5시드로 비교(대조군 additive): 울산 RMSE +0.12%·MAPE −0.13%,
-  Porto RMSE +0.64%(0/5). `g`는 학습 후에도 0.48~0.50에 머물렀다(초기 `V=W`라 logit 기울기가 0에서
-  시작하고, 공용 lr 1e-4로는 logit이 거의 움직이지 않음). 채택하지 않았다.
-
-**`node_adaptive_mode=basis`** (선택): 노드마다 독립인 full-rank ΔW 대신 노드가 공유하는 `M`개 기저의
-선형 결합으로 ΔW를 만든다(노드 사이 통계 공유, 자유도 `A·4h·(F+h+1)` → `M·4h·(F+h+1) + A·M`).
-
-```text
-c[n]     = C[n] (+ φ[n]·W_φ, node_delta_descriptor=true)    C: [A, M], W_φ: [F_φ, M]
-ΔW_ih[n] = Σ_m c[n,m]·B_ih[m]     B_ih: [M, 4h, D+E]
-ΔW_hh[n], Δb[n]도 같은 식          B_hh: [M, 4h, h], B_b: [M, 4h]
-W_ih(n)  = W_ih + ΔW_ih[n]        (W_hh, b도 additive와 같은 식)
-```
-
-- `M = node_delta_rank`(기본 8). 모든 `node_delta_*`는 생성 시 0이라 stage 1은 공유 LSTM과 같은 함수다
-  (`stage2.init_from`의 "저장 ΔW = 0" 검사도 그대로).
-- `begin_node_adaptation()`이 `C ~ N(0, 1/(2M))`, `W_φ ~ N(0, 1/(2M·F_φ))`(descriptor 없으면 `C ~ N(0, 1/M)`)로
-  채우고 `B`는 0으로 둔다(LoRA식: 시작 출력 불변, 첫 기울기는 `B`로). 난수는 학습 seed를 따른다.
-- 노드 기술자 `φ[n]` (`node_delta_descriptor=true`, train.py가 `train` 구간 `demand[k:train_end]`에서 계산해
-  `node_descriptors [A, F_φ]`로 config에 저장): 시각별(24)·요일별(7, 시작일 기준 상대 요일) 평균 수요 / 노드 평균,
-  `log1p` 평균, 0 비율, 변동계수 = 34차원. 차원마다 적응 노드 사이에서 표준화한다.
-  수요 패턴이 비슷한 노드가 비슷한 ΔW 방향에서 시작하고 같이 움직이게 한다.
-- 울산 채택 stage 1 체크포인트에서 stage 2만 3시드(245/6835/851) 비교, 대조군 additive(채택과 동일 재현):
-  test RMSE / MAPE (ADFormer 8h 같은 시드 대비) additive −2.45% / −2.42%, basis M=8 −2.28% / −2.53%,
-  +기술자 −2.26% / −2.58%, +기술자·전체 168노드 −2.27% / −2.56%. ΔW 파라미터는 2.21M → 0.20M으로 줄었지만
-  RMSE↔MAPE 교환선 위에서만 움직였다(두 지표 동시 개선 없음).
-
-**`node_delta_dynamic`** (basis 전용, 기본 false): history ΔW 계수를 샘플·노드마다 조절한다(정적 노드 ΔW → 상황별 ΔW).
-
-```text
-c[b,n,m] = c[n,m] · (1 + tanh(x_last[b,n]·W_dyn)[m])      W_dyn: [D+E, M], 0으로 생성·begin 후에도 0
-x·W(b,n)ᵀ = x·Wᵀ + Σ_m c[b,n,m]·(x·B_ihᵀ[m] + B_b[m])     (활성값 공간에서 계산, 가중치 [B,A,4h,F]를 만들지 않음)
-```
-
-- `x_last[b,n]`은 노드 `n`의 LSTM 마지막 입력(Transformer 토큰 + 시각·날씨 context). `W_dyn=0`이면 정적 basis와 같다.
-
-**`node_adaptive_mode=moe`** (선택): 노드마다 따로 두던 ΔW를 공유 전문가(expert) `K`개로 바꾸고, 노드별 router가 전문가를
-섞는다. 특화 연산은 전문가로 공유하고, 노드마다 어떤 특화를 얼마나 쓸지만 따로 둔다.
-
-```text
-expert k:  LSTM_k = LSTM(W + ΔW_k)          ΔW_k = (ΔW_ih[k], ΔW_hh[k], Δb[k]),  K = node_moe_experts
-router:    z[b,n,k] = R[n,k] (+ x̄[b,n]·W_r[:,k], node_moe_router=dynamic)       R: [A,K], W_r: [F,K]
-           g[b,n] = softmax(z[b,n]) (node_moe_top_k = t > 0이면 상위 t개 밖은 −∞)
-출력:      h[b,n] = Σ_k g[b,n,k]·LSTM_k(x[b,n])     (전문가 출력의 혼합, 모든 시점)
-```
-
-- `x̄[b,n]`은 노드 `n`의 LSTM 입력 시퀀스 시간 평균이다(시점별 router 없음, 한 샘플·노드에 게이트 하나).
-- 모든 `node_delta_*`(ΔW_k, R, W_r)는 0으로 생성되어 stage 1은 공유 LSTM과 같다. `begin_node_adaptation()`이
-  `R`과 `W_r`를 채운다. 이때 전문가가 모두 같아(ΔW_k=0) 출력은 바뀌지 않고, 노드마다 다른 게이트로 기울기가
-  전문가에 다르게 나뉘어 전문가가 갈라진다(대칭 깨기).
-  - `node_moe_router_init=random`: `R ~ N(0, 1)`. `cluster`: train.py가 train 구간 노드 기술자(§6.7 basis와 같은 34차원)를
-    k-means(K개, k-means++, 학습 seed)로 묶어 `node_moe_assign [A]`로 config에 저장하고, `R[n, assign[n]] = 2`, 나머지 0
-    (자기 군집 전문가 게이트 ≈ e²/(e²+K−1)). 수요 패턴이 비슷한 노드가 같은 전문가를 공유하며 시작한다.
-  - `dynamic`이면 `W_r ~ N(0, 1/F)` (커밋 `1cab648`에서는 0으로 시작해 학습 중에도 거의 움직이지 않았다).
-- 전문가는 공유 `nn.LSTM`의 가중치에 ΔW_k를 더해 cuDNN LSTM(`torch._VF.lstm`)으로 선택 노드 전체를 한 번에 돈다.
-- `node_adaptive_scope`의 `history`·`periodic`에 같은 식으로 쓴다(위치마다 전문가·router가 따로 있다, 배정은 공유).
-- 부하 균형 손실은 두지 않는다(dense softmax 기본, `gumbel`도 마찬가지).
-- `node_moe_residual=true`: 공유 전문가 위에 노드 고유 ΔW_n(additive와 같은 모양)을 더한다. 전문가 k의 노드 n 가중치는
-  `W + ΔW_k + ΔW_n`이고 노드별 가중치라 cuDNN 대신 `run_node_lstm`으로 전문가마다 돈다. 공유 특화(전문가)와
-  노드 고유 특화(ΔW_n)를 함께 둔다.
-
-**`node_moe_routing=gumbel`** (sparse MoE, 기본 `soft`): 노드마다 전문가 **하나**만 쓴다. router는 `static`만 허용
-(`node_moe_router=static`, `node_moe_top_k=0`). 이산 선택은 미분이 안 되므로 router를 범주형 분포로 두고
-재매개변수화(reparameterization) 표본으로 기울기를 흘린다(straight-through Gumbel-softmax).
-
-```text
-p[n]      = softmax(R[n])                                  노드 n의 전문가 분포 (미분 가능)
-학습:      ε[b,n,k] ~ Gumbel(0,1) (= −log(−log U), U ~ Uniform(0,1))   샘플·노드마다 새로 뽑음
-           s[b,n]   = softmax((R[n] + ε[b,n]) / τ)          τ = node_moe_tau
-           y[b,n]   = onehot(argmax s[b,n]) − stop_grad(s[b,n]) + s[b,n]
-           (순전파 값은 one-hot = 표본 전문가 하나, 역전파는 s를 통해 R로 기울기)
-추론:      y[b,n]   = onehot(argmax R[n])                   표본 없이 확률이 가장 큰 전문가
-출력:      h[b,n]   = Σ_k y[b,n,k]·LSTM_k(x[b,n])           순전파에서는 선택된 전문가 하나의 출력
-```
-
-- `argmax(R + ε)`는 `p`에서 뽑은 표본과 분포가 같다(Gumbel-max). 노이즈 `ε`가 파라미터 밖에 있어 표본이 `R`의 미분 가능한
-  함수가 된다(diffusion의 `x = μ + σ·ε`와 같은 방식).
-- straight-through에서 `R`의 기울기는 `s`를 거치므로 전문가 출력이 모두 필요하다. 그래서 학습·추론 모두 전문가 K개를 다
-  계산하고 one-hot으로 고른다(계산량은 soft와 같고, 예측에 쓰이는 전문가는 하나).
-- 울산 3시드(k-means 배정, history+periodic), test RMSE / MAPE(ADFormer 대비), val RMSE / MAPE:
-  stage 2만 K=4 −2.33% / −2.62% (0.7388 / 15.29), K=8 −2.31% / −2.61% (0.7388 / 15.30);
-  `joint_two_stage` K=4 −2.53% / −1.75% (0.7378 / 15.38), K=8 −2.50% / −1.54% (0.7377 / 15.41).
-  stage 2만이면 soft(−2.40% / −2.46%)보다 MAPE가 조금 낫고 RMSE가 조금 나쁘며, 처음부터 켜면 soft와 같이 RMSE 쪽으로
-  간다. 노드별 ΔW(−2.39% / −2.78%)를 넘지 못했다.
-- router 표 `R`는 거의 움직이지 않았다: 학습 뒤 `argmax R`가 k-means 초기 배정과 모든 노드에서 같고, softmax 최대 확률은
-  초기값(K=8 0.513)에서 0.49~0.54. straight-through 기울기가 표본마다 방향이 달라 쌓이지 않는다(추정). 사실상
-  "k-means 묶음별 전문가 + 학습 중 확률적 배정"으로 동작했다.
-
-**`node_adaptive_scope`** (기본 `[history]`): ΔW를 넣을 위치. 같은 선택 노드·`node_adaptive_mode`(additive|basis|moe)를 쓴다.
-
-- `history`: 위의 최근 이력 `history_lstm`.
-- `periodic`: 일·주 주기 `PeriodicLSTMEncoder.lstm`마다 `NodeLSTMDelta`(같은 식, basis는 기술자 없이 `C ~ N(0, 1/M)`).
-  주기 branch는 노드 정체성 입력이 없어(노드 공용 LSTM) 노드별 주기 반응을 따로 배울 수 없었다.
-- `head`: 출력 `neural_head`에 `raw[n] += h_attn[n]·Δw[n] + Δb[n]` (`Δw: [A, fusion_dim]`, `Δb: [A]`).
-- `fusion`: `BranchAttention`에 노드별 query offset `Δq[n]` (`[A, fusion_dim]`, branch 선호)과 branch token별 value
-  offset `Δv[n, branch]` (`[A, 3, fusion_dim]`)를 더한다.
-- 모든 위치의 ΔW는 0으로 생성되고 stage 1에서 고정, stage 2에서 학습한다(위 규칙과 같음).
-
-**울산 ΔW 실험 결과** (채택 stage 1 체크포인트에서 stage 2만, 같은 시드 ADFormer 8h 대비 test RMSE / MAPE):
-
-| ΔW 설정 | 3시드 (245/6835/851) | 5시드 |
-|---|---|---|
-| additive, history (채택, 대조군) | −2.45% / −2.42% | −2.29% / −2.39% |
-| basis M=8 / +기술자 / +기술자·전체 노드 | −2.28% / −2.53%, −2.26% / −2.58%, −2.27% / −2.56% | |
-| basis + dynamic (history, history+periodic) | −2.28% / −2.52%, −2.28% / −2.53% | |
-| history+head | −2.44% / −2.43% | |
-| history+fusion | −2.45% / −2.43% | |
-| **history+periodic** | −2.39% / −2.78% | **−2.28% / −2.66%** (대조군 대비 MAPE 5/5·MAE 5/5·RMSE 4/5 개선) |
-| history+periodic+head / +fusion | −2.48% / −2.44%, −2.39% / −2.78% | |
-| history+periodic, ΔW만 학습(공유 고정) lr 1e-3 | −2.48% / −2.55% (best epoch 2) | |
-| joint(처음부터) basis history+periodic | −1.95% / +0.03% | |
-| MoE K=4 (static·dynamic, random·k-means 배정, 전체 노드), history+periodic | −2.39~−2.40% / −2.46~−2.48% (val 0.7386 / 15.31) | |
-| MoE K=8 top-2 / K=16 k-means, history+periodic | −2.26% / −2.59%, −2.39% / −2.48% | |
-| MoE K=4 k-means + 노드 잔차 ΔW_n, history+periodic | −2.41% / −2.50% (val 0.7372 / 15.31) | |
-
-- MoE(§6.7 `moe`)는 공유 전문가만으로는 노드별 ΔW(−2.39% / −2.78%, val 0.7377 / 15.27)보다 val·test MAPE가 나빴다.
-  설정과 무관하게 거의 같은 값이고 시드 245·851은 best epoch 1(stage 1 직후와 거의 같음). train 손실도 노드별 ΔW보다
-  덜 내려가고(10 epoch 0.864 vs 0.836), ΔW를 0으로 바꿨을 때 예측 변화가 0.005로 노드별 ΔW(0.013)의 절반 이하다.
-  router는 k-means 배정으로 시작하면 노드 수요 수준과 상관 ±0.4~0.6인 배정을 유지하고 dynamic이면 샘플별로도
-  움직이지만(게이트 표준편차 0.05~0.13), 그 공유 특화가 val 이득으로 이어지지 않았다. 노드 잔차를 더하면 val RMSE는
-  가장 낮지만(0.7372) val·test MAPE는 노드별 ΔW보다 나쁘다. 채택은 노드별 ΔW(additive) 유지.
-
-- ΔW의 예측 기여는 작다: 채택 체크포인트에서 ΔW만 0으로 바꾸면 test 예측이 평균 0.01(수요 평균 0.47) 바뀌고
-  RMSE 0.1% 차이. lr을 10배로 올려 ΔW만 학습해도 val 최적이 2 epoch이고 그 뒤 val이 나빠진다 → 용량·학습량이 아니라
-  노드 고유 신호가 작은 것이 한계. Poisson NLL로 학습한 비편향 μ의 잔차에서 val로 추정한 노드×시각 편향을
-  test에 더해도 RMSE −0.2% 이하.
-- Porto(채택 stage 1, 3시드) history+periodic: 대조군 대비 RMSE −0.06%·MAPE −0.07%로 방향은 같지만 잡음 수준이라
-  Porto 기본값은 `[history]` 유지.
-- 주기 LSTM에 노드 임베딩을 stage 1부터 넣어도(`periodic_node_embedding_dim=8`, §6.3, + history+periodic ΔW, 3시드)
-  −2.46% / −2.63%로 stage 2 periodic ΔW(−2.39% / −2.78%)와 같은 수준.
-- 같은 stage 1에서 ΔW 변형 4개를 평균해도 −2.47% / −2.60%(단일 −2.45% / −2.39%)로 앙상블 이득이 거의 없다.
-
-<details>
-<summary>세부</summary>
-
-- 선택 노드는 LSTM 셀(i, f, g, o 순서)을 직접 반복 계산한다. 입력 투영
-  `x·W_ih(n)ᵀ + b(n)`은 전 시점을 한 번에 계산한다.
-- 비선택 노드는 공유 `nn.LSTM`(cuDNN) 결과를 그대로 쓴다.
-- ΔW=0(additive)·`s=0`(gated)일 때 두 경로의 일치와, gated에서 `begin_node_adaptation()`
-  직후 출력 불변은 `validate_merged.py`가 검사한다.
-
-</details>
+> 노드별 가중치 적응(ΔW, gated·basis·MoE 변형 포함, 2-stage 학습)과 인과 검색기(`CausalRetrieval`·검색 gate)는
+> 커밋 `eb92db5`까지 있었고 제거했다. ΔW는 파라미터가 공유 모델의 약 14~35배(울산 594만 / 17만)인데 울산 효과는
+> RMSE·MAPE 0.1~0.3% 수준이었고, 검색기는 채택 설정에서 쓰지 않았다. 실험 기록은 Notion 기록 페이지에 있다.
 
 ---
 
@@ -688,11 +448,11 @@ p[n]      = softmax(R[n])                                  노드 n의 전문가
 | `combined` | `d² + γ·(d/(y_true+ε))²` (`γ=loss_gamma`, `ε=loss_eps`) |
 | `rmse_mape` | `rmse_weight·RMSE + MAPE(+1)` |
 | `demand_split` | `y ≤ split_threshold`: `|d|/(|y|+1)`, 그 외: `split_high_weight·d²` |
-| `mse_mape` | `d² + mape_weight·|d|/(|y|+1)` (제곱항은 평균 쪽, 상대항은 저수요 칸을 0 쪽으로; stage 2는 `stage2.mape_weight`) |
+| `mse_mape` | `d² + mape_weight·|d|/(|y|+1)` (제곱항은 평균 쪽, 상대항은 저수요 칸을 0 쪽으로) |
 | `node_mix` | 노드 `n`마다 `r_n·[λ_n·|d|/((|y|+1)·B_n) + (1−λ_n)·d²/(2A_n)]` (아래) |
 | `poisson` | `ŷ − y·ln(ŷ + 1e−6)` (Poisson NLL). 출력 `ŷ`는 평균 수요 μ다(점 예측 = μ) |
 
-**`poisson` 실험 (울산, stage 1·2, 3시드)** — 표현은 likelihood로 배우고 점 예측은 평가 목적으로 따로 정할 수 있는지 확인했다.
+**`poisson` 실험 (울산, 3시드, 당시 2-stage 학습)** — 표현은 likelihood로 배우고 점 예측은 평가 목적으로 따로 정할 수 있는지 확인했다.
 
 - μ 그대로: test RMSE −5.39% / MAPE +32.9% (ADFormer 8h 대비). μ의 test MSE(0.477)가 평균 μ(0.481)와 같아
   잔차가 Poisson 잡음 수준이다.
@@ -716,7 +476,7 @@ p[n]      = softmax(R[n])                                  노드 n의 전문가
   `r_n=1`, 정규화 없이 `λ_n·|d|/(|y|+1) + (1−λ_n)·d²`(대조군).
 - `λ_n`, `1/B_n`, `1/(2A_n)`, `r_n`은 train.py가 train 구간에서 계산해 config(`node_mix_lambda`,
   `node_mix_mape_scale`, `node_mix_mse_scale`, `node_mix_weight`, 길이 N)에 넣는다. 손실 텐서는 비영속 버퍼다.
-- 울산 3시드(stage 1·2, ADF 8h 대비 RMSE / MAPE): (λ_lo, λ_hi) = (0.9, 0.1) −3.70% / +4.62%, (0.95, 0.2)
+- 울산 3시드(당시 2-stage 학습, ADF 8h 대비 RMSE / MAPE): (λ_lo, λ_hi) = (0.9, 0.1) −3.70% / +4.62%, (0.95, 0.2)
   −3.03% / +0.65%, (0.97, 0.35) −2.02% / −3.62%, (0.98, 0.5) −0.21% / −7.59%. 같은 MAPE에서 `mse_mape` 경계보다
   RMSE가 약 0.1%p 낫거나 같아(시드 편차 수준) 채택하지 않았다. scaler를 끄면((0.9, 0.1)) −3.94% / +8.72%.
 
@@ -748,65 +508,30 @@ python train.py --config-name config_<city> "description='실험 설명'" \
   ```
 
 1. 세 split의 `UnifiedDemandDataset`을 만든다.
-2. train 구간에서 날씨 통계와 적응 노드를 계산해 `MergedDemandConfig`에 주입하고,
-   seed 고정 후 모델을 만든다.
-3. `node_adaptive=true`면 **2-stage**, 아니면 단일 stage로 학습한다.
-4. 선택된 최종 모델을 `hydra.run.dir`에 저장하고 test split을 평가한다.
+2. train 구간에서 날씨 통계(`node_mix`면 노드별 손실 벡터, `functional_neighbor_k>0`이면 기능적 이웃도)를 계산해
+   `MergedDemandConfig`에 주입하고, seed 고정 후 모델을 만든다.
+3. 한 번의 Trainer로 학습한다(`train.learning_rate`, `model.loss_type`). 검증 `eval_loss` 기준 최적 epoch의
+   가중치를 `load_best_model_at_end`로 불러온다.
+4. 선택된 모델을 `hydra.run.dir`에 저장하고 test split을 평가한다.
 5. 결과 JSON을 쓴다.
-
-| stage | 학습 대상 | LR | 손실 | 저장 위치 |
-|---|---|---|---|---|
-| 1 | ΔW 제외 전부 (ΔW=0 고정) | `train.learning_rate` | `model.loss_type` | `<run>/stage1` |
-| 2 | 전부 (ΔW 해제). `stage2.freeze`로 일부 고정 가능 | `stage2.learning_rate` | `stage2.loss` | `<run>/stage2` |
-
-각 stage는 새 Trainer·optimizer·scheduler로 시작하고, 검증 기준 최적 epoch의 가중치를
-`load_best_model_at_end`로 불러온다. 선택 기준은 `eval_loss`이며, `rmse_mape`는 전체
-검증 예측으로 계산한 `rmse_weight·RMSE + MAPE(+1)`이다.
 
 <details>
 <summary>스케줄·조기 종료·재개·출력 세부</summary>
 
 - **LR 스케줄** (`optimizer_schedule.name=warmup_cosine`): epoch 단위.
-  `warmup_epochs` 동안 `warmup_lr_init → stage LR` 선형, 이후 `cosine_epochs` 동안
+  `warmup_epochs` 동안 `warmup_lr_init → train.learning_rate` 선형, 이후 `cosine_epochs` 동안
   `eta_min`까지 cosine, 그 뒤 `eta_min` 유지. 알 수 없는 이름은 오류, 이름이 없으면
   HF 기본 스케줄러.
 - **조기 종료**: `min_epochs` 이전 평가는 무시하고 이후 `early_stopping_patience`
   epoch 동안 개선이 없으면 멈춘다.
 - **SDPA 배치 제한**: `attention_dropout>0`일 때만 batch를
   `max(1, 65535 // (k·H·W))`로 제한한다.
-- **`stage2.init_from`** (적응 켬 전용): 저장된 stage 1 체크포인트에서 가중치만 이어받고
-  stage 1을 건너뛴다. 저장·요청 config는 적응 노드 관련 필드와 메타데이터 외에 같아야
-  하고, 저장된 ΔW는 모두 0이어야 한다. ΔW는 새 노드 목록으로 0부터 다시 만든다.
-  optimizer·scheduler·step은 복원하지 않는다.
-  stage 1 체크포인트는 `<run>/stage1/checkpoint-<step>`(stage 1 best epoch)이다.
-- **`stage2.freeze`** (기본 `none`): stage 2에서 고정할 범위.
-  - `shared`: ΔW를 제외한 공유 가중치를 모두 고정(ΔW만 학습). 채택 모델 stage 1에서 5시드로 비교한
-    결과 울산 RMSE·MAE −0.1%(4/5), Porto는 차이 없음.
-  - `pre_lstm`: LSTM 입력을 만드는 부분(`MergedDemandModel.pre_lstm_parameters()`: `local_history`의
-    scalar/node embedding·sink·direction bias·Transformer·functional/weather projection, `snow_scale`,
-    weekday/hour embedding)을 고정한다. `history_lstm`·ΔW·daily/weekly LSTM·`branch_attention`·
-    `output_gate`는 학습한다. 고정 부분도 train 모드(dropout 켬)로 돈다. 채택 stage 1에서 5시드 비교 결과
-    대조군(`none`) 대비 울산 RMSE −0.03%·MAPE +0.12%, Porto RMSE +0.15%·MAPE −0.25%로 차이 없음.
-  - `delta`: ΔW를 0으로 고정하고 공유 가중치만 stage 2 설정(lr·손실)으로 미세조정한다(`additive`·`basis` 전용, ΔW=0이면
-    노드 적응 없는 모델과 같은 함수). stage 2 개선 중 ΔW 몫과 단순 추가 미세조정 몫을 나누는 대조군이다.
-- **`node_adaptive_schedule`** (기본 `two_stage`): `joint`면 stage를 나누지 않고 처음부터 ΔW를 포함해
-  `train.learning_rate`·`model.loss_type`으로 한 번에 학습한다(`stage2.*` 무시, `init_from` 금지).
-  채택 설정 3시드 비교에서 ΔW가 초반부터 train에 과적합해(best epoch 7~12, 이후 val 상승)
-  울산 MAE +1.8%·MAPE +1.7%, Porto RMSE +6.3%·MAE +2.6%로 2-stage보다 나빴다.
-  `joint_two_stage`면 stage 1부터 ΔW를 포함해 학습하고(`begin_node_adaptation()`은 stage 1 직전 한 번), 이어서
-  stage 2를 그대로 돈다(`init_from` 금지). 학습 순서와 Trainer 설정은 `two_stage`와 같고 ΔW 고정 여부만 다르다.
-  울산 MoE(k-means 배정, dynamic router, history+periodic) 3시드, test RMSE / MAPE(ADFormer 대비), val RMSE / MAPE:
-  `joint` K=4 −2.35% / −1.28% (0.7393 / 15.44), K=8 −2.38% / −1.86% (0.7395 / 15.36);
-  `joint_two_stage` K=4 −2.42% / −1.66% (0.7383 / 15.39), K=8 −2.60% / −1.57% (0.7369 / 15.40).
-  노드별 ΔW 2단계(채택, −2.39% / −2.78%, 0.7377 / 15.27) 대비 MAPE가 1%p 이상 나쁘다. K=8 `joint_two_stage`는
-  val·test RMSE가 가장 낮지만 같은 손실의 λ 교환선(λ=1.75 −2.81% / −0.91%, λ=2 −2.45% / −2.42%) 위의 RMSE 쪽 점과
-  비슷해 교환선을 넘지는 못했다. stage 1부터 MoE를 켜면 stage 1 test MAPE부터 나쁘다(15.30~15.39, ΔW 고정 stage 1 15.21).
 - **`limit_samples`**: 각 split 앞쪽 N개만 쓰는 스모크용.
 - **결과 JSON**: `run_json`이 있으면 그 경로, 없으면
-  `output/<project_name>/runs/<city>_<loss_type>_<ablation>[_nodeadaptive]_seed<seed>.json`.
-  데이터 경로, 날씨 정규화 통계(`weather_stats`), 장치, 목적함수·stage 손실, ablation 라벨과 스위치 값, seed,
-  적응 노드 정보, stage별 기록, 최적 epoch·검증 손실, 체크포인트 경로, test 지표
-  (`loss`, `mae`, `rmse`, `mape_plus1`, `mape_excl_zero`), epoch별 history를 담는다.
+  `output/<project_name>/runs/<city>_<loss_type>_<ablation>_seed<seed>.json`.
+  데이터 경로, 날씨 정규화 통계(`weather_stats`), 장치, 목적함수, ablation 라벨과 스위치 값, seed,
+  최적 epoch·검증 손실, 체크포인트 경로, test 지표(`loss`, `mae`, `rmse`, `mape_plus1`, `mape_excl_zero`),
+  epoch별 history를 담는다.
 
 </details>
 
@@ -837,10 +562,7 @@ python test.py <checkpoint_dir> --city {ulsan,porto} --weather_csv_path <csv> \
   end-to-end gradient 연결, 날씨 민감도, label·lag가 절대 시간 격자와 일치.
 - 주기 lag가 모두 무효일 때 neural 후보로 대체.
 - 날씨·캘린더 채널이 lag 압축 뒤에도 유지되고 기준 LSTM과 일치.
-- ΔW=0 적응 경로가 `nn.LSTM`과 일치하고 비적응 노드는 비트 단위 동일.
-- 검색 후보가 `τ < t`만 사용.
-- Transformer 3×3에서 검색 창 3×3·5×5 선택이 forward에 반영.
-- 검색 pass: grid 없이 생성·예측·체크포인트 복원, `prediction = neural_pred`, `λ=1`.
+- `save_pretrained` → `from_pretrained` 복원 후 예측 동일.
 - masked Transformer 수용 영역: 1층은 반경 1, 2층은 반경 2 밖 수요에 무반응(eval·no_grad).
 
 </details>
@@ -856,8 +578,8 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
 
 | 스크립트 | 동작 | 출력 |
 |---|---|---|
-| `DESCRIPTION=... run_seeds.sh <city> <loss> [seeds]` | 기본 5시드 `245 6835 851 5123 535`, 검색 켬(`model.use_retrieval=true`) | `output/merged/runs/<city>_<loss>_seed<seed>.json`, `output/merged/logs/` |
-| `run_ablation.sh build` / `DESCRIPTION=... run_ablation.sh worker <gpu> <slot>` | 3시드 `245 6835 851`, ablation 큐. `no-ir` 외에는 검색 켬 기준. description에 ablation·도시·시드를 덧붙임 | `output/merged/runs/<city>_mae_<ab>_zero_seed<seed>.json` |
+| `DESCRIPTION=... run_seeds.sh <city> <loss> [seeds]` | 기본 5시드 `245 6835 851 5123 535` | `output/merged/runs/<city>_<loss>_seed<seed>.json`, `output/merged/logs/` |
+| `run_ablation.sh build` / `DESCRIPTION=... run_ablation.sh worker <gpu> <slot>` | 3시드 `245 6835 851`, ablation 큐. description에 ablation·도시·시드를 덧붙임 | `output/merged/runs/<city>_mae_<ab>_zero_seed<seed>.json` |
 
 - `output`은 외장 디스크 `/mnt/hdd/jinsu_extention_disk/gir`을 가리키는 symlink이며
   git 추적 대상이 아니다.
@@ -866,17 +588,18 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
   있다(시드별 CSV, 노드별 지표 `regional_metrics/`). 수치는 `docs/ADFORMER_REFERENCE.md`.
 - **채택 모델**은 `output/adopted/`에 둔다: 결과 JSON은 `runs/`, 체크포인트·학습 로그·GPU 사용률
   기록은 `checkpoints/`의 같은 이름 폴더. 현재 채택 모델은 날씨 2채널(기온, 강수 + g·적설,
-  min-max), `local_radius=1`(3×3), 검색 pass, **입력 시간 창 8시간**, 5시드(245/6835/851/5123/535)다.
-  - 울산: 손실 `mse_mape`(λ=2, stage 1·2) + ΔW 위치 `[history, periodic]`, `dwper_ulsan_seed{seed}_0f4a9b2`
-    (stage 1은 `msemape2_ulsan_seed{seed}_471594f/stage1`을 `stage2.init_from`으로 이어받음 — 이 폴더는 stage 1
-    원본이라 그대로 둔다). ADFormer 8h 대비 RMSE 0.7124(−2.28%), MAE 0.3186(−1.99%), MAPE 15.177(−2.66%);
-    직전 채택(ΔW history만, `msemape2_*`, RMSE −2.29%·MAPE −2.39%) 대비 MAPE 5/5·MAE 5/5·RMSE 4/5 시드 개선.
-    MAE 손실은 중앙값을 예측해 평균 대비 23% 과소예측하고 RMSE가 막혔다(이전 울산 채택 `timestep8_ulsan_*`는
-    `output/past/adopted_ulsan_mae_d02824a/`).
-  - Porto: 손실 `mse_mape`(λ=6, stage 1·2), `msemape6_porto_seed{seed}_0769f0c`. ADFormer 8h 대비
-    RMSE 1.5846(−9.67%), MAPE 14.364(−8.89%). λ는 3시드 val로 골랐다(λ=2·4·6·8·12 중 val RMSE가 최저 근처
+  min-max), `local_radius=1`(3×3), **입력 시간 창 8시간**, 단일 stage 학습, 5시드(245/6835/851/5123/535)다.
+  ΔW 제거 뒤의 채택 모델은 ΔW 시절 채택 실행의 stage 1 체크포인트(ΔW=0, 같은 함수)를 현재 코드 형식으로 바꿔 저장한
+  것이다(키 `output_gate.neural_head.*` → `output_head.neural_head.*`, ΔW·검색 gate 키 제거).
+  - 울산: 손실 `mse_mape`(λ=2), `msemape2s1_ulsan_seed{seed}_471594f`. ADFormer 8h 대비 RMSE 0.7141(−2.05%),
+    MAE 0.3193(−1.77%), MAPE 15.206(−2.47%). MAE 손실은 중앙값을 예측해 평균 대비 23% 과소예측하고 RMSE가
+    막혔다(이전 울산 채택 `timestep8_ulsan_*`는 `output/past/adopted_ulsan_mae_d02824a/`).
+  - Porto: 손실 `mse_mape`(λ=6), `msemape6s1_porto_seed{seed}_0769f0c`. ADFormer 8h 대비 RMSE 1.6115(−8.13%),
+    MAE 0.4866(−2.24%), MAPE 14.353(−8.97%). λ는 3시드 val로 골랐다(λ=2·4·6·8·12 중 val RMSE가 최저 근처
     (+0.4%)이면서 val MAPE가 가장 낮은 6). 이전 Porto 채택(MAE, `timestep8_porto_*`, RMSE −5.85%·MAPE −3.94%)은
     `output/past/adopted_porto_mae_d02824a/`.
+  - ΔW를 쓰던 직전 채택(울산 `dwper_ulsan_*` RMSE −2.28%·MAPE −2.66%, `msemape2_ulsan_*`, Porto `msemape6_porto_*`
+    RMSE −9.67%·MAPE −8.89%)은 `output/past/adopted_deltaw_eb92db5/`에 있고 커밋 `eb92db5`의 코드로만 불러올 수 있다.
 - 이전 채택 모델:
   - 커밋 `8d28250`, 입력 창 24시간, 시드 245 `weathermerge_{ulsan,porto}_seed245_8d28250`:
     `output/past/adopted_8d28250/`. 현재 코드로 불러올 수 있다(`test.py`는 체크포인트의
@@ -886,8 +609,8 @@ RMSE·MAE·MAPE(+1)를 기준선·변형·차이 지도로 그려 `--out` 경로
 - **후보 모델**(나중에 다시 볼 실험)은 `output/candidate/`에 둔다(`runs/`, `checkpoints/` 구조는 채택 모델과 같다):
   - `center_nzTauLearn1_ulsan_seed245_k5_d84854f` (울산 시드 245): 검색 top-5, 노드 label
     `sigmoid(a·s+b)·Embedding(bucket)` 합 C를 `(1−w)·C + w·O`(`w = e^{−m/τ}`, m = 질의의 0 아닌 칸 수,
-    τ 학습)로 섞어 `h_neural`에 concat. 채택 모델 대비 RMSE +0.37%, MAE −0.07%, MAPE −1.12%.
-    커밋 `d84854f`의 코드로만 불러올 수 있다(현재 코드는 이 융합을 되돌렸다).
+    τ 학습)로 섞어 `h_neural`에 concat. 당시 채택 모델 대비 RMSE +0.37%, MAE −0.07%, MAPE −1.12%.
+    커밋 `d84854f`의 코드로만 불러올 수 있다.
 
 ---
 
