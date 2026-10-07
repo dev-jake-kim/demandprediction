@@ -112,6 +112,8 @@ class MergedDemandModel(PreTrainedModel):
             node_moe_top_k=getattr(config, 'node_moe_top_k', 0),
             node_moe_assign=getattr(config, 'node_moe_assign', None),
             node_moe_residual=getattr(config, 'node_moe_residual', False),
+            node_moe_routing=getattr(config, 'node_moe_routing', 'soft'),
+            node_moe_tau=getattr(config, 'node_moe_tau', 1.0),
         )
 
         self.snow_scale = nn.Parameter(torch.tensor(1.0))

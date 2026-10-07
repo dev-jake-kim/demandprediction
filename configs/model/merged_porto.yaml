@@ -64,6 +64,10 @@ node_moe_top_k: 0
 node_moe_router_init: random
 # moe에서 공유 전문가 위에 노드 고유 ΔW_n도 더함(W + ΔW_k + ΔW_n)
 node_moe_residual: false
+# moe 라우팅: soft(전문가 softmax 혼합) | gumbel(sparse, 노드별 전문가 하나: 학습은 straight-through Gumbel 표본, 추론은 argmax; static router만)
+node_moe_routing: soft
+# gumbel 표본 softmax 온도 τ
+node_moe_tau: 1.0
 # 일·주 주기 LSTM 입력에 붙이는 학습 노드 임베딩 차원(0이면 끔). 주기 branch에 노드 정체성을 준다.
 periodic_node_embedding_dim: 0
 

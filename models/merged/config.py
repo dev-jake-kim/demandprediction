@@ -77,6 +77,8 @@ class MergedDemandConfig(PretrainedConfig):
         node_moe_router_init: str = 'random',
         node_moe_assign: list[int] | None = None,
         node_moe_residual: bool = False,
+        node_moe_routing: str = 'soft',
+        node_moe_tau: float = 1.0,
         loss_type: str = 'combined',
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
@@ -176,6 +178,9 @@ class MergedDemandConfig(PretrainedConfig):
         self.node_moe_assign = node_moe_assign
         # 공유 전문가 위에 노드 고유 ΔW_n을 더함(전문가 k의 노드 n 가중치 = W + ΔW_k + ΔW_n).
         self.node_moe_residual = node_moe_residual
+        # soft: 전문가 softmax 혼합 | gumbel: 노드별 전문가 하나(학습 straight-through Gumbel 표본, 추론 argmax), τ = node_moe_tau.
+        self.node_moe_routing = node_moe_routing
+        self.node_moe_tau = node_moe_tau
         # configure_loss가 stage마다 갱신한다(체크포인트가 마지막 학습 손실을 기록).
         self.loss_type = loss_type
         self.loss_gamma = loss_gamma

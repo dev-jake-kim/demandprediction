@@ -529,6 +529,43 @@ def _check_node_adaptive_identity() -> dict:
     if zero_gap > 1e-5 or residual_gap > 1e-5:
         raise AssertionError(f'moe residual: 0일 때 {zero_gap:.2e}, 노드별 {residual_gap:.2e}')
 
+    # gumbel(sparse): 학습 순전파 게이트는 one-hot이고 R로 기울기가 흐르며, 추론은 argmax R, 표본 빈도는 softmax(R)를 따른다.
+    torch.manual_seed(6)
+    sparse = NodeLSTMMoE(len(adaptive), 8, 5, num_experts=3, router='static', routing='gumbel', tau=1.0)
+    with torch.no_grad():
+        sparse.begin()
+        for param in (sparse.node_delta_expert_ih, sparse.node_delta_expert_hh, sparse.node_delta_expert_bias):
+            param.normal_(0.0, 0.3)
+    sparse.train()
+    train_gate = sparse.gates(sequence)
+    one_hot_ok = bool(((train_gate.detach() == 0) | (train_gate.detach() == 1)).all()) and bool(
+        (train_gate.detach().sum(-1) == 1).all()
+    )
+    sparse(lstm_small, sequence).pow(2).sum().backward()
+    router_grad = float(sparse.node_delta_router.grad.abs().sum())
+    with torch.no_grad():
+        many = torch.stack([sparse.gates(sequence.repeat(32, 1, 1, 1)) for _ in range(40)]).mean(dim=(0, 1))
+        frequency_gap = float((many - torch.softmax(sparse.node_delta_router, dim=-1)).abs().max())
+        sparse.eval()
+        eval_gate = sparse.gates(sequence)
+        argmax_ok = bool((eval_gate.argmax(-1) == sparse.node_delta_router.argmax(-1)[None]).all())
+        sparse_out = sparse(lstm_small, sequence)[:, :, -1]
+        chosen = sparse.node_delta_router.argmax(-1)
+        sparse_gap = 0.0
+        for slot in range(len(adaptive)):
+            k = int(chosen[slot])
+            single = torch.nn.LSTM(8, 5, batch_first=True)
+            single.weight_ih_l0.copy_(lstm_small.weight_ih_l0 + sparse.node_delta_expert_ih[k])
+            single.weight_hh_l0.copy_(lstm_small.weight_hh_l0 + sparse.node_delta_expert_hh[k])
+            single.bias_ih_l0.copy_(lstm_small.bias_ih_l0 + sparse.node_delta_expert_bias[k])
+            single.bias_hh_l0.copy_(lstm_small.bias_hh_l0)
+            sparse_gap = max(sparse_gap, float((sparse_out[:, slot] - single(sequence[:, slot])[1][0][-1]).abs().max()))
+    if not (one_hot_ok and router_grad > 0 and argmax_ok and frequency_gap < 0.03 and sparse_gap < 1e-5):
+        raise AssertionError(
+            f'gumbel: one-hot {one_hot_ok}, R 기울기 {router_grad:.2e}, argmax {argmax_ok}, '
+            f'표본 빈도 오차 {frequency_gap:.3f}, 선택 전문가 출력 {sparse_gap:.2e}'
+        )
+
     return {
         'node_adaptive_zero_delta_matches_nn_lstm': True,
         'max_abs_diff': gap,

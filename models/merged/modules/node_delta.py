@@ -11,6 +11,7 @@ from collections.abc import Sequence
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 
 def run_node_lstm(sequence: Tensor, weight_ih: Tensor, weight_hh: Tensor, bias: Tensor) -> Tensor:
@@ -132,6 +133,8 @@ class NodeLSTMMoE(nn.Module):
         top_k: int = 0,
         assign: Sequence[int] | None = None,
         residual: bool = False,
+        routing: str = "soft",
+        tau: float = 1.0,
     ) -> None:
         super().__init__()
         if num_experts < 2:
@@ -140,6 +143,15 @@ class NodeLSTMMoE(nn.Module):
             raise ValueError(f"node_moe_router는 'static'|'dynamic' (받음: {router!r})")
         if not 0 <= top_k <= num_experts:
             raise ValueError("node_moe_top_k는 0(전체)~전문가 수")
+        if routing not in ("soft", "gumbel"):
+            raise ValueError(f"node_moe_routing은 'soft'|'gumbel' (받음: {routing!r})")
+        if routing == "gumbel" and (router != "static" or top_k != 0):
+            raise ValueError("node_moe_routing=gumbel은 node_moe_router=static, node_moe_top_k=0에서만 쓴다")
+        if tau <= 0:
+            raise ValueError("node_moe_tau는 양수여야 함")
+        # gumbel: 노드별 범주형 분포 softmax(R[n])에서 전문가 하나를 고른다(학습: straight-through Gumbel 표본, 추론: argmax).
+        self.routing = routing
+        self.tau = float(tau)
         # 노드 → 전문가 초기 배정(train 구간 노드 기술자 k-means, 선택). 없으면 router 표를 난수로 시작.
         self._assign_list = None if assign is None else [int(v) for v in assign]
         if self._assign_list is not None and (
@@ -186,9 +198,21 @@ class NodeLSTMMoE(nn.Module):
             self.node_delta_router_input.normal_(0.0, self.node_delta_router_input.shape[0] ** -0.5)
 
     def gates(self, sequence: Tensor) -> Tensor:
-        """``sequence [B,A,L,F]`` -> 게이트 ``[B,A,K]`` (softmax, top_k>0이면 상위 k개만)."""
+        """``sequence [B,A,L,F]`` -> 게이트 ``[B,A,K]``.
+
+        soft: softmax(top_k>0이면 상위 k개만). gumbel: 순전파 값은 one-hot(학습은 Gumbel 표본, 추론은 argmax R),
+        학습 중 역전파는 softmax((R + ε)/τ)를 거친다(straight-through).
+        """
 
         logits = self.node_delta_router.unsqueeze(0).expand(sequence.shape[0], -1, -1)
+        if self.routing == "gumbel":
+            if not self.training:
+                return F.one_hot(logits.argmax(dim=-1), self.num_experts).to(logits.dtype)
+            uniform = torch.rand_like(logits).clamp_(1e-10, 1.0 - 1e-7)
+            noisy = (logits - torch.log(-torch.log(uniform))) / self.tau
+            soft = torch.softmax(noisy, dim=-1)
+            hard = F.one_hot(soft.argmax(dim=-1), self.num_experts).to(soft.dtype)
+            return hard - soft.detach() + soft
         if self.node_delta_router_input is not None:
             logits = logits + sequence.mean(dim=2) @ self.node_delta_router_input
         if 0 < self.top_k < self.num_experts:

@@ -577,10 +577,29 @@ router:    z[b,n,k] = R[n,k] (+ x̄[b,n]·W_r[:,k], node_moe_router=dynamic)    
   - `dynamic`이면 `W_r ~ N(0, 1/F)` (커밋 `1cab648`에서는 0으로 시작해 학습 중에도 거의 움직이지 않았다).
 - 전문가는 공유 `nn.LSTM`의 가중치에 ΔW_k를 더해 cuDNN LSTM(`torch._VF.lstm`)으로 선택 노드 전체를 한 번에 돈다.
 - `node_adaptive_scope`의 `history`·`periodic`에 같은 식으로 쓴다(위치마다 전문가·router가 따로 있다, 배정은 공유).
-- 부하 균형 손실은 두지 않는다(dense softmax 기본).
+- 부하 균형 손실은 두지 않는다(dense softmax 기본, `gumbel`도 마찬가지).
 - `node_moe_residual=true`: 공유 전문가 위에 노드 고유 ΔW_n(additive와 같은 모양)을 더한다. 전문가 k의 노드 n 가중치는
   `W + ΔW_k + ΔW_n`이고 노드별 가중치라 cuDNN 대신 `run_node_lstm`으로 전문가마다 돈다. 공유 특화(전문가)와
   노드 고유 특화(ΔW_n)를 함께 둔다.
+
+**`node_moe_routing=gumbel`** (sparse MoE, 기본 `soft`): 노드마다 전문가 **하나**만 쓴다. router는 `static`만 허용
+(`node_moe_router=static`, `node_moe_top_k=0`). 이산 선택은 미분이 안 되므로 router를 범주형 분포로 두고
+재매개변수화(reparameterization) 표본으로 기울기를 흘린다(straight-through Gumbel-softmax).
+
+```text
+p[n]      = softmax(R[n])                                  노드 n의 전문가 분포 (미분 가능)
+학습:      ε[b,n,k] ~ Gumbel(0,1) (= −log(−log U), U ~ Uniform(0,1))   샘플·노드마다 새로 뽑음
+           s[b,n]   = softmax((R[n] + ε[b,n]) / τ)          τ = node_moe_tau
+           y[b,n]   = onehot(argmax s[b,n]) − stop_grad(s[b,n]) + s[b,n]
+           (순전파 값은 one-hot = 표본 전문가 하나, 역전파는 s를 통해 R로 기울기)
+추론:      y[b,n]   = onehot(argmax R[n])                   표본 없이 확률이 가장 큰 전문가
+출력:      h[b,n]   = Σ_k y[b,n,k]·LSTM_k(x[b,n])           순전파에서는 선택된 전문가 하나의 출력
+```
+
+- `argmax(R + ε)`는 `p`에서 뽑은 표본과 분포가 같다(Gumbel-max). 노이즈 `ε`가 파라미터 밖에 있어 표본이 `R`의 미분 가능한
+  함수가 된다(diffusion의 `x = μ + σ·ε`와 같은 방식).
+- straight-through에서 `R`의 기울기는 `s`를 거치므로 전문가 출력이 모두 필요하다. 그래서 학습·추론 모두 전문가 K개를 다
+  계산하고 one-hot으로 고른다(계산량은 soft와 같고, 예측에 쓰이는 전문가는 하나).
 
 **`node_adaptive_scope`** (기본 `[history]`): ΔW를 넣을 위치. 같은 선택 노드·`node_adaptive_mode`(additive|basis|moe)를 쓴다.
 

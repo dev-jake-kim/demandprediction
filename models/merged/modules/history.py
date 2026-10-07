@@ -50,6 +50,8 @@ class LocalHistoryEncoder(nn.Module):
         node_moe_top_k: int = 0,
         node_moe_assign: Sequence[int] | None = None,
         node_moe_residual: bool = False,
+        node_moe_routing: str = "soft",
+        node_moe_tau: float = 1.0,
     ) -> None:
         super().__init__()
         if extra_dim < 0:
@@ -188,6 +190,7 @@ class LocalHistoryEncoder(nn.Module):
                 self.node_moe = NodeLSTMMoE(
                     num_adaptive, d_model + extra_dim, history_hidden,
                     node_moe_experts, node_moe_router, node_moe_top_k, node_moe_assign, node_moe_residual,
+                    node_moe_routing, node_moe_tau,
                 )
             else:
                 if node_descriptors is not None:
