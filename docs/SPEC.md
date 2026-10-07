@@ -600,6 +600,14 @@ p[n]      = softmax(R[n])                                  노드 n의 전문가
   함수가 된다(diffusion의 `x = μ + σ·ε`와 같은 방식).
 - straight-through에서 `R`의 기울기는 `s`를 거치므로 전문가 출력이 모두 필요하다. 그래서 학습·추론 모두 전문가 K개를 다
   계산하고 one-hot으로 고른다(계산량은 soft와 같고, 예측에 쓰이는 전문가는 하나).
+- 울산 3시드(k-means 배정, history+periodic), test RMSE / MAPE(ADFormer 대비), val RMSE / MAPE:
+  stage 2만 K=4 −2.33% / −2.62% (0.7388 / 15.29), K=8 −2.31% / −2.61% (0.7388 / 15.30);
+  `joint_two_stage` K=4 −2.53% / −1.75% (0.7378 / 15.38), K=8 −2.50% / −1.54% (0.7377 / 15.41).
+  stage 2만이면 soft(−2.40% / −2.46%)보다 MAPE가 조금 낫고 RMSE가 조금 나쁘며, 처음부터 켜면 soft와 같이 RMSE 쪽으로
+  간다. 노드별 ΔW(−2.39% / −2.78%)를 넘지 못했다.
+- router 표 `R`는 거의 움직이지 않았다: 학습 뒤 `argmax R`가 k-means 초기 배정과 모든 노드에서 같고, softmax 최대 확률은
+  초기값(K=8 0.513)에서 0.49~0.54. straight-through 기울기가 표본마다 방향이 달라 쌓이지 않는다(추정). 사실상
+  "k-means 묶음별 전문가 + 학습 중 확률적 배정"으로 동작했다.
 
 **`node_adaptive_scope`** (기본 `[history]`): ΔW를 넣을 위치. 같은 선택 노드·`node_adaptive_mode`(additive|basis|moe)를 쓴다.
 
