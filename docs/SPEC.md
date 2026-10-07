@@ -605,6 +605,16 @@ router:    z[b,n,k] = R[n,k] (+ x̄[b,n]·W_r[:,k], node_moe_router=dynamic)    
 | history+periodic+head / +fusion | −2.48% / −2.44%, −2.39% / −2.78% | |
 | history+periodic, ΔW만 학습(공유 고정) lr 1e-3 | −2.48% / −2.55% (best epoch 2) | |
 | joint(처음부터) basis history+periodic | −1.95% / +0.03% | |
+| MoE K=4 (static·dynamic, random·k-means 배정, 전체 노드), history+periodic | −2.39~−2.40% / −2.46~−2.48% (val 0.7386 / 15.31) | |
+| MoE K=8 top-2 / K=16 k-means, history+periodic | −2.26% / −2.59%, −2.39% / −2.48% | |
+| MoE K=4 k-means + 노드 잔차 ΔW_n, history+periodic | −2.41% / −2.50% (val 0.7372 / 15.31) | |
+
+- MoE(§6.7 `moe`)는 공유 전문가만으로는 노드별 ΔW(−2.39% / −2.78%, val 0.7377 / 15.27)보다 val·test MAPE가 나빴다.
+  설정과 무관하게 거의 같은 값이고 시드 245·851은 best epoch 1(stage 1 직후와 거의 같음). train 손실도 노드별 ΔW보다
+  덜 내려가고(10 epoch 0.864 vs 0.836), ΔW를 0으로 바꿨을 때 예측 변화가 0.005로 노드별 ΔW(0.013)의 절반 이하다.
+  router는 k-means 배정으로 시작하면 노드 수요 수준과 상관 ±0.4~0.6인 배정을 유지하고 dynamic이면 샘플별로도
+  움직이지만(게이트 표준편차 0.05~0.13), 그 공유 특화가 val 이득으로 이어지지 않았다. 노드 잔차를 더하면 val RMSE는
+  가장 낮지만(0.7372) val·test MAPE는 노드별 ΔW보다 나쁘다. 채택은 노드별 ΔW(additive) 유지.
 
 - ΔW의 예측 기여는 작다: 채택 체크포인트에서 ΔW만 0으로 바꾸면 test 예측이 평균 0.01(수요 평균 0.47) 바뀌고
   RMSE 0.1% 차이. lr을 10배로 올려 ΔW만 학습해도 val 최적이 2 epoch이고 그 뒤 val이 나빠진다 → 용량·학습량이 아니라
