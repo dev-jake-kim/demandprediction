@@ -569,11 +569,16 @@ router:    z[b,n,k] = R[n,k] (+ x̄[b,n]·W_r[:,k], node_moe_router=dynamic)    
 
 - `x̄[b,n]`은 노드 `n`의 LSTM 입력 시퀀스 시간 평균이다(시점별 router 없음, 한 샘플·노드에 게이트 하나).
 - 모든 `node_delta_*`(ΔW_k, R, W_r)는 0으로 생성되어 stage 1은 공유 LSTM과 같다. `begin_node_adaptation()`이
-  `R ~ N(0, 1)`로 채운다(`W_r`는 0 유지). 이때 전문가가 모두 같아(ΔW_k=0) 출력은 바뀌지 않고, 노드마다 다른
-  게이트로 기울기가 전문가에 다르게 나뉘어 전문가가 갈라진다(대칭 깨기).
+  `R`과 `W_r`를 채운다. 이때 전문가가 모두 같아(ΔW_k=0) 출력은 바뀌지 않고, 노드마다 다른 게이트로 기울기가
+  전문가에 다르게 나뉘어 전문가가 갈라진다(대칭 깨기).
+  - `node_moe_router_init=random`: `R ~ N(0, 1)`. `cluster`: train.py가 train 구간 노드 기술자(§6.7 basis와 같은 34차원)를
+    k-means(K개, k-means++, 학습 seed)로 묶어 `node_moe_assign [A]`로 config에 저장하고, `R[n, assign[n]] = 2`, 나머지 0
+    (자기 군집 전문가 게이트 ≈ e²/(e²+K−1)). 수요 패턴이 비슷한 노드가 같은 전문가를 공유하며 시작한다.
+  - `dynamic`이면 `W_r ~ N(0, 1/F)` (커밋 `1cab648`에서는 0으로 시작해 학습 중에도 거의 움직이지 않았다).
 - 전문가는 공유 `nn.LSTM`의 가중치에 ΔW_k를 더해 cuDNN LSTM(`torch._VF.lstm`)으로 선택 노드 전체를 한 번에 돈다.
-- `node_adaptive_scope`의 `history`·`periodic`에 같은 식으로 쓴다(위치마다 전문가·router가 따로 있다).
+- `node_adaptive_scope`의 `history`·`periodic`에 같은 식으로 쓴다(위치마다 전문가·router가 따로 있다, 배정은 공유).
 - 부하 균형 손실은 두지 않는다(dense softmax 기본).
+
 **`node_adaptive_scope`** (기본 `[history]`): ΔW를 넣을 위치. 같은 선택 노드·`node_adaptive_mode`(additive|basis|moe)를 쓴다.
 
 - `history`: 위의 최근 이력 `history_lstm`.

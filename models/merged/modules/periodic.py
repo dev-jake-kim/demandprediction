@@ -25,6 +25,7 @@ class PeriodicLSTMEncoder(nn.Module):
         node_moe_experts: int = 4,
         node_moe_router: str = "static",
         node_moe_top_k: int = 0,
+        node_moe_assign: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
         if extra_dim < 0:
@@ -43,7 +44,8 @@ class PeriodicLSTMEncoder(nn.Module):
             self.node_delta = None
         elif node_adaptive_mode == "moe":
             self.node_delta = NodeLSTMMoE(
-                len(self._node_index_list), input_size, hidden_size, node_moe_experts, node_moe_router, node_moe_top_k
+                len(self._node_index_list), input_size, hidden_size, node_moe_experts, node_moe_router, node_moe_top_k,
+                node_moe_assign,
             )
         else:
             self.node_delta = NodeLSTMDelta(

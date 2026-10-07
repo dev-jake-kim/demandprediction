@@ -74,6 +74,8 @@ class MergedDemandConfig(PretrainedConfig):
         node_moe_experts: int = 4,
         node_moe_router: str = 'static',
         node_moe_top_k: int = 0,
+        node_moe_router_init: str = 'random',
+        node_moe_assign: list[int] | None = None,
         loss_type: str = 'combined',
         loss_gamma: float = 1.0,
         loss_eps: float = 0.5,
@@ -168,6 +170,9 @@ class MergedDemandConfig(PretrainedConfig):
         self.node_moe_experts = node_moe_experts
         self.node_moe_router = node_moe_router
         self.node_moe_top_k = node_moe_top_k
+        # router 초기화: random | cluster(train 구간 노드 기술자 k-means 배정 node_moe_assign, train.py가 계산).
+        self.node_moe_router_init = node_moe_router_init
+        self.node_moe_assign = node_moe_assign
         # configure_loss가 stage마다 갱신한다(체크포인트가 마지막 학습 손실을 기록).
         self.loss_type = loss_type
         self.loss_gamma = loss_gamma

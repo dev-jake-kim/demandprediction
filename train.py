@@ -256,7 +256,7 @@ def select_node_adaptive_indices(train_ds: UnifiedDemandDataset, min_demand: flo
 
 
 def compute_node_descriptors(train_ds: UnifiedDemandDataset, indices: list[int]) -> list[list[float]]:
-    """basis ΔW용 노드 기술자 φ[n] (34차원, 적응 노드 사이 표준화). ``[time_step, train_end)``만 사용.
+    """basis ΔW·MoE router 배정용 노드 기술자 φ[n] (34차원, 적응 노드 사이 표준화). ``[time_step, train_end)``만 사용.
 
     시각별(24)·요일별(7, 시작일 기준 상대 요일) 평균 / 노드 평균, log1p 평균, 0 비율, 변동계수.
     """
@@ -274,6 +274,31 @@ def compute_node_descriptors(train_ds: UnifiedDemandDataset, indices: list[int])
     ])
     features = (features - features.mean(axis=0)) / np.maximum(features.std(axis=0), 1e-6)
     return features.tolist()
+
+
+def cluster_nodes(descriptors: list[list[float]], clusters: int, seed: int, iterations: int = 100) -> list[int]:
+    """노드 기술자 k-means(k-means++ 시작, 유클리드). MoE router 초기 배정용. 빈 군집은 가장 먼 점으로 다시 채운다."""
+
+    points = np.asarray(descriptors, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    centers = [points[rng.integers(len(points))]]
+    for _ in range(1, clusters):
+        distance = np.min([((points - c) ** 2).sum(1) for c in centers], axis=0)
+        centers.append(points[rng.choice(len(points), p=distance / distance.sum())])
+    centers = np.stack(centers)
+    assign = np.zeros(len(points), dtype=int)
+    for _ in range(iterations):
+        distance = ((points[:, None] - centers[None]) ** 2).sum(-1)
+        assign = distance.argmin(1)
+        for k in range(clusters):
+            if not (assign == k).any():
+                far = distance[np.arange(len(points)), assign].argmax()
+                assign[far] = k
+        new_centers = np.stack([points[assign == k].mean(0) for k in range(clusters)])
+        if np.allclose(new_centers, centers):
+            break
+        centers = new_centers
+    return assign.tolist()
 
 
 def compute_node_mix(
@@ -337,7 +362,7 @@ def load_stage1_with_new_nodes(init_from: str, config: MergedDemandConfig) -> Me
     ignored = {
         'node_adaptive_indices', 'node_adaptive_min_demand', 'node_adaptive', 'node_adaptive_mode',
         'node_delta_rank', 'node_delta_descriptor', 'node_descriptors', 'node_adaptive_scope', 'node_delta_dynamic',
-        'node_moe_experts', 'node_moe_router', 'node_moe_top_k',
+        'node_moe_experts', 'node_moe_router', 'node_moe_top_k', 'node_moe_router_init', 'node_moe_assign',
         # stage 2 손실 전용 설정(node_mix 벡터·하이퍼파라미터)은 stage 1 가중치와 무관하다.
         'node_mix_lambda', 'node_mix_mape_scale', 'node_mix_mse_scale', 'node_mix_weight', 'node_mix_lambda_low',
         'node_mix_lambda_high', 'node_mix_tau', 'node_mix_width', 'node_mix_scaler',
@@ -447,6 +472,12 @@ def main(cfg: DictConfig) -> None:
             if model_kwargs.get('node_adaptive_mode') != 'basis':
                 raise ValueError('node_delta_descriptor는 node_adaptive_mode=basis에서만 쓴다')
             model_kwargs['node_descriptors'] = compute_node_descriptors(train_ds, node_adaptive_indices)
+        if model_kwargs.get('node_adaptive_mode') == 'moe' and model_kwargs.get('node_moe_router_init') == 'cluster':
+            model_kwargs['node_moe_assign'] = cluster_nodes(
+                compute_node_descriptors(train_ds, node_adaptive_indices), int(model_kwargs['node_moe_experts']),
+                int(cfg.train.seed),
+            )
+            logger.info(f'[moe] 노드 기술자 k-means 배정 크기: {np.bincount(model_kwargs["node_moe_assign"]).tolist()}')
 
     # node_mix 손실(stage 1 또는 stage 2)을 쓰면 노드별 λ·정규화·scaler를 train 구간에서 계산한다.
     node_mix = None

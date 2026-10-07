@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 from torch import Tensor, nn
 
@@ -128,6 +130,7 @@ class NodeLSTMMoE(nn.Module):
         num_experts: int = 4,
         router: str = "static",
         top_k: int = 0,
+        assign: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
         if num_experts < 2:
@@ -136,6 +139,12 @@ class NodeLSTMMoE(nn.Module):
             raise ValueError(f"node_moe_router는 'static'|'dynamic' (받음: {router!r})")
         if not 0 <= top_k <= num_experts:
             raise ValueError("node_moe_top_k는 0(전체)~전문가 수")
+        # 노드 → 전문가 초기 배정(train 구간 노드 기술자 k-means, 선택). 없으면 router 표를 난수로 시작.
+        self._assign_list = None if assign is None else [int(v) for v in assign]
+        if self._assign_list is not None and (
+            len(self._assign_list) != num_nodes or min(self._assign_list) < 0 or max(self._assign_list) >= num_experts
+        ):
+            raise ValueError(f"node_moe_assign은 노드 {num_nodes}개의 0..{num_experts - 1} 전문가 id여야 함")
         gates = 4 * hidden_size
         self.num_experts = int(num_experts)
         self.top_k = int(top_k)
@@ -155,9 +164,17 @@ class NodeLSTMMoE(nn.Module):
 
     @torch.no_grad()
     def begin(self) -> None:
-        """router 표 R ~ N(0,1). 전문가 ΔW=0이라 출력 불변, 노드별 게이트 차이로 전문가가 갈라진다."""
+        """router 표 R: 배정이 있으면 R[n, assign[n]] = 2(나머지 0), 없으면 N(0,1). dynamic이면 W_r ~ N(0, 1/F).
+        전문가 ΔW=0이라 출력은 불변이고, 노드별 게이트 차이로 전문가가 갈라진다."""
 
-        self.node_delta_router.normal_(0.0, 1.0)
+        if self._assign_list is None:
+            self.node_delta_router.normal_(0.0, 1.0)
+        else:
+            self.node_delta_router.zero_()
+            index = torch.as_tensor(self._assign_list, dtype=torch.long, device=self.node_delta_router.device)
+            self.node_delta_router.scatter_(1, index[:, None], 2.0)
+        if self.node_delta_router_input is not None:
+            self.node_delta_router_input.normal_(0.0, self.node_delta_router_input.shape[0] ** -0.5)
 
     def gates(self, sequence: Tensor) -> Tensor:
         """``sequence [B,A,L,F]`` -> 게이트 ``[B,A,K]`` (softmax, top_k>0이면 상위 k개만)."""
