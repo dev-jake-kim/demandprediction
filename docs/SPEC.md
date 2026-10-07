@@ -50,13 +50,13 @@ flowchart TD
     WC --> C1
 
     subgraph LH["LocalHistoryEncoder: 공간 + 최근 시간"]
-        L1["노드 토큰<br/>log1p + Fourier 스칼라 임베딩<br/>+ 노드 임베딩 [B·k, N, D]<br/>(선택) + 이벤트 노드·시각에 공유 이벤트 임베딩"]
+        L1["노드 토큰<br/>log1p + Fourier 스칼라 임베딩<br/>+ 노드 임베딩 [B·k, N, D]<br/>(선택) + 이벤트 노드·시각에 공유 이벤트 임베딩<br/>(선택) + 배차 상태 이력 Linear(C→D)"]
         L2["층마다: [층별 sink, 노드 N개]<br/>[B·k, 1+N, D]"]
         L3["masked Transformer 층<br/>노드는 sink + 자기 창만 봄<br/>+ 방향별·head별 bias"]
         L4["sink 출력 버림<br/>노드 출력만 다음 층으로"]
         L5["최종 노드 출력 [B,N,k,D]<br/>+ 최근 context 14"]
         L6["공유 history LSTM"]
-        L7["적응 노드만 W + ΔW LSTM<br/>(gated: g·W + (1−g)·V)<br/>stage 2에서 ΔW 학습<br/>(울산: 일·주 주기 LSTM에도 ΔW)"]
+        L7["적응 노드(train 평균 수요 > 0.1)만 노드별 LSTM<br/>additive(채택): W + ΔW[n]<br/>(선택) gated · basis · moe(공유 전문가 + router)<br/>stage 2에서 학습"]
         HN["h_neural [B,N,history_hidden]"]
         L1 --> L2 --> L3 --> L4
         L4 -->|"transformer_layers번 반복"| L2
@@ -65,15 +65,21 @@ flowchart TD
     end
 
     H --> L1
+    AUX["(선택) 배차 상태 이력<br/>aux_history [B,k,N,C]"] -.-> L1
     C2 -->|"최근 context"| L5
 
     subgraph PER["PeriodicLSTMEncoder ×2"]
-        P1["daily: log1p lag + context<br/>유효 lag 압축 → LSTM"]
-        P2["weekly: log1p lag + context<br/>유효 lag 압축 → LSTM"]
+        P1["daily: log1p lag + context<br/>(선택) + 노드 임베딩<br/>유효 lag 압축 → LSTM"]
+        P2["weekly: log1p lag + context<br/>(선택) + 노드 임베딩<br/>유효 lag 압축 → LSTM"]
+        P3["적응 노드만 노드별 LSTM<br/>(울산 채택: W + ΔW[n], scope=periodic)<br/>stage 2에서 학습"]
         HD["h_daily [B,N,periodic_hidden]<br/>daily_valid [B]"]
         HW["h_weekly [B,N,periodic_hidden]<br/>weekly_valid [B]"]
         P1 --> HD
         P2 --> HW
+        P1 --> P3
+        P2 --> P3
+        P3 --> HD
+        P3 --> HW
     end
 
     D --> P1
@@ -83,7 +89,7 @@ flowchart TD
 
     subgraph ATT["BranchAttention: 노드별 브랜치 선택"]
         A1["세 표현을 fusion_dim으로 projection<br/>z_neural, z_daily, z_weekly"]
-        A2["query = z_neural<br/>keys·values = daily, weekly, neural"]
+        A2["query = z_neural<br/>keys·values = daily, weekly, neural<br/>(선택, scope=fusion) + 노드별 Δq·Δv"]
         A3["무효 daily·weekly 후보 mask<br/>softmax attention"]
         A4["z_neural + fused<br/>LayerNorm"]
         HA["h_attn [B,N,fusion_dim]"]
@@ -95,14 +101,14 @@ flowchart TD
     HW --> A1
 
     subgraph OUT["기본 출력: 검색 pass"]
-        O1["neural_head Linear"]
+        O1["neural_head Linear<br/>(선택, scope=head) + 노드별 Δw·Δb"]
         O2["Softplus"]
         PRED["예측 수요 logits<br/>[B,H,W]"]
         O1 --> O2 --> PRED
     end
 
     HA --> O1
-    PRED --> LOSS["MAE 손실"]
+    PRED --> LOSS["손실 mse_mape<br/>d² + λ·|d|/(y+1), 울산 λ=2 / Porto λ=6"]
     Y --> LOSS
 
     subgraph RET["선택 경로: use_retrieval=true"]
@@ -132,17 +138,19 @@ flowchart TD
 | `dataset_frame/unified_demand_dataset.py` | `UnifiedDemandDataset`: 시간 격자 → 학습 샘플 |
 | `models/merged/config.py` | `MergedDemandConfig` (`PretrainedConfig`) |
 | `models/merged/modeling.py` | `MergedDemandModel`: 조립, 데이터 흐름, 손실 |
-| `models/merged/modules/history.py` | `LocalHistoryEncoder` (+ 노드별 ΔW) |
+| `models/merged/modules/history.py` | `LocalHistoryEncoder` (+ 노드별 ΔW: additive·gated·basis·moe) |
+| `models/merged/modules/node_delta.py` | 노드별 LSTM 부품: `run_node_lstm`, `NodeLSTMDelta`(주기 LSTM ΔW), `NodeLSTMMoE`(MoE), `run_dynamic_basis_lstm` |
 | `models/merged/modules/embeddings.py` | `FourierScalarEmbedding` |
-| `models/merged/modules/periodic.py` | `PeriodicLSTMEncoder` |
-| `models/merged/modules/attention.py` | `BranchAttention` |
-| `models/merged/modules/fusion.py` | `NeuralRetrievalGate` (출력 head + 검색 gate) |
+| `models/merged/modules/periodic.py` | `PeriodicLSTMEncoder` (+ 선택: 노드 임베딩, 노드별 ΔW·MoE) |
+| `models/merged/modules/attention.py` | `BranchAttention` (+ 선택: 노드별 query·value ΔW) |
+| `models/merged/modules/fusion.py` | `NeuralRetrievalGate` (출력 head + 검색 gate, + 선택: 노드별 head ΔW) |
 | `models/merged/modules/retrieval.py` | `CausalRetrieval` (선택 경로) |
-| `models/merged/losses.py`, `models/losses.py` | `build_loss`와 손실 구현 |
+| `models/merged/losses.py`, `models/losses.py` | `build_loss`와 손실 구현 (`mse_mape`, `poisson` 등) |
 | `models/merged/metrics.py`, `models/metrics.py` | `compute_merged_metrics`와 공용 지표 |
 | `configs/config_{ulsan,porto}.yaml` | 도시별 Hydra 루트 설정 |
 | `configs/model/merged_{ulsan,porto}.yaml` | 도시별 모델 하이퍼파라미터·스위치 |
 | `configs/dataset/{ulsan,porto}.yaml` | 데이터 경로·분할 |
+| `preprocessing/ulsan/build_dispatch_grid.py` | 원본 호출 기록 → 배차 상태 격자 `data/raw/ulsan_dispatch_grid.npy` (`data.aux_grid`) |
 | `train.py` / `test.py` | 학습 / 체크포인트 평가 |
 | `validate_merged.py` | 구조·인과 검증 |
 | `visualize_merged_node_metrics.py` | 노드별 지표 지도 |
