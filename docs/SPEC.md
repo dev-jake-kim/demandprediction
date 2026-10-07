@@ -753,6 +753,10 @@ python train.py --config-name config_<city> "description='실험 설명'" \
   `train.learning_rate`·`model.loss_type`으로 한 번에 학습한다(`stage2.*` 무시, `init_from` 금지).
   채택 설정 3시드 비교에서 ΔW가 초반부터 train에 과적합해(best epoch 7~12, 이후 val 상승)
   울산 MAE +1.8%·MAPE +1.7%, Porto RMSE +6.3%·MAE +2.6%로 2-stage보다 나빴다.
+  `joint_two_stage`면 stage 1부터 ΔW를 포함해 학습하고(`begin_node_adaptation()`은 stage 1 직전 한 번), 이어서
+  stage 2를 그대로 돈다(`init_from` 금지). 학습 순서와 Trainer 설정은 `two_stage`와 같고 ΔW 고정 여부만 다르다.
+  울산 MoE(K=4, k-means, dynamic, history+periodic) `joint` 3시드: test RMSE −2.35%·MAPE −1.28%(ADFormer 대비),
+  val 0.7393 / 15.44 — 노드별 ΔW 2단계(−2.39% / −2.78%, val 0.7377 / 15.27)보다 MAPE가 나쁘다.
 - **`limit_samples`**: 각 split 앞쪽 N개만 쓰는 스모크용.
 - **결과 JSON**: `run_json`이 있으면 그 경로, 없으면
   `output/<project_name>/runs/<city>_<loss_type>_<ablation>[_nodeadaptive]_seed<seed>.json`.

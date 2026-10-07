@@ -94,7 +94,8 @@ stage2:
   # null이면 stage 1부터 학습한다.
   init_from: null
 
-# 노드별 ΔW 학습 방식: two_stage(stage 1 ΔW 고정 → stage 2 ΔW 해제) | joint(처음부터 ΔW 포함 한 번에 학습).
+# 노드별 ΔW 학습 방식: two_stage(stage 1 ΔW 고정 → stage 2 ΔW 해제) | joint(처음부터 ΔW 포함 한 번에 학습)
+# | joint_two_stage(stage 1부터 ΔW 포함 학습 → stage 2 미세조정).
 node_adaptive_schedule: two_stage
 
 callbacks:

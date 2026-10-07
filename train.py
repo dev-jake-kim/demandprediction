@@ -639,13 +639,15 @@ def main(cfg: DictConfig) -> None:
     deltas = model.node_delta_parameters()
     stage_records: dict[str, dict] = {}
     stage1_metrics: dict[str, float] | None = None
-    # node_adaptive_schedule: two_stage(기본, stage 1 ΔW 고정 → stage 2 ΔW 해제) | joint(처음부터 ΔW 포함 한 번에 학습).
+    # node_adaptive_schedule: two_stage(기본, stage 1 ΔW 고정 → stage 2 ΔW 해제) | joint(처음부터 ΔW 포함 한 번에 학습)
+    # | joint_two_stage(stage 1부터 ΔW 포함 학습 → stage 2 미세조정).
     schedule = str(cfg.get('node_adaptive_schedule', 'two_stage'))
-    if schedule not in ('two_stage', 'joint'):
-        raise ValueError(f"node_adaptive_schedule은 'two_stage'|'joint' (받음: {schedule!r})")
+    if schedule not in ('two_stage', 'joint', 'joint_two_stage'):
+        raise ValueError(f"node_adaptive_schedule은 'two_stage'|'joint'|'joint_two_stage' (받음: {schedule!r})")
     joint = bool(deltas) and schedule == 'joint'
-    if joint and init_from:
-        raise ValueError('node_adaptive_schedule=joint에서는 stage2.init_from을 쓸 수 없다')
+    early_delta = bool(deltas) and schedule == 'joint_two_stage'
+    if (joint or early_delta) and init_from:
+        raise ValueError(f'node_adaptive_schedule={schedule}에서는 stage2.init_from을 쓸 수 없다')
 
     if not deltas or joint:
         model.begin_node_adaptation()
@@ -682,11 +684,14 @@ def main(cfg: DictConfig) -> None:
             del probe
         else:
             model.configure_loss(str(cfg.model.loss_type))
+            if early_delta:
+                # stage 1부터 ΔW(MoE 등)를 켜고 같이 학습한다. begin은 여기서 한 번만 부른다.
+                model.begin_node_adaptation()
             for param in deltas:
-                param.requires_grad_(False)
+                param.requires_grad_(early_delta)
             stage1 = build_trainer('stage1', train_cfg['learning_rate'])
             logger.info(
-                f'[stage1] ΔW 고정(node_adaptive=false와 동일), '
+                f'[stage1] ΔW {"포함 학습" if early_delta else "고정(node_adaptive=false와 동일)"}, '
                 f'학습 파라미터 {trainable_count(stage1):,}개'
             )
             stage1.train()
@@ -703,7 +708,8 @@ def main(cfg: DictConfig) -> None:
             # stage 1 Trainer가 optimizer와 모델 wrapper를 계속 붙들고 있지 않게 놓아준다.
             del stage1
 
-        model.begin_node_adaptation()
+        if not early_delta:
+            model.begin_node_adaptation()
         for param in deltas:
             param.requires_grad_(True)
         # stage2.freeze: none | shared(ΔW만 학습) | pre_lstm(LSTM 입력부 고정, LSTM 이후만 학습).
