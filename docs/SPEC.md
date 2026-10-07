@@ -236,6 +236,9 @@ Hydra 루트 설정은 도시별로 분리한다: `python train.py --config-name
 | 이벤트 | `use_event_embedding`, `event_csv_path` | false, null — train.py가 `data.event_csv`가 있으면 켜고 절대경로를 저장. 공연·축제 등 모든 이벤트에 **같은** 학습 임베딩 `event_embedding [D]`(0 초기화)을 이벤트 시각·노드의 Transformer 입력 토큰에 더한다(§6.2) |
 | 배차 상태 | `aux_channels`, `aux_grid_path` | 0, null — train.py가 `data.aux_grid`가 있으면 채널 수와 절대경로를 넣는다. 최근 창 `[t−k, t)`의 노드별 배차 상태 `log1p` 값을 `Linear(C→D)`로 Transformer 입력 토큰에 더한다(§6.2) |
 | 노드 적응 | `node_adaptive`, `node_adaptive_min_demand`, `node_adaptive_mode`, `node_adaptive_scope` | true, 0.1, `additive`, 울산 `[history, periodic]` / Porto `[history]` |
+| ΔW 변형 (선택) | `node_delta_rank`, `node_delta_descriptor`, `node_delta_dynamic`, `node_descriptors` | 8, false, false, null — `basis` 전용(§6.7). `node_descriptors`는 train.py가 채움 |
+| MoE (선택) | `node_moe_experts`, `node_moe_router`, `node_moe_top_k`, `node_moe_router_init`, `node_moe_residual`, `node_moe_routing`, `node_moe_tau`, `node_moe_assign` | 4, `static`, 0, `random`, false, `soft`, 1.0, null — `node_adaptive_mode=moe` 전용(§6.7). `node_moe_assign`은 `cluster`일 때 train.py가 채움 |
+| 주기 노드 임베딩 (선택) | `periodic_node_embedding_dim` | 0 (§6.3) |
 | 손실 | `loss_type`, `mape_weight` | `mse_mape`, 울산 2.0 / Porto 6.0 (stage 2도 같은 손실: `stage2.loss`, `stage2.mape_weight`) |
 | | `loss_gamma`, `loss_eps`, `rmse_weight`, `split_threshold`, `split_high_weight` | 1.0, 0.5, 10.0, 1.0, 1.0 |
 
