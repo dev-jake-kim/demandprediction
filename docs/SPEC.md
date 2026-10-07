@@ -578,6 +578,9 @@ router:    z[b,n,k] = R[n,k] (+ x̄[b,n]·W_r[:,k], node_moe_router=dynamic)    
 - 전문가는 공유 `nn.LSTM`의 가중치에 ΔW_k를 더해 cuDNN LSTM(`torch._VF.lstm`)으로 선택 노드 전체를 한 번에 돈다.
 - `node_adaptive_scope`의 `history`·`periodic`에 같은 식으로 쓴다(위치마다 전문가·router가 따로 있다, 배정은 공유).
 - 부하 균형 손실은 두지 않는다(dense softmax 기본).
+- `node_moe_residual=true`: 공유 전문가 위에 노드 고유 ΔW_n(additive와 같은 모양)을 더한다. 전문가 k의 노드 n 가중치는
+  `W + ΔW_k + ΔW_n`이고 노드별 가중치라 cuDNN 대신 `run_node_lstm`으로 전문가마다 돈다. 공유 특화(전문가)와
+  노드 고유 특화(ΔW_n)를 함께 둔다.
 
 **`node_adaptive_scope`** (기본 `[history]`): ΔW를 넣을 위치. 같은 선택 노드·`node_adaptive_mode`(additive|basis|moe)를 쓴다.
 

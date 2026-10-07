@@ -501,6 +501,34 @@ def _check_node_adaptive_identity() -> dict:
     if moe_identity_gap > 1e-5 or moe_gap > 1e-5:
         raise AssertionError(f'moe: begin 직후 {moe_identity_gap:.2e}, 전문가 혼합 {moe_gap:.2e}')
 
+    # moe residual: 같은 전문가·게이트에서 ΔW_n을 더하면 노드별 Σ_k g_k·LSTM(W + ΔW_k + ΔW_n)과 같다.
+    from models.merged.modules.node_delta import NodeLSTMMoE
+
+    torch.manual_seed(5)
+    lstm_small = torch.nn.LSTM(8, 5, batch_first=True)
+    residual_moe = NodeLSTMMoE(len(adaptive), 8, 5, num_experts=3, router='static', residual=True)
+    with torch.no_grad():
+        residual_moe.begin()
+        zero_gap = float((residual_moe(lstm_small, sequence)[:, :, -1]
+                          - lstm_small(sequence.reshape(-1, time_step, 8))[1][0][-1].reshape(2, len(adaptive), 5)).abs().max())
+        for param in residual_moe.node_delta_parameters():
+            param.normal_(0.0, 0.3)
+        residual_out = residual_moe(lstm_small, sequence)[:, :, -1]
+        gate = residual_moe.gates(sequence)
+        residual_gap = 0.0
+        for slot in range(len(adaptive)):
+            expected = torch.zeros(2, 5)
+            for k in range(3):
+                single = torch.nn.LSTM(8, 5, batch_first=True)
+                single.weight_ih_l0.copy_(lstm_small.weight_ih_l0 + residual_moe.node_delta_expert_ih[k] + residual_moe.node_delta_node_ih[slot])
+                single.weight_hh_l0.copy_(lstm_small.weight_hh_l0 + residual_moe.node_delta_expert_hh[k] + residual_moe.node_delta_node_hh[slot])
+                single.bias_ih_l0.copy_(lstm_small.bias_ih_l0 + residual_moe.node_delta_expert_bias[k] + residual_moe.node_delta_node_bias[slot])
+                single.bias_hh_l0.copy_(lstm_small.bias_hh_l0)
+                expected += gate[:, slot, k, None] * single(sequence[:, slot])[1][0][-1]
+            residual_gap = max(residual_gap, float((residual_out[:, slot] - expected).abs().max()))
+    if zero_gap > 1e-5 or residual_gap > 1e-5:
+        raise AssertionError(f'moe residual: 0일 때 {zero_gap:.2e}, 노드별 {residual_gap:.2e}')
+
     return {
         'node_adaptive_zero_delta_matches_nn_lstm': True,
         'max_abs_diff': gap,

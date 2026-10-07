@@ -49,6 +49,7 @@ class LocalHistoryEncoder(nn.Module):
         node_moe_router: str = "static",
         node_moe_top_k: int = 0,
         node_moe_assign: Sequence[int] | None = None,
+        node_moe_residual: bool = False,
     ) -> None:
         super().__init__()
         if extra_dim < 0:
@@ -186,7 +187,7 @@ class LocalHistoryEncoder(nn.Module):
                 # moe: 공유 전문가 K개(W + ΔW_k)를 노드별 router로 섞는다(docs/SPEC.md §6.7).
                 self.node_moe = NodeLSTMMoE(
                     num_adaptive, d_model + extra_dim, history_hidden,
-                    node_moe_experts, node_moe_router, node_moe_top_k, node_moe_assign,
+                    node_moe_experts, node_moe_router, node_moe_top_k, node_moe_assign, node_moe_residual,
                 )
             else:
                 if node_descriptors is not None:

@@ -131,6 +131,7 @@ class NodeLSTMMoE(nn.Module):
         router: str = "static",
         top_k: int = 0,
         assign: Sequence[int] | None = None,
+        residual: bool = False,
     ) -> None:
         super().__init__()
         if num_experts < 2:
@@ -155,11 +156,19 @@ class NodeLSTMMoE(nn.Module):
         self.node_delta_router_input = (
             nn.Parameter(torch.zeros(input_size, num_experts)) if router == "dynamic" else None
         )
+        # residual: 공유 전문가 위에 노드 고유 ΔW_n을 더한다(전문가 k의 노드 n 가중치 = W + ΔW_k + ΔW_n).
+        self.residual = bool(residual)
+        if self.residual:
+            self.node_delta_node_ih = nn.Parameter(torch.zeros(num_nodes, gates, input_size))
+            self.node_delta_node_hh = nn.Parameter(torch.zeros(num_nodes, gates, hidden_size))
+            self.node_delta_node_bias = nn.Parameter(torch.zeros(num_nodes, gates))
 
     def node_delta_parameters(self) -> tuple[nn.Parameter, ...]:
         params = (self.node_delta_expert_ih, self.node_delta_expert_hh, self.node_delta_expert_bias, self.node_delta_router)
         if self.node_delta_router_input is not None:
             params += (self.node_delta_router_input,)
+        if self.residual:
+            params += (self.node_delta_node_ih, self.node_delta_node_hh, self.node_delta_node_bias)
         return params
 
     @torch.no_grad()
@@ -196,13 +205,21 @@ class NodeLSTMMoE(nn.Module):
         gate = self.gates(sequence)
         mixed = None
         for expert in range(self.num_experts):
-            weights = [
-                lstm.weight_ih_l0 + self.node_delta_expert_ih[expert],
-                lstm.weight_hh_l0 + self.node_delta_expert_hh[expert],
-                lstm.bias_ih_l0 + self.node_delta_expert_bias[expert],
-                lstm.bias_hh_l0,
-            ]
-            output = torch._VF.lstm(flat, (zeros, zeros), weights, True, 1, 0.0, self.training, False, True)[0]
+            if self.residual:
+                output = run_node_lstm(
+                    sequence,
+                    lstm.weight_ih_l0 + self.node_delta_expert_ih[expert] + self.node_delta_node_ih,
+                    lstm.weight_hh_l0 + self.node_delta_expert_hh[expert] + self.node_delta_node_hh,
+                    lstm.bias_ih_l0 + lstm.bias_hh_l0 + self.node_delta_expert_bias[expert] + self.node_delta_node_bias,
+                )
+            else:
+                weights = [
+                    lstm.weight_ih_l0 + self.node_delta_expert_ih[expert],
+                    lstm.weight_hh_l0 + self.node_delta_expert_hh[expert],
+                    lstm.bias_ih_l0 + self.node_delta_expert_bias[expert],
+                    lstm.bias_hh_l0,
+                ]
+                output = torch._VF.lstm(flat, (zeros, zeros), weights, True, 1, 0.0, self.training, False, True)[0]
             term = gate[..., expert, None, None] * output.reshape(batch, num_nodes, steps, -1)
             mixed = term if mixed is None else mixed + term
         return mixed
