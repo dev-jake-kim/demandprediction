@@ -755,8 +755,12 @@ python train.py --config-name config_<city> "description='실험 설명'" \
   울산 MAE +1.8%·MAPE +1.7%, Porto RMSE +6.3%·MAE +2.6%로 2-stage보다 나빴다.
   `joint_two_stage`면 stage 1부터 ΔW를 포함해 학습하고(`begin_node_adaptation()`은 stage 1 직전 한 번), 이어서
   stage 2를 그대로 돈다(`init_from` 금지). 학습 순서와 Trainer 설정은 `two_stage`와 같고 ΔW 고정 여부만 다르다.
-  울산 MoE(K=4, k-means, dynamic, history+periodic) `joint` 3시드: test RMSE −2.35%·MAPE −1.28%(ADFormer 대비),
-  val 0.7393 / 15.44 — 노드별 ΔW 2단계(−2.39% / −2.78%, val 0.7377 / 15.27)보다 MAPE가 나쁘다.
+  울산 MoE(k-means 배정, dynamic router, history+periodic) 3시드, test RMSE / MAPE(ADFormer 대비), val RMSE / MAPE:
+  `joint` K=4 −2.35% / −1.28% (0.7393 / 15.44), K=8 −2.38% / −1.86% (0.7395 / 15.36);
+  `joint_two_stage` K=4 −2.42% / −1.66% (0.7383 / 15.39), K=8 −2.60% / −1.57% (0.7369 / 15.40).
+  노드별 ΔW 2단계(채택, −2.39% / −2.78%, 0.7377 / 15.27) 대비 MAPE가 1%p 이상 나쁘다. K=8 `joint_two_stage`는
+  val·test RMSE가 가장 낮지만 같은 손실의 λ 교환선(λ=1.75 −2.81% / −0.91%, λ=2 −2.45% / −2.42%) 위의 RMSE 쪽 점과
+  비슷해 교환선을 넘지는 못했다. stage 1부터 MoE를 켜면 stage 1 test MAPE부터 나쁘다(15.30~15.39, ΔW 고정 stage 1 15.21).
 - **`limit_samples`**: 각 split 앞쪽 N개만 쓰는 스모크용.
 - **결과 JSON**: `run_json`이 있으면 그 경로, 없으면
   `output/<project_name>/runs/<city>_<loss_type>_<ablation>[_nodeadaptive]_seed<seed>.json`.
