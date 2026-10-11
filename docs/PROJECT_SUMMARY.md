@@ -3,6 +3,7 @@
 `docs/crn.pdf`의 비교 모델(CRN 제외) STID, AGCRN, MTGNN, BigST, BiST, PDFormer, ADFormer를 우리 데이터·분할·지표로 다시 잰 결과다.
 ADFormer는 기존 실험 기록(`git show tmp:docs/ADFORMER_REFERENCE.md`, 8시간 입력)을 그대로 옮겼고, 나머지 6개는 upstream 코드를 모델별 브랜치에 복사해 새로 학습했다.
 MTGNN·BigST·BiST는 upstream 학습 코드가 수요 0을 결측으로 보고 loss에서 빼므로, 그 mask만 제거한 변형(‡, `<M>-nomask` 브랜치)을 주 결과로 쓴다(§4).
+`OURS_*` 행은 채택 전 개선·축소 후보다(§7).
 
 ## 1. 공통 조건
 
@@ -30,8 +31,8 @@ test 셀 중 0의 비율은 울산 75.0%, Porto 73.1%다. 그래서 학습 손�
 
 학습 시간은 run당 평균 초이며, 모델마다 재는 방식이 다르다(§5). OURS의 학습 시간은 기록이 없어 `-`로 둔다.
 
-- **굵은 값**: 열마다 OURS와 비교 모델 중 가장 좋은(낮은) 값이다. OURS_dW는 우리 모델의 이전 버전이라 순위에서 뺐다.
-- OURS 옆 괄호: 비교 모델 중 가장 좋은 값 대비 % = (OURS/최고 비교 모델−1)×100. 음수면 OURS가 그만큼 낮고(좋고), 양수면 그만큼 높다(나쁘다).
+- **굵은 값**: 열마다 OURS와 비교 모델 중 가장 좋은(낮은) 값이다. OURS_dW(이전 버전)와 `OURS_*` 후보(§7)는 순위에서 뺐다.
+- OURS·후보 옆 괄호: 비교 모델 중 가장 좋은 값 대비 % = (값/최고 비교 모델−1)×100. 음수면 그만큼 낮고(좋고), 양수면 그만큼 높다(나쁘다).
 
 ### 울산
 
@@ -39,6 +40,8 @@ test 셀 중 0의 비율은 울산 75.0%, Porto 73.1%다. 그래서 학습 손�
 |---|---|---|---|---|---|---|---:|---:|
 | **OURS** | **0.7141 ± 0.0018** (−0.96%) | **0.3193 ± 0.0005** (−0.09%) | **15.21 ± 0.17** (−1.85%) | 58.96 ± 0.74 (+14.28%) | 1.0149 (+8.78%) | 1.3099 (+4.12%) | 171,063 | - |
 | OURS_dW | 0.7124 ± 0.0017 | 0.3186 ± 0.0004 | 15.18 ± 0.07 | 58.34 ± 0.19 | 1.0103 | 1.3081 | 6,111,673 | - |
+| OURS_SE (S + E) | 0.7123 ± 0.0004 (−1.21%) | 0.3187 ± 0.0001 (−0.28%) | 15.14 ± 0.03 (−2.29%) | 58.67 ± 0.09 (+13.72%) | 1.0139 (+8.68%) | 1.3092 (+4.07%) | 171,063 | - |
+| OURS_tiny (축소 + S + E) | 0.7119 ± 0.0004 (−1.26%) | 0.3193 ± 0.0002 (−0.11%) | 15.20 ± 0.06 (−1.86%) | 58.56 ± 0.10 (+13.51%) | 1.0129 (+8.57%) | 1.3089 (+4.04%) | 27,159 | - |
 | STID | 0.7252 ± 0.0013 | 0.3220 ± 0.0012 | 15.69 ± 0.19 | 58.07 ± 0.99 | 1.0012 | 1.3129 | 106,369 | 103 |
 | AGCRN | 0.7298 ± 0.0015 | 0.3275 ± 0.0005 | 15.94 ± 0.08 | 58.67 ± 0.11 | 1.0172 | 1.3268 | 746,705 | 840 |
 | MTGNN ‡ | 0.7328 ± 0.0020 | 0.3227 ± 0.0007 | 15.65 ± 0.11 | 56.83 ± 0.71 | 1.0007 | 1.3300 | 348,497 | 1,034 |
@@ -52,6 +55,9 @@ test 셀 중 0의 비율은 울산 75.0%, Porto 73.1%다. 그래서 학습 손�
 |---|---|---|---|---|---|---|---:|---:|
 | **OURS** | **1.6115 ± 0.0315** (−1.79%) | 0.4866 ± 0.0004 (+0.03%) | **14.35 ± 0.16** (−5.44%) | 64.79 ± 0.60 (+22.00%) | 1.6726 (+8.12%) | **3.0672** (−1.24%) | 250,583 | - |
 | OURS_dW | 1.5846 ± 0.0359 | 0.4818 ± 0.0007 | 14.36 ± 0.14 | 63.99 ± 0.29 | 1.6487 | 3.0122 | 3,728,473 | - |
+| OURS_SE (S + E) | 1.5895 ± 0.0157 (−3.13%) | 0.4805 ± 0.0015 (−1.22%) | 14.10 ± 0.03 (−7.13%) | 64.02 ± 0.27 (+20.56%) | 1.6546 (+6.96%) | 3.0265 (−2.55%) | 250,583 | - |
+| OURS_avgSE (평균 주기 + S + E) | 1.5573 ± 0.0212 (−5.09%) | 0.4797 ± 0.0008 (−1.39%) | 14.26 ± 0.04 (−6.05%) | 64.10 ± 0.20 (+20.69%) | 1.6456 (+6.38%) | 2.9605 (−4.67%) | 217,687 | - |
+| OURS_cavgSE (축소 + 평균 주기 + S + E) | 1.5682 ± 0.0348 (−4.42%) | 0.4801 ± 0.0007 (−1.31%) | 14.28 ± 0.05 (−5.90%) | 64.06 ± 0.15 (+20.63%) | 1.6461 (+6.41%) | 2.9835 (−3.93%) | 78,551 | - |
 | STID | 1.6682 ± 0.0082 | 0.4976 ± 0.0004 | 15.32 ± 0.08 | 59.76 ± 0.16 | 1.6498 | 3.1543 | 107,393 | 268 |
 | AGCRN | 1.9332 ± 0.0136 | 0.5067 ± 0.0012 | 15.66 ± 0.09 | 60.31 ± 0.48 | 1.6732 | 3.6857 | 747,025 | 10,435 |
 | MTGNN ‡ | 1.7507 ± 0.0483 | 0.4876 ± 0.0017 | 15.27 ± 0.21 | 57.35 ± 0.24 | 1.6005 | 3.3272 | 394,065 | 1,723 |
@@ -60,11 +66,12 @@ test 셀 중 0의 비율은 울산 75.0%, Porto 73.1%다. 그래서 학습 손�
 | PDFormer | 1.6561 ± 0.0334 | 0.5408 ± 0.0052 | 21.42 ± 0.59 | **53.11 ± 0.83** | **1.5469** | 3.1130 | 531,018 | 4,638 |
 
 - OURS: 현재 채택 모델(`tmp` b7f2b44, ΔW 없음). OURS_dW: ΔW 시절 채택 모델(eb92db5). 두 모델 모두 같은 `evaluate_test`로 다시 평가했다.
+- `OURS_*`: 채택 전 후보(§7, 브랜치 `night`). 같은 `evaluate_test`로 평가했다. 울산은 `OURS_SE`·`OURS_tiny`, Porto는 `OURS_SE`·`OURS_avgSE`·`OURS_cavgSE`만 돌렸다.
 - ‡ 표시는 upstream 학습 코드의 0 mask만 제거한 변형이다(§4). mask를 둔 원본 결과는 §4에 보조로 둔다.
 - OURS 괄호 %의 비교 기준(가장 좋은 비교 모델)은 다음과 같다.
   - 울산: RMSE BigST, MAE BiST, MAPE+1 BigST, MAPE(y>0)·mMAE·mRMSE PDFormer.
   - Porto: RMSE BiST, MAE BiST, MAPE+1 BiST, MAPE(y>0)·mMAE PDFormer, mRMSE BiST.
-- Porto MAE는 BiST ‡ 0.4865가 OURS 0.4866보다 0.03% 낮다. 차이는 BiST의 시드 표준편차(0.0065)보다 훨씬 작다.
+- Porto MAE는 BiST ‡ 0.4865가 OURS 0.4866보다 0.03% 낮다. 차이는 BiST의 시드 표준편차(0.0065)보다 훨씬 작다. 후보 `OURS_*`는 모두 BiST보다 1.2~1.4% 낮다.
 - 0이 아닌 셀만 보는 지표(MAPE(y>0), mMAE, mRMSE)는 대부분 PDFormer가 가장 낮다. 대신 PDFormer는 전체 셀 MAE·MAPE+1이 가장 나쁘다.
 
 ## 3. ADFormer 비교 — ADFormer test와 같은 시각 (울산 654, Porto 1313)
@@ -78,6 +85,10 @@ ADFormer 기록은 test가 울산 654개, Porto 1313개다. 우리 test의 마�
 | ADFormer (기록) | 0.7290 ± 0.0037 | 0.3251 ± 0.0011 | 15.5920 ± 0.2415 | 1.7542 ± 0.0419 | 0.4977 ± 0.0030 | 15.7666 ± 0.3293 |
 | **OURS** | **0.7134 ± 0.0018** (−0.98%) | **0.3188 ± 0.0005** (−0.12%) | **15.1728 ± 0.1703** (−1.92%) | **1.6069 ± 0.0334** (−1.90%) | 0.4862 ± 0.0004 (+0.00%) | **14.3365 ± 0.1605** (−5.43%) |
 | OURS_dW | 0.7118 ± 0.0017 | 0.3182 ± 0.0004 | 15.1448 ± 0.0667 | 1.5795 ± 0.0366 | 0.4814 ± 0.0007 | 14.3465 ± 0.1392 |
+| OURS_SE | 0.7117 ± 0.0004 (−1.23%) | 0.3182 ± 0.0001 (−0.31%) | 15.1052 ± 0.0318 (−2.36%) | 1.5857 ± 0.0146 (−3.20%) | 0.4802 ± 0.0015 (−1.25%) | 14.0800 ± 0.0255 (−7.12%) |
+| OURS_tiny | 0.7113 ± 0.0004 (−1.28%) | 0.3188 ± 0.0002 (−0.14%) | 15.1708 ± 0.0612 (−1.93%) | | | |
+| OURS_avgSE | | | | 1.5551 ± 0.0210 (−5.06%) | 0.4795 ± 0.0008 (−1.39%) | 14.2463 ± 0.0438 (−6.03%) |
+| OURS_cavgSE | | | | 1.5664 ± 0.0355 (−4.38%) | 0.4799 ± 0.0007 (−1.31%) | 14.2718 ± 0.0455 (−5.86%) |
 | STID | 0.7249 ± 0.0013 | 0.3216 ± 0.0012 | 15.6704 ± 0.1889 | 1.6629 ± 0.0073 | 0.4972 ± 0.0005 | 15.2958 ± 0.0782 |
 | AGCRN | 0.7292 ± 0.0014 | 0.3271 ± 0.0005 | 15.9145 ± 0.0833 | 1.9333 ± 0.0137 | 0.5066 ± 0.0012 | 15.6546 ± 0.0891 |
 | MTGNN ‡ | 0.7321 ± 0.0021 | 0.3223 ± 0.0007 | 15.6213 ± 0.1086 | 1.7508 ± 0.0485 | 0.4875 ± 0.0017 | 15.2678 ± 0.2076 |
@@ -91,6 +102,11 @@ OURS ÷ ADFormer − 1:
 
 - 울산: RMSE −2.14%, MAE −1.94%, MAPE+1 −2.69%.
 - Porto: RMSE −8.40%, MAE −2.31%, MAPE+1 −9.07%.
+
+후보 ÷ ADFormer − 1:
+
+- 울산 OURS_SE: RMSE −2.37%, MAE −2.11%, MAPE+1 −3.12%. OURS_tiny: −2.43%, −1.94%, −2.70%.
+- Porto OURS_SE: RMSE −9.61%, MAE −3.52%, MAPE+1 −10.70%. OURS_avgSE: −11.35%, −3.66%, −9.64%. OURS_cavgSE: −10.71%, −3.58%, −9.48%.
 
 ADFormer 행은 기록의 8시간 입력 값이다. ±는 기록 괄호 안의 표본 표준편차다.
 같은 저장 예측(`../ADFormer/log/ADFormer/{ULSAN,PORTO}-Taxi/window8_seed*/predictions.npz`)의 origin 채널을 `gir_common.metrics`로 다시 계산하면 위 세 값이 소수 넷째 자리까지 같다.
@@ -222,11 +238,41 @@ AGCRN은 데이터 로딩 코드 두 파일을 바꿨다. 원본 loader는 정�
 
 ```bash
 # 평균표 (§2)
-python /home/jinsu/PycharmProjects/gir-baselines/_common/summarize.py OURS OURS_dW STID AGCRN MTGNN_nomask BigST_nomask BiST_nomask PDFormer
+python /home/jinsu/PycharmProjects/gir-baselines/_common/summarize.py OURS OURS_dW OURS_SE OURS_tiny OURS_avgSE OURS_cavgSE STID AGCRN MTGNN_nomask BigST_nomask BiST_nomask PDFormer
 # ADFormer test 시각 subset (§3)
-conda run -n DA python /home/jinsu/PycharmProjects/gir-baselines/_common/summarize.py --adformer-subset OURS OURS_dW STID AGCRN MTGNN_nomask BigST_nomask BiST_nomask PDFormer
+conda run -n DA python /home/jinsu/PycharmProjects/gir-baselines/_common/summarize.py --adformer-subset OURS OURS_dW OURS_SE OURS_tiny OURS_avgSE OURS_cavgSE STID AGCRN MTGNN_nomask BigST_nomask BiST_nomask PDFormer
 # 대상 시각·지표 재계산·upstream 변경 확인
-conda run -n DA python /home/jinsu/PycharmProjects/gir-baselines/_common/verify.py STID AGCRN MTGNN BigST BiST PDFormer MTGNN_nomask BigST_nomask BiST_nomask OURS OURS_dW
+conda run -n DA python /home/jinsu/PycharmProjects/gir-baselines/_common/verify.py STID AGCRN MTGNN BigST BiST PDFormer MTGNN_nomask BigST_nomask BiST_nomask OURS OURS_dW OURS_SE OURS_tiny OURS_avgSE OURS_cavgSE
+# 후보 평가 (§7, cwd = night 브랜치 worktree gir-cap, 예: OURS_SE 울산)
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=1 conda run -n DA python /home/jinsu/PycharmProjects/gir-baselines/_common/eval_ours.py \
+  OURS_SE ulsan "output/merged/night/checkpoints/ulsan_sinkc_ema1_s{s}"
 ```
 
 모델별 상세(시드별 표, repo 지표 교차 확인, 실행 환경)는 각 브랜치의 `docs/RESULTS.md`에 있다.
+
+## 7. 우리 모델 개선·축소 후보 (10/11)
+
+ΔW 없는 현재 모델에서 ① 파라미터를 줄이면서 성능 유지 ② 성능 향상을 5시드로 탐색했다(46개 설정, 234회 학습).
+코드는 브랜치 `night`(worktree `gir-cap`, 옵션 커밋 `96d8fec`, SPEC `90c2c80`·`a1c2f93`)에 있고, 기본값은 바꾸지 않았다.
+기록은 `output/merged/night/`, 전체 표·그래프는 Notion 기록 페이지 "파라미터 축소·성능 개선 야간 실험" 절과 `night` 브랜치 `docs/SPEC.md` §4.1에 있다.
+
+새 옵션(둘 다 파라미터 0):
+
+- S `model.sink_carry=true`: 이전 층 sink 출력을 다음 층 sink 입력에 더한다. sink는 모든 노드를 보므로 2층 노드가 격자 전체 요약을 받는다.
+- E `ema_epochs=1`: 파라미터 EMA(시간 상수 1 epoch). 평가·best 선택·저장·test에 EMA 가중치를 쓴다.
+- 평균 주기: `model.periodic_encoder=average`. 일·주 LSTM 대신 유효 lag 평균 → MLP.
+
+| 후보 | 도시 | 설정 | 파라미터 |
+|---|---|---|---:|
+| OURS_SE | 울산·Porto | 채택 크기 + S + E | 171,063 / 250,583 |
+| OURS_tiny | 울산 | history·주기 hidden 16, fusion 32 + S + E | 27,159 (−84%) |
+| OURS_avgSE | Porto | 평균 주기 + S + E | 217,687 (−13%) |
+| OURS_cavgSE | Porto | d_model 32, history 32, fusion 64 + 평균 주기 + S + E | 78,551 (−69%) |
+
+같은 코드로 다시 학습한 채택 크기 기준과 시드별로 짝지어 비교한 변화율(RMSE / MAE / MAPE+1, 괄호는 개선 시드 수):
+
+- 울산 OURS_SE −0.25%(5/5) / −0.19% / −0.44%, OURS_tiny −0.30% / −0.02% / +0.00%.
+- Porto OURS_SE −0.32% / −1.25%(5/5) / −1.30%, OURS_avgSE −2.35%(5/5) / −1.42%(5/5) / −0.15%, OURS_cavgSE −1.67% / −1.34%(5/5) / +0.01%.
+- Porto 재학습 기준은 RMSE 1.5949로 채택 OURS(1.6115, ΔW 시절 stage 1 체크포인트 변환)보다 낮다. 그래서 §2 표의 OURS 대비 차이는 위 짝 비교보다 크게 보인다.
+- 울산은 λ(MAPE 가중치)로 RMSE↔MAPE가 교환된다(λ 1.5: −0.91% / +3.46%, λ 3: +1.26% / −3.65%). 같은 MAPE로 환산한 RMSE 이득은 0.2~0.4%로 작다.
+- 효과 없음: Porto 크기 키우기(d_model 96, history 128은 3시드), dropout, 도시 전체 수요 context, Porto global node 114.
