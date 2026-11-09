@@ -18,7 +18,6 @@ preprocessing/**/output/
 *.csv
 .claude/
 .codex/
-docs/PROJECT_SUMMARY.md
 # ablation 큐 러너의 런타임 상태 파일
 merged_model/.ablation_queue*
 tmp/
